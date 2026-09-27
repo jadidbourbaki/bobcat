@@ -73,9 +73,11 @@ caches the compiled shaders between runs.
 
 Apple clang 16 from the older Command Line Tools lacks the libFuzzer
 runtime. Its AddressSanitizer also crashed at startup on the
-maintainer's macOS 26 machine, while its UBSan worked. Use Xcode 26's
-clang or Homebrew's `llvm` for sanitizer and fuzzing builds. Homebrew's
-`llvm` includes libFuzzer.
+maintainer's macOS 26 machine, while its UBSan worked. On macOS the
+`justfile` therefore builds `build/sanitize` with Homebrew's LLVM at
+`/opt/homebrew/opt/llvm`, passing the installed SDK with `-isysroot`.
+Install it with `brew install llvm`. Homebrew's LLVM also includes
+libFuzzer. Other systems use their default compiler for every build.
 
 ## Repository layout
 

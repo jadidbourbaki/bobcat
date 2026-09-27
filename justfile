@@ -6,6 +6,14 @@ llama_bench_metal := "bench/llama.cpp/build-metal/bin/llama-bench"
 gguf_models := "-m models/LFM2.5-350M-Q8_0.gguf -m models/LFM2.5-1.2B-Instruct-Q8_0.gguf"
 mlx_models := "models/LFM2.5-350M-MLX-8bit models/LFM2.5-1.2B-Instruct-MLX-8bit"
 
+# Apple clang's AddressSanitizer crashes at startup on some macOS
+# releases, so macOS sanitizer builds use Homebrew's LLVM with the
+# installed SDK.  Other systems use their default compiler.
+llvm_clang := "/opt/homebrew/opt/llvm/bin/clang"
+sanitize_env := if os() == "macos" { "CC=" + llvm_clang + " OBJC=" + llvm_clang } else { "" }
+sanitize_sdk := if os() == "macos" { `xcrun --show-sdk-path` } else { "" }
+sanitize_args := if os() == "macos" { "-Dc_args='-isysroot " + sanitize_sdk + "' -Dc_link_args='-isysroot " + sanitize_sdk + "' -Dobjc_args='-isysroot " + sanitize_sdk + "' -Dobjc_link_args='-isysroot " + sanitize_sdk + "'" } else { "" }
+
 # List the recipes.
 default:
     @just --list
@@ -13,7 +21,7 @@ default:
 # Configure any build directory that does not exist yet.
 setup:
     [ -d {{build_dir}} ] || meson setup {{build_dir}} -Dwerror=true
-    [ -d {{sanitize_dir}} ] || meson setup {{sanitize_dir}} -Dwerror=true -Db_sanitize=address,undefined -Db_lundef=false
+    [ -d {{sanitize_dir}} ] || {{sanitize_env}} meson setup {{sanitize_dir}} -Dwerror=true -Db_sanitize=address,undefined -Db_lundef=false {{sanitize_args}}
     [ -d {{release_dir}} ] || meson setup {{release_dir}} --buildtype=release
 
 # Build the library and tools.
