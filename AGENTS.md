@@ -50,7 +50,8 @@ A change that fails `just check` locally is unfinished.
 | `just test` | Run the tests |
 | `just check` | Run the full quality gate |
 | `just fmt` | Rewrite the sources in GNU style |
-| `just bench` | Measure bandwidth and the llama.cpp baseline |
+| `just bench` | Measure GPU bandwidth and the llama.cpp Metal and mlx-lm baselines |
+| `just bench-cpu` | Measure CPU bandwidth and the llama.cpp CPU baseline |
 | `just clean` | Remove the build directories |
 
 `meson install` honors `--prefix` and `DESTDIR`, as the

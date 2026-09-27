@@ -1,8 +1,10 @@
 build_dir := "build/default"
 sanitize_dir := "build/sanitize"
 release_dir := "build/release"
-llama_bench := "bench/llama.cpp/build/bin/llama-bench"
-bench_models := "-m models/LFM2.5-350M-Q8_0.gguf -m models/LFM2.5-1.2B-Instruct-Q8_0.gguf"
+llama_bench_cpu := "bench/llama.cpp/build/bin/llama-bench"
+llama_bench_metal := "bench/llama.cpp/build-metal/bin/llama-bench"
+gguf_models := "-m models/LFM2.5-350M-Q8_0.gguf -m models/LFM2.5-1.2B-Instruct-Q8_0.gguf"
+mlx_models := "models/LFM2.5-350M-MLX-8bit models/LFM2.5-1.2B-Instruct-MLX-8bit"
 
 # List the recipes.
 default:
@@ -34,12 +36,21 @@ check: setup
 fmt: setup
     ninja -C {{build_dir}} clang-format
 
-# Measure memory bandwidth and the llama.cpp baseline.
+# Measure GPU bandwidth and the llama.cpp Metal and mlx-lm baselines.
 bench: setup
     meson compile -C {{release_dir}}
+    {{release_dir}}/tools/gpu_bw
+    @echo "llama.cpp $(git -C bench/llama.cpp rev-parse --short HEAD), Metal"
+    {{llama_bench_metal}} {{gguf_models}} -p 512 -n 128 -r 5 -o md
+    @cd tools && uv run python -c "import mlx.core, mlx_lm; print('mlx', mlx.core.__version__, 'mlx-lm', mlx_lm.__version__)"
+    for model in {{mlx_models}}; do echo "$model"; (cd tools && uv run python -m mlx_lm.benchmark --model "../$model" -p 512 -g 128 -n 5); done
+
+# Measure CPU bandwidth and the llama.cpp CPU baseline.
+bench-cpu: setup
+    meson compile -C {{release_dir}}
     {{release_dir}}/tools/bw
-    @echo "llama.cpp $(git -C bench/llama.cpp rev-parse --short HEAD)"
-    {{llama_bench}} {{bench_models}} -t 1,4,8,10 -p 512 -n 128 -r 5 -o md
+    @echo "llama.cpp $(git -C bench/llama.cpp rev-parse --short HEAD), CPU"
+    {{llama_bench_cpu}} {{gguf_models}} -t 1,4,8,10 -p 512 -n 128 -r 5 -o md
 
 # Remove the build directories.
 clean:

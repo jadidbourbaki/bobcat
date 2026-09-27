@@ -13,6 +13,13 @@ project(
 
 cc = meson.get_compiler('c')
 
+# The Metal host code is Objective-C, so macOS builds add that language.
+languages = ['c']
+if host_machine.system() == 'darwin'
+  add_languages('objc', native: false, required: true)
+  languages += 'objc'
+endif
+
 add_project_arguments(
   '-D_GNU_SOURCE',
   '-DGIP_VERSION="@0@"'.format(meson.project_version()),
@@ -27,7 +34,7 @@ add_project_arguments(
     '-Werror=int-conversion',
     '-Werror=format-security',
   ),
-  language: 'c',
+  language: languages,
 )
 
 threads = dependency('threads')
