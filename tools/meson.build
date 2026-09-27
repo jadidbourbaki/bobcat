@@ -10,4 +10,11 @@ if have_metal
     dependencies: metal_dep,
     objc_args: ['-fobjc-arc'],
   )
+  executable(
+    'gip_bench',
+    'gip_bench.c',
+    include_directories: gip_inc,
+    link_with: gip_core,
+    dependencies: [m_dep, metal_dep],
+  )
 endif

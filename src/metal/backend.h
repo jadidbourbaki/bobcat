@@ -15,6 +15,14 @@ struct gip_metal;
 /* A Metal buffer in memory shared by the CPU and GPU.  */
 struct gip_metal_buffer;
 
+/* A position inside a Metal buffer: OFFSET bytes past the start of
+   BUFFER.  */
+struct gip_metal_view
+{
+  struct gip_metal_buffer *buffer;
+  size_t offset;
+};
+
 /* Open the default Metal device, compile gip's kernels, and store the
    backend in OUT.  On failure, write a message to ERR, which holds
    ERR_SIZE bytes.  */
@@ -37,20 +45,72 @@ struct gip_metal_buffer *gip_metal_buffer_wrap (struct gip_metal *metal,
 /* Return the CPU address of the contents of BUFFER.  */
 void *gip_metal_buffer_contents (struct gip_metal_buffer *buffer);
 
+/* Return a view of BUFFER at byte OFFSET.  */
+struct gip_metal_view gip_metal_at (struct gip_metal_buffer *buffer,
+                                    size_t offset);
+
 /* Release BUFFER.  */
 void gip_metal_buffer_free (struct gip_metal_buffer *buffer);
 
-/* Start recording kernel launches on METAL into a new command buffer.  */
+/* Start recording kernel launches on METAL into a new command buffer.
+   Each launch reads the results of the launches recorded before it.  */
 enum gip_status gip_metal_begin (struct gip_metal *metal);
 
-/* Record a multiply of the Q8_0 matrix at byte WEIGHTS_OFFSET of
-   WEIGHTS, which has N_ROWS rows of N_COLS elements, by the N_COLS
-   floats in X.  The N_ROWS results go to Y.  */
+/* Record a multiply of the Q8_0 matrix at WEIGHTS, which has N_ROWS rows
+   of N_COLS elements, by the N_COLS floats at X.  The N_ROWS results go
+   to Y.  */
 void gip_metal_matvec_q8_0 (struct gip_metal *metal,
-                            struct gip_metal_buffer *weights,
-                            size_t weights_offset, uint32_t n_rows,
-                            uint32_t n_cols, struct gip_metal_buffer *x,
-                            struct gip_metal_buffer *y);
+                            struct gip_metal_view weights, uint32_t n_rows,
+                            uint32_t n_cols, struct gip_metal_view x,
+                            struct gip_metal_view y);
+
+/* Record an RMS normalization of the N floats at X, scaled by the N
+   floats at WEIGHT, into OUT.  */
+void gip_metal_rms_norm (struct gip_metal *metal, struct gip_metal_view x,
+                         struct gip_metal_view weight,
+                         struct gip_metal_view out, uint32_t n, float eps);
+
+/* Record the per-head RMS normalization and rotary embedding of the
+   N_HEADS heads of HEAD_DIM floats at VEC for position POS.  */
+void gip_metal_qk_norm_rope (struct gip_metal *metal,
+                             struct gip_metal_view vec,
+                             struct gip_metal_view weight, uint32_t n_heads,
+                             uint32_t head_dim, uint32_t pos, float theta,
+                             float eps);
+
+/* Record attention of the N_HEADS query heads at Q over the first N_KEYS
+   positions of K_CACHE and V_CACHE into OUT.  Each cache holds N_CTX
+   positions of N_KV_HEADS heads of HEAD_DIM floats.  SCORES holds
+   N_HEADS * N_CTX floats of scratch.  */
+void gip_metal_attention (struct gip_metal *metal, struct gip_metal_view q,
+                          struct gip_metal_view k_cache,
+                          struct gip_metal_view v_cache,
+                          struct gip_metal_view scores,
+                          struct gip_metal_view out, uint32_t n_heads,
+                          uint32_t n_kv_heads, uint32_t head_dim,
+                          uint32_t n_keys, uint32_t n_ctx);
+
+/* Record the gated short convolution of the 3 * N_EMBD floats at BCX
+   with KERNEL_SIZE taps per channel at TAPS.  HISTORY holds the previous
+   KERNEL_SIZE - 1 inputs and moves forward one token.  The N_EMBD
+   results go to OUT.  */
+void gip_metal_short_conv (struct gip_metal *metal, struct gip_metal_view bcx,
+                           struct gip_metal_view taps,
+                           struct gip_metal_view history,
+                           struct gip_metal_view out, uint32_t n_embd,
+                           uint32_t kernel_size);
+
+/* Record GATE = SiLU (GATE) * UP over N floats.  */
+void gip_metal_swiglu (struct gip_metal *metal, struct gip_metal_view gate,
+                       struct gip_metal_view up, uint32_t n);
+
+/* Record H += DELTA over N floats.  */
+void gip_metal_add (struct gip_metal *metal, struct gip_metal_view h,
+                    struct gip_metal_view delta, uint32_t n);
+
+/* Record a copy of N floats from SRC to DST.  */
+void gip_metal_copy (struct gip_metal *metal, struct gip_metal_view src,
+                     struct gip_metal_view dst, uint32_t n);
 
 /* Run the recorded launches of METAL and wait for them.  Store the GPU
    time in seconds in GPU_SECONDS unless it is null.  */

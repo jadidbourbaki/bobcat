@@ -1,15 +1,23 @@
-/* lfm2_reference.c checks gip's scalar LFM2 forward pass against
-   activations that tools/ref_dump.py saved from transformers.  The test
-   compares the embedding, every layer's output, the final norm, and the
-   logits for each prompt token, then checks that greedy decoding
-   reproduces transformers' continuation token for token.  */
+/* lfm2_reference.c checks gip's LFM2 forward pass against activations
+   that tools/ref_dump.py saved from transformers.  The test runs either
+   the scalar pass or the Metal pass.  It compares the embedding, every
+   layer's output, the final norm, and the logits for each prompt token,
+   then checks that greedy decoding reproduces transformers'
+   continuation token for token.  */
 
 #include <math.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "model_lfm2.h"
+
+/* The Metal backend exists only on macOS, so its header and calls are
+   compiled only there.  */
+#if GIP_HAVE_METAL
+#include "model_lfm2_metal.h"
+#endif
 
 enum
 {
@@ -19,9 +27,33 @@ enum
 };
 
 /* The largest error allowed, relative to the largest magnitude in the
-   reference row.  Both sides compute in float32 from the same bfloat16
-   weights, so only summation order separates them.  */
+   reference row.  Both sides compute in float32 from the same weights,
+   so only summation order separates them.  */
 static const double TOLERANCE = 1e-4;
+
+/* The forward pass under test.  */
+struct runner
+{
+  const struct gip_lfm2_model *model;
+  bool use_metal;
+  struct gip_lfm2_state state;
+#if GIP_HAVE_METAL
+  struct gip_metal *metal;
+  struct gip_lfm2_metal gpu;
+#endif
+};
+
+/* Run one step of the forward pass of R, as gip_lfm2_step does.  */
+static enum gip_status
+run_step (struct runner *r, int32_t token, float *logits,
+          const struct gip_lfm2_trace *trace)
+{
+#if GIP_HAVE_METAL
+  if (r->use_metal)
+    return gip_lfm2_metal_step (&r->gpu, token, logits, trace);
+#endif
+  return gip_lfm2_step (r->model, &r->state, token, logits, trace);
+}
 
 /* Read the file NAME in directory DIR into a new buffer of COUNT
    elements of ELEMENT_SIZE bytes.  Store the element count in COUNT
@@ -95,13 +127,20 @@ argmax (const float *x, size_t n)
 int
 main (int argc, char **argv)
 {
-  if (argc != 3)
+  if (argc != 3 && argc != 4)
     {
-      fprintf (stderr, "usage: lfm2_reference MODEL.gguf REF_DIR\n");
+      fprintf (stderr,
+               "usage: lfm2_reference MODEL.gguf REF_DIR [scalar|metal]\n");
       return EXIT_FAILURE;
     }
   const char *model_path = argv[1];
   const char *ref_dir = argv[2];
+  bool use_metal = argc == 4 && strcmp (argv[3], "metal") == 0;
+  if (use_metal && !GIP_HAVE_METAL)
+    {
+      printf ("skip: this build has no Metal backend\n");
+      return EXIT_SKIP;
+    }
 
   size_t n_tokens = 0;
   size_t n_generated = 0;
@@ -160,9 +199,27 @@ main (int argc, char **argv)
         }
     }
 
-  struct gip_lfm2_state state;
-  status = gip_lfm2_state_init (&model, (uint32_t)(n_tokens + n_generated),
-                                &state);
+  struct runner runner = { .model = &model, .use_metal = use_metal };
+  uint32_t n_ctx = (uint32_t)(n_tokens + n_generated);
+  if (use_metal)
+    {
+#if GIP_HAVE_METAL
+      if (gip_metal_open (&runner.metal, err, sizeof err) != GIP_OK)
+        {
+          printf ("skip: %s\n", err);
+          return EXIT_SKIP;
+        }
+      status = gip_lfm2_metal_init (&model, runner.metal, n_ctx, &runner.gpu,
+                                    err, sizeof err);
+      if (status != GIP_OK)
+        {
+          fprintf (stderr, "lfm2_reference: %s\n", err);
+          return EXIT_FAILURE;
+        }
+#endif
+    }
+  else
+    status = gip_lfm2_state_init (&model, n_ctx, &runner.state);
   float *embedding = malloc (n_embd * sizeof (float));
   float *layers = malloc (n_layers * n_embd * sizeof (float));
   float *final_norm = malloc (n_embd * sizeof (float));
@@ -187,7 +244,7 @@ main (int argc, char **argv)
 
   for (size_t t = 0; t < n_tokens; t++)
     {
-      status = gip_lfm2_step (&model, &state, tokens[t], logits, &trace);
+      status = run_step (&runner, tokens[t], logits, &trace);
       if (status != GIP_OK)
         {
           fprintf (stderr, "lfm2_reference: step failed: %s\n",
@@ -250,7 +307,7 @@ main (int argc, char **argv)
       matched++;
       if (g + 1 < n_generated)
         {
-          status = gip_lfm2_step (&model, &state, predicted, logits, NULL);
+          status = run_step (&runner, predicted, logits, NULL);
           if (status != GIP_OK)
             {
               fprintf (stderr, "lfm2_reference: step failed: %s\n",
@@ -274,7 +331,15 @@ main (int argc, char **argv)
   free (logits);
   free (tokens);
   free (generated);
-  gip_lfm2_state_free (&state);
+#if GIP_HAVE_METAL
+  if (use_metal)
+    {
+      gip_lfm2_metal_free (&runner.gpu);
+      gip_metal_close (runner.metal);
+    }
+#endif
+  if (!use_metal)
+    gip_lfm2_state_free (&runner.state);
   gip_lfm2_free (&model);
   return EXIT_SUCCESS;
 }

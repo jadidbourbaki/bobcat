@@ -46,10 +46,12 @@ check: setup
 fmt: setup
     ninja -C {{build_dir}} clang-format
 
-# Measure GPU bandwidth and the llama.cpp Metal and mlx-lm baselines.
+# Measure GPU bandwidth, gip, and the llama.cpp Metal and mlx-lm baselines.
 bench: setup
     meson compile -C {{release_dir}}
     {{release_dir}}/tools/gpu_bw
+    @echo "gip $(git rev-parse --short HEAD), Metal"
+    for model in {{gguf_models}}; do [ "$model" = "-m" ] || {{release_dir}}/tools/gip_bench "$model"; done
     @echo "llama.cpp $(git -C bench/llama.cpp rev-parse --short HEAD), Metal"
     {{llama_bench_metal}} {{gguf_models}} -p 512 -n 128 -r 5 -o md
     @cd tools && uv run python -c "import mlx.core, mlx_lm; print('mlx', mlx.core.__version__, 'mlx-lm', mlx_lm.__version__)"

@@ -14,6 +14,7 @@ have_metal = host_machine.system() == 'darwin'
 if have_metal
   subdir('metal')
   gip_sources += metal_sources
+  gip_sources += files('model_lfm2_metal.c')
   gip_deps += metal_dep
 endif
 

@@ -1,0 +1,55 @@
+/* model_lfm2_metal.h declares the LFM2 forward pass on the Metal GPU.  */
+
+#ifndef GIP_MODEL_LFM2_METAL_H
+#define GIP_MODEL_LFM2_METAL_H
+
+#include "metal/backend.h"
+#include "model_lfm2.h"
+
+/* The GPU state of one LFM2 decode on METAL: the weights, the caches,
+   and the scratch buffers.  N_PAST counts the tokens processed so
+   far.  */
+struct gip_lfm2_metal
+{
+  const struct gip_lfm2_model *model;
+  struct gip_metal *metal;
+  uint32_t n_ctx;
+  uint32_t n_past;
+  struct gip_metal_buffer *weights;
+  const unsigned char *weights_base;
+  struct gip_metal_buffer *k_cache;
+  struct gip_metal_buffer *v_cache;
+  struct gip_metal_buffer *conv_state;
+  struct gip_metal_buffer *hidden;
+  struct gip_metal_buffer *normed;
+  struct gip_metal_buffer *block_out;
+  struct gip_metal_buffer *bcx;
+  struct gip_metal_buffer *conv_out;
+  struct gip_metal_buffer *q;
+  struct gip_metal_buffer *attn;
+  struct gip_metal_buffer *scores;
+  struct gip_metal_buffer *gate;
+  struct gip_metal_buffer *up;
+  struct gip_metal_buffer *logits;
+  struct gip_metal_buffer *trace_layers;
+  struct gip_metal_buffer *trace_final;
+};
+
+/* Prepare GPU for decoding sequences of up to N_CTX tokens of MODEL on
+   METAL.  Every matrix of MODEL must be Q8_0.  On failure, write a
+   message to ERR, which holds ERR_SIZE bytes.  */
+enum gip_status gip_lfm2_metal_init (const struct gip_lfm2_model *model,
+                                     struct gip_metal *metal, uint32_t n_ctx,
+                                     struct gip_lfm2_metal *gpu, char *err,
+                                     size_t err_size);
+
+/* Release everything GPU owns.  */
+void gip_lfm2_metal_free (struct gip_lfm2_metal *gpu);
+
+/* Run the model on TOKEN at the next position of GPU, with the same
+   outputs as gip_lfm2_step.  */
+enum gip_status gip_lfm2_metal_step (struct gip_lfm2_metal *gpu, int32_t token,
+                                     float *logits,
+                                     const struct gip_lfm2_trace *trace);
+
+#endif /* GIP_MODEL_LFM2_METAL_H */

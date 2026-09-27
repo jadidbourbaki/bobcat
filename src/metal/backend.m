@@ -20,7 +20,11 @@ enum
      the starting point of llama.cpp's Q8_0 matrix-vector kernel.  Tune
      both with just bench.  */
   MATVEC_Q8_0_ROWS_PER_SIMDGROUP = 4,
-  MATVEC_Q8_0_SIMDGROUPS = 2
+  MATVEC_Q8_0_SIMDGROUPS = 2,
+  /* Threads per threadgroup for the reduction and elementwise
+     kernels.  */
+  REDUCE_THREADS = 256,
+  ELEMENTWISE_THREADS = 256
 };
 
 /* The state behind a struct gip_metal.  */
@@ -28,6 +32,15 @@ enum
 @property (nonatomic, strong) id<MTLDevice> device;
 @property (nonatomic, strong) id<MTLCommandQueue> queue;
 @property (nonatomic, strong) id<MTLComputePipelineState> matvec_q8_0;
+@property (nonatomic, strong) id<MTLComputePipelineState> rms_norm;
+@property (nonatomic, strong) id<MTLComputePipelineState> qk_norm_rope;
+@property (nonatomic, strong) id<MTLComputePipelineState> attention;
+@property (nonatomic, strong) id<MTLComputePipelineState> short_conv;
+@property (nonatomic, strong) id<MTLComputePipelineState> swiglu;
+@property (nonatomic, strong) id<MTLComputePipelineState> add_in_place;
+/* Objective-C treats a property named copy... as returning an owned
+   object, so the copy pipeline takes a different name.  */
+@property (nonatomic, strong) id<MTLComputePipelineState> float_copy;
 @property (nonatomic, strong) id<MTLCommandBuffer> command_buffer;
 @property (nonatomic, strong) id<MTLComputeCommandEncoder> encoder;
 @end
@@ -51,7 +64,7 @@ metal_buffer (struct gip_metal_buffer *buffer)
 
 /* Return a pipeline for the kernel NAME in LIBRARY on DEVICE with the
    function constant at index 0 set to CONSTANT, or nil.  Store any
-   error in ERROR.  */
+   error in ERROR.  Kernels without the constant ignore it.  */
 static id<MTLComputePipelineState>
 make_pipeline (id<MTLDevice> device, id<MTLLibrary> library, NSString *name,
                uint32_t constant, NSError **error)
@@ -94,11 +107,26 @@ gip_metal_open (struct gip_metal **out, char *err, size_t err_size)
         return GIP_ERR_UNSUPPORTED;
       }
 
-    id<MTLComputePipelineState> matvec_q8_0
-        = make_pipeline (device, library, @"matvec_q8_0",
-                         MATVEC_Q8_0_ROWS_PER_SIMDGROUP, &error);
-    id<MTLCommandQueue> queue = [device newCommandQueue];
-    if (matvec_q8_0 == nil || queue == nil)
+    GipMetal *metal = [GipMetal new];
+    metal.device = device;
+    metal.queue = [device newCommandQueue];
+    metal.matvec_q8_0 = make_pipeline (device, library, @"matvec_q8_0",
+                                       MATVEC_Q8_0_ROWS_PER_SIMDGROUP, &error);
+    metal.rms_norm = make_pipeline (device, library, @"rms_norm", 0, &error);
+    metal.qk_norm_rope
+        = make_pipeline (device, library, @"qk_norm_rope", 0, &error);
+    metal.attention = make_pipeline (device, library, @"attention", 0, &error);
+    metal.short_conv
+        = make_pipeline (device, library, @"short_conv", 0, &error);
+    metal.swiglu = make_pipeline (device, library, @"swiglu", 0, &error);
+    metal.add_in_place
+        = make_pipeline (device, library, @"add_in_place", 0, &error);
+    metal.float_copy
+        = make_pipeline (device, library, @"copy_floats", 0, &error);
+    if (metal.queue == nil || metal.matvec_q8_0 == nil || metal.rms_norm == nil
+        || metal.qk_norm_rope == nil || metal.attention == nil
+        || metal.short_conv == nil || metal.swiglu == nil
+        || metal.add_in_place == nil || metal.float_copy == nil)
       {
         gip_format_error (err, err_size, "cannot create Metal pipelines: %s",
                           error != nil ? error.localizedDescription.UTF8String
@@ -106,10 +134,6 @@ gip_metal_open (struct gip_metal **out, char *err, size_t err_size)
         return GIP_ERR_UNSUPPORTED;
       }
 
-    GipMetal *metal = [GipMetal new];
-    metal.device = device;
-    metal.queue = queue;
-    metal.matvec_q8_0 = matvec_q8_0;
     *out = (__bridge_retained void *)metal;
     return GIP_OK;
   }
@@ -163,6 +187,13 @@ gip_metal_buffer_contents (struct gip_metal_buffer *buffer)
   return metal_buffer (buffer).contents;
 }
 
+struct gip_metal_view
+gip_metal_at (struct gip_metal_buffer *buffer, size_t offset)
+{
+  struct gip_metal_view view = { buffer, offset };
+  return view;
+}
+
 void
 gip_metal_buffer_free (struct gip_metal_buffer *buffer)
 {
@@ -193,11 +224,37 @@ gip_metal_begin (struct gip_metal *metal)
   return GIP_OK;
 }
 
+/* Bind VIEW to buffer slot INDEX of ENCODER.  */
+static void
+bind (id<MTLComputeCommandEncoder> encoder, struct gip_metal_view view,
+      NSUInteger index)
+{
+  [encoder setBuffer:metal_buffer (view.buffer)
+              offset:view.offset
+             atIndex:index];
+}
+
+/* Bind the SIZE bytes at VALUE to slot INDEX of ENCODER.  */
+static void
+bind_bytes (id<MTLComputeCommandEncoder> encoder, const void *value,
+            size_t size, NSUInteger index)
+{
+  [encoder setBytes:value length:size atIndex:index];
+}
+
+/* Dispatch N threads of the current pipeline of ENCODER in threadgroups
+   of ELEMENTWISE_THREADS.  */
+static void
+dispatch_elements (id<MTLComputeCommandEncoder> encoder, uint32_t n)
+{
+  [encoder dispatchThreads:MTLSizeMake (n, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake (ELEMENTWISE_THREADS, 1, 1)];
+}
+
 void
-gip_metal_matvec_q8_0 (struct gip_metal *metal,
-                       struct gip_metal_buffer *weights, size_t weights_offset,
+gip_metal_matvec_q8_0 (struct gip_metal *metal, struct gip_metal_view weights,
                        uint32_t n_rows, uint32_t n_cols,
-                       struct gip_metal_buffer *x, struct gip_metal_buffer *y)
+                       struct gip_metal_view x, struct gip_metal_view y)
 {
   GipMetal *m = backend (metal);
   id<MTLComputeCommandEncoder> encoder = m.encoder;
@@ -207,15 +264,142 @@ gip_metal_matvec_q8_0 (struct gip_metal *metal,
       = (n_rows + rows_per_threadgroup - 1) / rows_per_threadgroup;
 
   [encoder setComputePipelineState:m.matvec_q8_0];
-  [encoder setBuffer:metal_buffer (weights) offset:weights_offset atIndex:0];
-  [encoder setBuffer:metal_buffer (x) offset:0 atIndex:1];
-  [encoder setBuffer:metal_buffer (y) offset:0 atIndex:2];
-  [encoder setBytes:&n_rows length:sizeof n_rows atIndex:3];
-  [encoder setBytes:&n_cols length:sizeof n_cols atIndex:4];
+  bind (encoder, weights, 0);
+  bind (encoder, x, 1);
+  bind (encoder, y, 2);
+  bind_bytes (encoder, &n_rows, sizeof n_rows, 3);
+  bind_bytes (encoder, &n_cols, sizeof n_cols, 4);
   [encoder
        dispatchThreadgroups:MTLSizeMake (n_threadgroups, 1, 1)
       threadsPerThreadgroup:MTLSizeMake (SIMD_WIDTH * MATVEC_Q8_0_SIMDGROUPS,
                                          1, 1)];
+}
+
+void
+gip_metal_rms_norm (struct gip_metal *metal, struct gip_metal_view x,
+                    struct gip_metal_view weight, struct gip_metal_view out,
+                    uint32_t n, float eps)
+{
+  GipMetal *m = backend (metal);
+  id<MTLComputeCommandEncoder> encoder = m.encoder;
+
+  [encoder setComputePipelineState:m.rms_norm];
+  bind (encoder, x, 0);
+  bind (encoder, weight, 1);
+  bind (encoder, out, 2);
+  bind_bytes (encoder, &n, sizeof n, 3);
+  bind_bytes (encoder, &eps, sizeof eps, 4);
+  [encoder dispatchThreadgroups:MTLSizeMake (1, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake (REDUCE_THREADS, 1, 1)];
+}
+
+void
+gip_metal_qk_norm_rope (struct gip_metal *metal, struct gip_metal_view vec,
+                        struct gip_metal_view weight, uint32_t n_heads,
+                        uint32_t head_dim, uint32_t pos, float theta,
+                        float eps)
+{
+  GipMetal *m = backend (metal);
+  id<MTLComputeCommandEncoder> encoder = m.encoder;
+
+  [encoder setComputePipelineState:m.qk_norm_rope];
+  bind (encoder, vec, 0);
+  bind (encoder, weight, 1);
+  bind_bytes (encoder, &head_dim, sizeof head_dim, 2);
+  bind_bytes (encoder, &pos, sizeof pos, 3);
+  bind_bytes (encoder, &theta, sizeof theta, 4);
+  bind_bytes (encoder, &eps, sizeof eps, 5);
+  [encoder dispatchThreadgroups:MTLSizeMake (n_heads, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake (head_dim, 1, 1)];
+}
+
+void
+gip_metal_attention (struct gip_metal *metal, struct gip_metal_view q,
+                     struct gip_metal_view k_cache,
+                     struct gip_metal_view v_cache,
+                     struct gip_metal_view scores, struct gip_metal_view out,
+                     uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                     uint32_t n_keys, uint32_t n_ctx)
+{
+  GipMetal *m = backend (metal);
+  id<MTLComputeCommandEncoder> encoder = m.encoder;
+  float scale = 1.0f / sqrtf ((float)head_dim);
+
+  [encoder setComputePipelineState:m.attention];
+  bind (encoder, q, 0);
+  bind (encoder, k_cache, 1);
+  bind (encoder, v_cache, 2);
+  bind (encoder, scores, 3);
+  bind (encoder, out, 4);
+  bind_bytes (encoder, &n_heads, sizeof n_heads, 5);
+  bind_bytes (encoder, &n_kv_heads, sizeof n_kv_heads, 6);
+  bind_bytes (encoder, &head_dim, sizeof head_dim, 7);
+  bind_bytes (encoder, &n_keys, sizeof n_keys, 8);
+  bind_bytes (encoder, &n_ctx, sizeof n_ctx, 9);
+  bind_bytes (encoder, &scale, sizeof scale, 10);
+  [encoder dispatchThreadgroups:MTLSizeMake (n_heads, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake (REDUCE_THREADS, 1, 1)];
+}
+
+void
+gip_metal_short_conv (struct gip_metal *metal, struct gip_metal_view bcx,
+                      struct gip_metal_view taps,
+                      struct gip_metal_view history, struct gip_metal_view out,
+                      uint32_t n_embd, uint32_t kernel_size)
+{
+  GipMetal *m = backend (metal);
+  id<MTLComputeCommandEncoder> encoder = m.encoder;
+
+  [encoder setComputePipelineState:m.short_conv];
+  bind (encoder, bcx, 0);
+  bind (encoder, taps, 1);
+  bind (encoder, history, 2);
+  bind (encoder, out, 3);
+  bind_bytes (encoder, &n_embd, sizeof n_embd, 4);
+  bind_bytes (encoder, &kernel_size, sizeof kernel_size, 5);
+  dispatch_elements (encoder, n_embd);
+}
+
+void
+gip_metal_swiglu (struct gip_metal *metal, struct gip_metal_view gate,
+                  struct gip_metal_view up, uint32_t n)
+{
+  GipMetal *m = backend (metal);
+  id<MTLComputeCommandEncoder> encoder = m.encoder;
+
+  [encoder setComputePipelineState:m.swiglu];
+  bind (encoder, gate, 0);
+  bind (encoder, up, 1);
+  bind_bytes (encoder, &n, sizeof n, 2);
+  dispatch_elements (encoder, n);
+}
+
+void
+gip_metal_add (struct gip_metal *metal, struct gip_metal_view h,
+               struct gip_metal_view delta, uint32_t n)
+{
+  GipMetal *m = backend (metal);
+  id<MTLComputeCommandEncoder> encoder = m.encoder;
+
+  [encoder setComputePipelineState:m.add_in_place];
+  bind (encoder, h, 0);
+  bind (encoder, delta, 1);
+  bind_bytes (encoder, &n, sizeof n, 2);
+  dispatch_elements (encoder, n);
+}
+
+void
+gip_metal_copy (struct gip_metal *metal, struct gip_metal_view src,
+                struct gip_metal_view dst, uint32_t n)
+{
+  GipMetal *m = backend (metal);
+  id<MTLComputeCommandEncoder> encoder = m.encoder;
+
+  [encoder setComputePipelineState:m.float_copy];
+  bind (encoder, src, 0);
+  bind (encoder, dst, 1);
+  bind_bytes (encoder, &n, sizeof n, 2);
+  dispatch_elements (encoder, n);
 }
 
 enum gip_status

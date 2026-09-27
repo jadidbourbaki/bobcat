@@ -91,7 +91,8 @@ check_shape (struct gip_metal *metal, uint32_t n_rows, uint32_t n_cols)
       fprintf (stderr, "metal_matvec: cannot start a command buffer\n");
       exit (EXIT_FAILURE);
     }
-  gip_metal_matvec_q8_0 (metal, weights, 0, n_rows, n_cols, x, y);
+  gip_metal_matvec_q8_0 (metal, gip_metal_at (weights, 0), n_rows, n_cols,
+                         gip_metal_at (x, 0), gip_metal_at (y, 0));
   if (gip_metal_end (metal, NULL) != GIP_OK)
     {
       fprintf (stderr, "metal_matvec: the command buffer failed\n");
