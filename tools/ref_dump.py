@@ -5,7 +5,13 @@ Usage:
     uv run python ref_dump.py --model LiquidAI/LFM2.5-350M \
         --out ../models/ref/LFM2.5-350M
 
-The script runs the model in float32 on the CPU and writes raw
+    uv run python ref_dump.py --model LiquidAI/LFM2.5-350M \
+        --gguf ../models/LFM2.5-350M-Q8_0.gguf \
+        --out ../models/ref/LFM2.5-350M-Q8_0
+
+With `--gguf`, the weights come from the GGUF file, dequantized to
+float32, and the tokenizer still comes from `--model`. The script runs
+the model in float32 on the CPU and writes raw
 little-endian files to the output directory. `tokens.i32` holds the
 prompt token ids. `embedding.f32`, `layer_NN.f32`, and `final_norm.f32`
 hold one row of hidden size per prompt token. `logits.f32` holds one
@@ -32,6 +38,9 @@ def parse_args() -> argparse.Namespace:
         description="Dump reference activations for gip's tests."
     )
     parser.add_argument("--model", required=True, help="Hugging Face repo or path")
+    parser.add_argument(
+        "--gguf", type=pathlib.Path, help="load the weights from this GGUF file"
+    )
     parser.add_argument("--out", required=True, type=pathlib.Path)
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument(
@@ -51,9 +60,18 @@ def main() -> None:
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.model)
     if tokenizer is None:
         raise RuntimeError(f"no tokenizer found for {args.model}")
-    model = transformers.AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=torch.float32
-    )
+    if args.gguf is not None:
+        gguf_path = args.gguf.resolve()
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            gguf_path.parent,
+            gguf_file=gguf_path.name,
+            dtype=torch.float32,
+            device_map="cpu",
+        )
+    else:
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            args.model, dtype=torch.float32, device_map="cpu"
+        )
     model.eval()
 
     input_ids = tokenizer(args.prompt, return_tensors="pt").input_ids
@@ -97,6 +115,7 @@ def main() -> None:
 
     manifest = {
         "model": args.model,
+        "gguf": str(args.gguf) if args.gguf is not None else None,
         "prompt": args.prompt,
         "n_tokens": int(input_ids.shape[1]),
         "n_generated": int(generated.shape[0]),
