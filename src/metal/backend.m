@@ -24,7 +24,17 @@ enum
   /* Threads per threadgroup for the reduction and elementwise
      kernels.  */
   REDUCE_THREADS = 256,
-  ELEMENTWISE_THREADS = 256
+  ELEMENTWISE_THREADS = 256,
+  /* Distinct kernel and shape pairs a profile keeps.  A model has far
+     fewer.  */
+  MAX_PROFILE_ENTRIES = 64
+};
+
+/* The profile of a backend: one entry per kernel and matrix shape.  */
+struct profile_table
+{
+  size_t count;
+  struct gip_metal_profile_entry entries[MAX_PROFILE_ENTRIES];
 };
 
 /* The state behind a struct gip_metal.  */
@@ -43,9 +53,17 @@ enum
 @property (nonatomic, strong) id<MTLComputePipelineState> float_copy;
 @property (nonatomic, strong) id<MTLCommandBuffer> command_buffer;
 @property (nonatomic, strong) id<MTLComputeCommandEncoder> encoder;
+@property (nonatomic) BOOL profiling;
+@property (nonatomic, strong) id<MTLCommandBuffer> op_command_buffer;
+@property (nonatomic, strong) id<MTLComputeCommandEncoder> op_encoder;
+@property (nonatomic) struct profile_table *profile;
 @end
 
 @implementation GipMetal
+- (void)dealloc
+{
+  free (_profile);
+}
 @end
 
 /* Return the GipMetal object behind METAL.  */
@@ -132,6 +150,13 @@ gip_metal_open (struct gip_metal **out, char *err, size_t err_size)
                           error != nil ? error.localizedDescription.UTF8String
                                        : "no command queue");
         return GIP_ERR_UNSUPPORTED;
+      }
+
+    metal.profile = calloc (1, sizeof (struct profile_table));
+    if (metal.profile == NULL)
+      {
+        gip_format_error (err, err_size, "out of memory");
+        return GIP_ERR_NOMEM;
       }
 
     *out = (__bridge_retained void *)metal;
@@ -251,13 +276,86 @@ dispatch_elements (id<MTLComputeCommandEncoder> encoder, uint32_t n)
       threadsPerThreadgroup:MTLSizeMake (ELEMENTWISE_THREADS, 1, 1)];
 }
 
+/* Return the encoder the next launch on M records into.  While
+   profiling, each launch gets a command buffer of its own.  */
+static id<MTLComputeCommandEncoder>
+op_encoder (GipMetal *m)
+{
+  if (!m.profiling)
+    return m.encoder;
+  @autoreleasepool
+  {
+    m.op_command_buffer = [m.queue commandBuffer];
+    m.op_encoder = [m.op_command_buffer computeCommandEncoder];
+  }
+  return m.op_encoder;
+}
+
+/* Finish a launch of the kernel NAME on M.  While profiling, run the
+   launch's command buffer and add its GPU time to the entry for NAME,
+   N_ROWS, and N_COLS, along with the BYTES of weights it read.  */
+static void
+op_done (GipMetal *m, const char *name, uint32_t n_rows, uint32_t n_cols,
+         uint64_t bytes)
+{
+  if (!m.profiling)
+    return;
+
+  id<MTLCommandBuffer> command_buffer = m.op_command_buffer;
+  [m.op_encoder endEncoding];
+  [command_buffer commit];
+  [command_buffer waitUntilCompleted];
+  m.op_encoder = nil;
+  m.op_command_buffer = nil;
+
+  struct profile_table *table = m.profile;
+  struct gip_metal_profile_entry *entry = NULL;
+  for (size_t i = 0; i < table->count && entry == NULL; i++)
+    if (strcmp (table->entries[i].name, name) == 0
+        && table->entries[i].n_rows == n_rows
+        && table->entries[i].n_cols == n_cols)
+      entry = &table->entries[i];
+  if (entry == NULL)
+    {
+      if (table->count == MAX_PROFILE_ENTRIES)
+        return;
+      entry = &table->entries[table->count++];
+      entry->name = name;
+      entry->n_rows = n_rows;
+      entry->n_cols = n_cols;
+    }
+  entry->calls++;
+  entry->seconds += command_buffer.GPUEndTime - command_buffer.GPUStartTime;
+  entry->bytes += bytes;
+}
+
+void
+gip_metal_set_profiling (struct gip_metal *metal, int enabled)
+{
+  GipMetal *m = backend (metal);
+
+  m.profiling = enabled != 0;
+  if (enabled)
+    memset (m.profile, 0, sizeof *m.profile);
+}
+
+size_t
+gip_metal_profile (struct gip_metal *metal,
+                   const struct gip_metal_profile_entry **entries)
+{
+  GipMetal *m = backend (metal);
+
+  *entries = m.profile->entries;
+  return m.profile->count;
+}
+
 void
 gip_metal_matvec_q8_0 (struct gip_metal *metal, struct gip_metal_view weights,
                        uint32_t n_rows, uint32_t n_cols,
                        struct gip_metal_view x, struct gip_metal_view y)
 {
   GipMetal *m = backend (metal);
-  id<MTLComputeCommandEncoder> encoder = m.encoder;
+  id<MTLComputeCommandEncoder> encoder = op_encoder (m);
   uint32_t rows_per_threadgroup
       = MATVEC_Q8_0_ROWS_PER_SIMDGROUP * MATVEC_Q8_0_SIMDGROUPS;
   NSUInteger n_threadgroups
@@ -273,6 +371,8 @@ gip_metal_matvec_q8_0 (struct gip_metal *metal, struct gip_metal_view weights,
        dispatchThreadgroups:MTLSizeMake (n_threadgroups, 1, 1)
       threadsPerThreadgroup:MTLSizeMake (SIMD_WIDTH * MATVEC_Q8_0_SIMDGROUPS,
                                          1, 1)];
+  op_done (m, "matvec_q8_0", n_rows, n_cols,
+           (uint64_t)n_rows * (n_cols / 32) * 34);
 }
 
 void
@@ -281,7 +381,7 @@ gip_metal_rms_norm (struct gip_metal *metal, struct gip_metal_view x,
                     uint32_t n, float eps)
 {
   GipMetal *m = backend (metal);
-  id<MTLComputeCommandEncoder> encoder = m.encoder;
+  id<MTLComputeCommandEncoder> encoder = op_encoder (m);
 
   [encoder setComputePipelineState:m.rms_norm];
   bind (encoder, x, 0);
@@ -291,6 +391,7 @@ gip_metal_rms_norm (struct gip_metal *metal, struct gip_metal_view x,
   bind_bytes (encoder, &eps, sizeof eps, 4);
   [encoder dispatchThreadgroups:MTLSizeMake (1, 1, 1)
           threadsPerThreadgroup:MTLSizeMake (REDUCE_THREADS, 1, 1)];
+  op_done (m, "rms_norm", 0, 0, 0);
 }
 
 void
@@ -300,7 +401,7 @@ gip_metal_qk_norm_rope (struct gip_metal *metal, struct gip_metal_view vec,
                         float eps)
 {
   GipMetal *m = backend (metal);
-  id<MTLComputeCommandEncoder> encoder = m.encoder;
+  id<MTLComputeCommandEncoder> encoder = op_encoder (m);
 
   [encoder setComputePipelineState:m.qk_norm_rope];
   bind (encoder, vec, 0);
@@ -311,6 +412,7 @@ gip_metal_qk_norm_rope (struct gip_metal *metal, struct gip_metal_view vec,
   bind_bytes (encoder, &eps, sizeof eps, 5);
   [encoder dispatchThreadgroups:MTLSizeMake (n_heads, 1, 1)
           threadsPerThreadgroup:MTLSizeMake (head_dim, 1, 1)];
+  op_done (m, "qk_norm_rope", 0, 0, 0);
 }
 
 void
@@ -322,7 +424,7 @@ gip_metal_attention (struct gip_metal *metal, struct gip_metal_view q,
                      uint32_t n_keys, uint32_t n_ctx)
 {
   GipMetal *m = backend (metal);
-  id<MTLComputeCommandEncoder> encoder = m.encoder;
+  id<MTLComputeCommandEncoder> encoder = op_encoder (m);
   float scale = 1.0f / sqrtf ((float)head_dim);
 
   [encoder setComputePipelineState:m.attention];
@@ -339,6 +441,7 @@ gip_metal_attention (struct gip_metal *metal, struct gip_metal_view q,
   bind_bytes (encoder, &scale, sizeof scale, 10);
   [encoder dispatchThreadgroups:MTLSizeMake (n_heads, 1, 1)
           threadsPerThreadgroup:MTLSizeMake (REDUCE_THREADS, 1, 1)];
+  op_done (m, "attention", 0, 0, 0);
 }
 
 void
@@ -348,7 +451,7 @@ gip_metal_short_conv (struct gip_metal *metal, struct gip_metal_view bcx,
                       uint32_t n_embd, uint32_t kernel_size)
 {
   GipMetal *m = backend (metal);
-  id<MTLComputeCommandEncoder> encoder = m.encoder;
+  id<MTLComputeCommandEncoder> encoder = op_encoder (m);
 
   [encoder setComputePipelineState:m.short_conv];
   bind (encoder, bcx, 0);
@@ -358,6 +461,7 @@ gip_metal_short_conv (struct gip_metal *metal, struct gip_metal_view bcx,
   bind_bytes (encoder, &n_embd, sizeof n_embd, 4);
   bind_bytes (encoder, &kernel_size, sizeof kernel_size, 5);
   dispatch_elements (encoder, n_embd);
+  op_done (m, "short_conv", 0, 0, 0);
 }
 
 void
@@ -365,13 +469,14 @@ gip_metal_swiglu (struct gip_metal *metal, struct gip_metal_view gate,
                   struct gip_metal_view up, uint32_t n)
 {
   GipMetal *m = backend (metal);
-  id<MTLComputeCommandEncoder> encoder = m.encoder;
+  id<MTLComputeCommandEncoder> encoder = op_encoder (m);
 
   [encoder setComputePipelineState:m.swiglu];
   bind (encoder, gate, 0);
   bind (encoder, up, 1);
   bind_bytes (encoder, &n, sizeof n, 2);
   dispatch_elements (encoder, n);
+  op_done (m, "swiglu", 0, 0, 0);
 }
 
 void
@@ -379,13 +484,14 @@ gip_metal_add (struct gip_metal *metal, struct gip_metal_view h,
                struct gip_metal_view delta, uint32_t n)
 {
   GipMetal *m = backend (metal);
-  id<MTLComputeCommandEncoder> encoder = m.encoder;
+  id<MTLComputeCommandEncoder> encoder = op_encoder (m);
 
   [encoder setComputePipelineState:m.add_in_place];
   bind (encoder, h, 0);
   bind (encoder, delta, 1);
   bind_bytes (encoder, &n, sizeof n, 2);
   dispatch_elements (encoder, n);
+  op_done (m, "add", 0, 0, 0);
 }
 
 void
@@ -393,13 +499,14 @@ gip_metal_copy (struct gip_metal *metal, struct gip_metal_view src,
                 struct gip_metal_view dst, uint32_t n)
 {
   GipMetal *m = backend (metal);
-  id<MTLComputeCommandEncoder> encoder = m.encoder;
+  id<MTLComputeCommandEncoder> encoder = op_encoder (m);
 
   [encoder setComputePipelineState:m.float_copy];
   bind (encoder, src, 0);
   bind (encoder, dst, 1);
   bind_bytes (encoder, &n, sizeof n, 2);
   dispatch_elements (encoder, n);
+  op_done (m, "copy", 0, 0, 0);
 }
 
 enum gip_status

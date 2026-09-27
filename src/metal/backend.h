@@ -116,4 +116,28 @@ void gip_metal_copy (struct gip_metal *metal, struct gip_metal_view src,
    time in seconds in GPU_SECONDS unless it is null.  */
 enum gip_status gip_metal_end (struct gip_metal *metal, double *gpu_seconds);
 
+/* The GPU time spent in one kernel on one shape while profiling.
+   N_ROWS and N_COLS describe matrix-vector launches and are zero for
+   other kernels.  BYTES counts the weight bytes the launches read.  */
+struct gip_metal_profile_entry
+{
+  const char *name;
+  uint32_t n_rows;
+  uint32_t n_cols;
+  uint64_t calls;
+  double seconds;
+  uint64_t bytes;
+};
+
+/* Turn profiling of METAL on or off.  Turning it on clears the counts.
+   While profiling is on, every launch runs in a command buffer of its
+   own and waits for it, so launches run slower and their GPU times add
+   up.  */
+void gip_metal_set_profiling (struct gip_metal *metal, int enabled);
+
+/* Store the profile entries of METAL in ENTRIES and return their
+   count.  */
+size_t gip_metal_profile (struct gip_metal *metal,
+                          const struct gip_metal_profile_entry **entries);
+
 #endif /* GIP_METAL_BACKEND_H */

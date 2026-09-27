@@ -27,6 +27,7 @@ static const struct option long_options[] = {
   { "prompt", required_argument, NULL, 'p' },
   { "generate", required_argument, NULL, 'n' },
   { "reps", required_argument, NULL, 'r' },
+  { "profile", no_argument, NULL, 'P' },
   { "help", no_argument, NULL, 'h' },
   { "version", no_argument, NULL, 'V' },
   { NULL, 0, NULL, 0 },
@@ -43,6 +44,7 @@ print_usage (FILE *stream)
            "  -p, --prompt=N     prompt tokens (default %d)\n"
            "  -n, --generate=N   generated tokens (default %d)\n"
            "  -r, --reps=N       repetitions (default %d)\n"
+           "  -P, --profile      break decode GPU time down by kernel\n"
            "  -h, --help         display this help and exit\n"
            "  -V, --version      output version information and exit\n",
            DEFAULT_PROMPT, DEFAULT_GENERATE, DEFAULT_REPS);
@@ -104,6 +106,79 @@ print_rates (const char *label, const double *rates, unsigned n)
   printf ("%-8s %9.2f ± %.2f tokens/s\n", label, mean, sqrt (variance));
 }
 
+/* Order profile entries by descending GPU time.  */
+static int
+compare_entries (const void *a, const void *b)
+{
+  const struct gip_metal_profile_entry *x = a;
+  const struct gip_metal_profile_entry *y = b;
+
+  return (x->seconds < y->seconds) - (x->seconds > y->seconds);
+}
+
+/* Prefill N_PROMPT tokens of MODEL on METAL, then decode N_GENERATE
+   tokens with profiling on and print each kernel's GPU time per token.
+   LOGITS holds the model's vocabulary size in floats.  */
+static void
+profile_decode (const struct gip_lfm2_model *model, struct gip_metal *metal,
+                unsigned n_prompt, unsigned n_generate, float *logits)
+{
+  struct gip_lfm2_metal gpu;
+  char err[512] = "";
+
+  if (gip_lfm2_metal_init (model, metal, n_prompt + n_generate, &gpu, err,
+                           sizeof err)
+      != GIP_OK)
+    {
+      fprintf (stderr, "gip_bench: %s\n", err);
+      exit (EXIT_FAILURE);
+    }
+  for (unsigned t = 0; t < n_prompt; t++)
+    gip_lfm2_metal_step (&gpu, PROMPT_TOKEN, t + 1 == n_prompt ? logits : NULL,
+                         NULL);
+
+  gip_metal_set_profiling (metal, 1);
+  for (unsigned t = 0; t < n_generate; t++)
+    gip_lfm2_metal_step (&gpu, argmax (logits, model->n_vocab), logits, NULL);
+  gip_metal_set_profiling (metal, 0);
+  gip_lfm2_metal_free (&gpu);
+
+  const struct gip_metal_profile_entry *entries;
+  size_t count = gip_metal_profile (metal, &entries);
+  struct gip_metal_profile_entry *sorted = malloc (count * sizeof *sorted);
+  if (sorted == NULL)
+    {
+      fprintf (stderr, "gip_bench: out of memory\n");
+      exit (EXIT_FAILURE);
+    }
+  memcpy (sorted, entries, count * sizeof *sorted);
+  qsort (sorted, count, sizeof *sorted, compare_entries);
+
+  double total = 0.0;
+  for (size_t i = 0; i < count; i++)
+    total += sorted[i].seconds;
+  printf ("\nprofiled decode, one command buffer per launch:\n");
+  printf ("%-14s %13s %10s %9s %6s %8s\n", "kernel", "shape", "launches",
+          "ms/token", "share", "GB/s");
+  for (size_t i = 0; i < count; i++)
+    {
+      char shape[32] = "";
+      if (sorted[i].n_rows != 0)
+        snprintf (shape, sizeof shape, "%ux%u", sorted[i].n_rows,
+                  sorted[i].n_cols);
+      double ms = sorted[i].seconds * 1e3 / n_generate;
+      printf ("%-14s %13s %10llu %9.3f %5.1f%%", sorted[i].name, shape,
+              (unsigned long long)(sorted[i].calls / n_generate), ms,
+              100.0 * sorted[i].seconds / total);
+      if (sorted[i].bytes != 0)
+        printf (" %8.1f", sorted[i].bytes / sorted[i].seconds / 1e9);
+      printf ("\n");
+    }
+  printf ("%-14s %13s %10s %9.3f\n", "total", "", "",
+          total * 1e3 / n_generate);
+  free (sorted);
+}
+
 /* Parse the options in ARGC and ARGV, load the model, and time REPS
    runs of prefill and decode.  */
 int
@@ -112,9 +187,10 @@ main (int argc, char **argv)
   unsigned n_prompt = DEFAULT_PROMPT;
   unsigned n_generate = DEFAULT_GENERATE;
   unsigned reps = DEFAULT_REPS;
+  int profile = 0;
   int opt;
 
-  while ((opt = getopt_long (argc, argv, "p:n:r:hV", long_options, NULL))
+  while ((opt = getopt_long (argc, argv, "p:n:r:PhV", long_options, NULL))
          != -1)
     switch (opt)
       {
@@ -126,6 +202,9 @@ main (int argc, char **argv)
         break;
       case 'r':
         parse_count (optarg, "repetition count", &reps);
+        break;
+      case 'P':
+        profile = 1;
         break;
       case 'h':
         print_usage (stdout);
@@ -163,6 +242,10 @@ main (int argc, char **argv)
       return EXIT_FAILURE;
     }
 
+  double total_decode_seconds = 0.0;
+  double total_encode_seconds = 0.0;
+  double total_gpu_seconds = 0.0;
+
   /* The first run warms the shader cache and the page cache and does not
      count.  */
   for (unsigned rep = 0; rep <= reps; rep++)
@@ -189,15 +272,21 @@ main (int argc, char **argv)
           }
       double prefill_seconds = now_seconds () - start;
 
+      double encode_seconds = 0.0;
+      double gpu_seconds = 0.0;
       start = now_seconds ();
       for (unsigned t = 0; t < n_generate; t++)
-        if (gip_lfm2_metal_step (&gpu, argmax (logits, model.n_vocab), logits,
-                                 NULL)
-            != GIP_OK)
-          {
-            fprintf (stderr, "gip_bench: decode step failed\n");
-            return EXIT_FAILURE;
-          }
+        {
+          if (gip_lfm2_metal_step (&gpu, argmax (logits, model.n_vocab),
+                                   logits, NULL)
+              != GIP_OK)
+            {
+              fprintf (stderr, "gip_bench: decode step failed\n");
+              return EXIT_FAILURE;
+            }
+          encode_seconds += gpu.last_encode_seconds;
+          gpu_seconds += gpu.last_gpu_seconds;
+        }
       double decode_seconds = now_seconds () - start;
       gip_lfm2_metal_free (&gpu);
 
@@ -205,6 +294,9 @@ main (int argc, char **argv)
         {
           prefill_rates[rep - 1] = n_prompt / prefill_seconds;
           decode_rates[rep - 1] = n_generate / decode_seconds;
+          total_decode_seconds += decode_seconds;
+          total_encode_seconds += encode_seconds;
+          total_gpu_seconds += gpu_seconds;
         }
     }
 
@@ -212,6 +304,19 @@ main (int argc, char **argv)
           n_prompt, n_generate, reps);
   print_rates ("prefill", prefill_rates, reps);
   print_rates ("decode", decode_rates, reps);
+
+  /* The rest of each decode step is the wait for the GPU to start, the
+     argmax, and the copy of the logits.  */
+  double per_token = 1e3 / ((double)n_generate * reps);
+  printf ("decode per token: %.3f ms total, %.3f ms GPU, %.3f ms encoding, "
+          "%.3f ms other\n",
+          total_decode_seconds * per_token, total_gpu_seconds * per_token,
+          total_encode_seconds * per_token,
+          (total_decode_seconds - total_gpu_seconds - total_encode_seconds)
+              * per_token);
+
+  if (profile)
+    profile_decode (&model, metal, n_prompt, n_generate, logits);
 
   free (logits);
   free (prefill_rates);

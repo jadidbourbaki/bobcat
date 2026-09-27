@@ -7,14 +7,17 @@
 #include "model_lfm2.h"
 
 /* The GPU state of one LFM2 decode on METAL: the weights, the caches,
-   and the scratch buffers.  N_PAST counts the tokens processed so
-   far.  */
+   and the scratch buffers.  N_PAST counts the tokens processed so far.
+   LAST_ENCODE_SECONDS and LAST_GPU_SECONDS time the CPU recording and
+   the GPU execution of the latest step.  */
 struct gip_lfm2_metal
 {
   const struct gip_lfm2_model *model;
   struct gip_metal *metal;
   uint32_t n_ctx;
   uint32_t n_past;
+  double last_encode_seconds;
+  double last_gpu_seconds;
   struct gip_metal_buffer *weights;
   const unsigned char *weights_base;
   struct gip_metal_buffer *k_cache;

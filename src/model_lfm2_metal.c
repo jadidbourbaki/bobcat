@@ -4,6 +4,7 @@
    them in place.  */
 
 #include <string.h>
+#include <time.h>
 
 #include "error.h"
 #include "kernels/scalar.h"
@@ -15,6 +16,16 @@ enum
      each, so the head size must divide 256.  */
   ATTENTION_THREADS = 256
 };
+
+/* Return the monotonic clock time in seconds.  */
+static double
+now_seconds (void)
+{
+  struct timespec ts;
+
+  clock_gettime (CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
 
 /* Report whether TENSOR is null or a Q8_0 matrix.  */
 static bool
@@ -254,6 +265,7 @@ gip_lfm2_metal_step (struct gip_lfm2_metal *gpu, int32_t token, float *logits,
   if (trace != NULL && trace->embedding != NULL)
     memcpy (trace->embedding, hidden, n_embd * sizeof (float));
 
+  double encode_start = now_seconds ();
   status = gip_metal_begin (metal);
   if (status != GIP_OK)
     return status;
@@ -295,7 +307,8 @@ gip_lfm2_metal_step (struct gip_lfm2_metal *gpu, int32_t token, float *logits,
   if (logits != NULL)
     matvec (gpu, model->output, normed, floats_at (gpu->logits, 0));
 
-  status = gip_metal_end (metal, NULL);
+  gpu->last_encode_seconds = now_seconds () - encode_start;
+  status = gip_metal_end (metal, &gpu->last_gpu_seconds);
   if (status != GIP_OK)
     return status;
 
