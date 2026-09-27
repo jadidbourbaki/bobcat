@@ -3,16 +3,18 @@ sanitize_dir := "build/sanitize"
 release_dir := "build/release"
 llama_bench_cpu := "bench/llama.cpp/build/bin/llama-bench"
 llama_bench_metal := "bench/llama.cpp/build-metal/bin/llama-bench"
-gguf_models := "-m models/LFM2.5-350M-Q8_0.gguf -m models/LFM2.5-1.2B-Instruct-Q8_0.gguf"
-mlx_models := "models/LFM2.5-350M-MLX-8bit models/LFM2.5-1.2B-Instruct-MLX-8bit"
+gguf_models := "-m models/LFM2.5-350M-Q8_0.gguf -m models/LFM2.5-1.2B-Instruct-Q8_0.gguf -m models/LFM2.5-2.6B-Q8_0.gguf"
+mlx_models := "models/LFM2.5-350M-MLX-8bit models/LFM2.5-1.2B-Instruct-MLX-8bit models/LFM2.5-2.6B-MLX-8bit"
 
 # Apple clang's AddressSanitizer crashes at startup on some macOS
 # releases, so macOS sanitizer builds use Homebrew's LLVM with the
-# installed SDK.  Other systems use their default compiler.
+# installed SDK.  Other systems use their default compiler.  Homebrew's
+# clang emits objc_msgSendClass stubs that only the Xcode 26 linker
+# fills in, and the flag below turns them off for older linkers.
 llvm_clang := "/opt/homebrew/opt/llvm/bin/clang"
 sanitize_env := if os() == "macos" { "CC=" + llvm_clang + " OBJC=" + llvm_clang } else { "" }
 sanitize_sdk := if os() == "macos" { `xcrun --show-sdk-path` } else { "" }
-sanitize_args := if os() == "macos" { "-Dc_args='-isysroot " + sanitize_sdk + "' -Dc_link_args='-isysroot " + sanitize_sdk + "' -Dobjc_args='-isysroot " + sanitize_sdk + "' -Dobjc_link_args='-isysroot " + sanitize_sdk + "'" } else { "" }
+sanitize_args := if os() == "macos" { "-Dc_args='-isysroot " + sanitize_sdk + "' -Dc_link_args='-isysroot " + sanitize_sdk + "' -Dobjc_args='-isysroot " + sanitize_sdk + " -fno-objc-msgsend-class-selector-stubs' -Dobjc_link_args='-isysroot " + sanitize_sdk + "'" } else { "" }
 
 # List the recipes.
 default:

@@ -8,8 +8,11 @@ symlink resolves to this file. Read top to bottom on first session.
 gip, the general inference program, is a local LLM inference engine
 written in C. The first goal is the fastest LLM inference on the Mac
 GPU, measured against mlx-lm and llama.cpp's Metal backend. The first
-models are Liquid AI's LFM2.5 350M and 1.2B at Q8_0, and the first
-machine is an Apple M4 Pro with a 20-core GPU.
+models are Liquid AI's LFM2.5 family at Q8_0, and the first machine is
+an Apple M4 Pro with a 20-core GPU. LFM2.5-1.2B and LFM2.5-2.6B carry
+the benchmark headline. LFM2.5-350M keeps the tests fast and will serve
+as the draft model for speculative decoding of the 1.2B model, whose
+vocabulary it shares.
 
 A scalar C implementation of every op defines the correct output and
 checks every GPU kernel. SIMD CPU kernels for phones and Linux servers
