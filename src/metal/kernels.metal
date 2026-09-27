@@ -17,7 +17,15 @@ enum
   /* Threadgroups of the reduction kernels hold at most this many
      simdgroups.  */
   MAX_SIMDGROUPS = 32,
-  MAX_HEAD_DIM = 256
+  MAX_HEAD_DIM = 256,
+  /* The attention kernels' limits.  Each chunk covers ATTENTION_CHUNK
+     positions with one thread per position.  On LFM2.5-350M at a
+     512-token context on an M4 Pro, 64-position chunks decoded at 369
+     tokens per second, against 366 for 32 and 348 for 128.  The host
+     checks the model against the other two limits.  */
+  ATTENTION_CHUNK = 64,
+  ATTENTION_MAX_GROUP = 4,
+  ATTENTION_MAX_HEAD_DIM = 128
 };
 
 /* Return the sum of VALUE over all threads of the threadgroup.  PARTIALS
@@ -197,87 +205,136 @@ qk_norm_rope (device float *vec [[buffer (0)]],
     }
 }
 
-/* Attend with each of the query heads at Q over the first N_KEYS
-   positions of K_CACHE and V_CACHE, and store each head's result at
-   OUT.  Query heads share KV heads in consecutive groups of N_HEADS /
-   N_KV_HEADS.  SCORES holds N_CTX floats of scratch per query head.  One
-   threadgroup handles one query head.  */
+/* Attend with the query heads at Q over one chunk of ATTENTION_CHUNK
+   positions of K_CACHE and V_CACHE, as the first of two passes.  Query
+   heads share KV heads in consecutive groups of N_HEADS / N_KV_HEADS, at
+   most ATTENTION_MAX_GROUP.
+
+   One threadgroup of ATTENTION_CHUNK threads handles one KV head, every
+   query head in its group, and the chunk CHUNK.  Each thread scores one
+   position, so K and V are read once per chunk.  For each query head
+   the pass stores the chunk's largest score, its sum of exponentials
+   relative to that score, and its unnormalized weighted sum of values in
+   SCRATCH, laid out as attention_combine expects for MAX_CHUNKS
+   chunks.  */
 kernel void
-attention (device const float *q [[buffer (0)]],
-           device const float *k_cache [[buffer (1)]],
-           device const float *v_cache [[buffer (2)]],
-           device float *scores [[buffer (3)]],
-           device float *out [[buffer (4)]],
-           constant uint &n_heads [[buffer (5)]],
-           constant uint &n_kv_heads [[buffer (6)]],
-           constant uint &head_dim [[buffer (7)]],
-           constant uint &n_keys [[buffer (8)]],
-           constant uint &n_ctx [[buffer (9)]],
-           constant float &scale [[buffer (10)]],
-           uint head [[threadgroup_position_in_grid]],
-           uint tid [[thread_position_in_threadgroup]],
-           uint threads [[threads_per_threadgroup]],
-           uint simdgroup_index [[simdgroup_index_in_threadgroup]],
-           uint simdgroups [[simdgroups_per_threadgroup]],
-           uint lane [[thread_index_in_simdgroup]])
+attention_chunk (device const float *q [[buffer (0)]],
+                 device const float *k_cache [[buffer (1)]],
+                 device const float *v_cache [[buffer (2)]],
+                 device float *scratch [[buffer (3)]],
+                 constant uint &n_heads [[buffer (4)]],
+                 constant uint &n_kv_heads [[buffer (5)]],
+                 constant uint &head_dim [[buffer (6)]],
+                 constant uint &n_keys [[buffer (7)]],
+                 constant uint &max_chunks [[buffer (8)]],
+                 constant float &scale [[buffer (9)]],
+                 uint2 position [[threadgroup_position_in_grid]],
+                 uint2 thread_position [[thread_position_in_threadgroup]],
+                 uint2 threadgroup_size [[threads_per_threadgroup]],
+                 uint simdgroup_index [[simdgroup_index_in_threadgroup]],
+                 uint simdgroups [[simdgroups_per_threadgroup]],
+                 uint lane [[thread_index_in_simdgroup]])
 {
   threadgroup float partials[MAX_SIMDGROUPS];
-  threadgroup float query[MAX_HEAD_DIM];
-  threadgroup float out_partials[MAX_SIMDGROUPS * SIMD_WIDTH];
+  threadgroup float query[ATTENTION_MAX_GROUP * ATTENTION_MAX_HEAD_DIM];
+  threadgroup float weights[ATTENTION_MAX_GROUP * ATTENTION_CHUNK];
 
+  uint tid = thread_position.x;
+  uint threads = threadgroup_size.x;
+  uint kv_head = position.x;
+  uint chunk = position.y;
+  uint group = n_heads / n_kv_heads;
   uint kv_dim = n_kv_heads * head_dim;
-  uint kv_head = head / (n_heads / n_kv_heads);
-  device const float *keys = k_cache + kv_head * head_dim;
-  device const float *values = v_cache + kv_head * head_dim;
-  device float *head_scores = scores + head * n_ctx;
+  uint first_head = kv_head * group;
+  uint start = chunk * ATTENTION_CHUNK;
+  uint count = min (uint (ATTENTION_CHUNK), n_keys - start);
 
-  for (uint d = tid; d < head_dim; d += threads)
-    query[d] = q[head * head_dim + d];
+  for (uint i = tid; i < group * head_dim; i += threads)
+    query[i] = q[first_head * head_dim + i];
   threadgroup_barrier (mem_flags::mem_threadgroup);
 
-  float local_max = -INFINITY;
-  for (uint t = tid; t < n_keys; t += threads)
+  float score[ATTENTION_MAX_GROUP];
+  bool valid = tid < count;
+  device const float4 *key
+      = (device const float4 *)(k_cache + (start + tid) * kv_dim
+                                + kv_head * head_dim);
+  for (uint g = 0; g < group; g++)
     {
+      threadgroup const float4 *qg
+          = (threadgroup const float4 *)(query + g * head_dim);
       float s = 0.0f;
-      for (uint d = 0; d < head_dim; d++)
-        s += query[d] * keys[t * kv_dim + d];
-      s *= scale;
-      head_scores[t] = s;
-      local_max = max (local_max, s);
+      if (valid)
+        for (uint d = 0; d < head_dim / 4; d++)
+          s += dot (qg[d], key[d]);
+      score[g] = valid ? s * scale : -INFINITY;
     }
-  float best = threadgroup_max (local_max, partials, simdgroup_index,
-                                simdgroups, lane);
 
-  float local_sum = 0.0f;
-  for (uint t = tid; t < n_keys; t += threads)
+  device float *chunk_max = scratch + n_heads * max_chunks * head_dim;
+  device float *chunk_sum = chunk_max + n_heads * max_chunks;
+  for (uint g = 0; g < group; g++)
     {
-      float e = precise::exp (head_scores[t] - best);
-      head_scores[t] = e;
-      local_sum += e;
+      float best = threadgroup_max (score[g], partials, simdgroup_index,
+                                    simdgroups, lane);
+      float e = valid ? precise::exp (score[g] - best) : 0.0f;
+      weights[g * ATTENTION_CHUNK + tid] = e;
+      float total = threadgroup_sum (e, partials, simdgroup_index,
+                                     simdgroups, lane);
+      if (tid == 0)
+        {
+          uint slot = (first_head + g) * max_chunks + chunk;
+          chunk_max[slot] = best;
+          chunk_sum[slot] = total;
+        }
     }
-  float total = threadgroup_sum (local_sum, partials, simdgroup_index,
-                                 simdgroups, lane);
-  threadgroup_barrier (mem_flags::mem_device);
-
-  /* Threads split into groups of HEAD_DIM.  Each group sums the weighted
-     values of every group-th position, and the first group adds the
-     groups together.  */
-  uint groups = threads / head_dim;
-  uint group = tid / head_dim;
-  uint d = tid % head_dim;
-  float acc = 0.0f;
-  if (group < groups)
-    for (uint t = group; t < n_keys; t += groups)
-      acc += head_scores[t] * values[t * kv_dim + d];
-  out_partials[tid] = acc;
   threadgroup_barrier (mem_flags::mem_threadgroup);
-  if (group == 0)
+
+  /* Neighboring threads take neighboring elements of each value row, so
+     the reads coalesce.  */
+  device const float *values = v_cache + start * kv_dim + kv_head * head_dim;
+  for (uint i = tid; i < group * head_dim; i += threads)
     {
-      float sum = 0.0f;
-      for (uint g = 0; g < groups; g++)
-        sum += out_partials[g * head_dim + d];
-      out[head * head_dim + d] = sum / total;
+      uint g = i / head_dim;
+      uint d = i % head_dim;
+      threadgroup const float *w = weights + g * ATTENTION_CHUNK;
+      float acc = 0.0f;
+      for (uint t = 0; t < count; t++)
+        acc += w[t] * values[t * kv_dim + d];
+      scratch[((first_head + g) * max_chunks + chunk) * head_dim + d] = acc;
     }
+}
+
+/* Combine the N_CHUNKS chunk results of attention_chunk in SCRATCH into
+   the result of each query head at OUT, as the second of two passes.
+   Each chunk's sums are rescaled from its own largest score to the
+   largest score of all chunks.  One threadgroup of HEAD_DIM threads
+   handles one query head.  */
+kernel void
+attention_combine (device const float *scratch [[buffer (0)]],
+                   device float *out [[buffer (1)]],
+                   constant uint &n_heads [[buffer (2)]],
+                   constant uint &head_dim [[buffer (3)]],
+                   constant uint &n_chunks [[buffer (4)]],
+                   constant uint &max_chunks [[buffer (5)]],
+                   uint head [[threadgroup_position_in_grid]],
+                   uint d [[thread_position_in_threadgroup]])
+{
+  device const float *chunk_max = scratch + n_heads * max_chunks * head_dim;
+  device const float *chunk_sum = chunk_max + n_heads * max_chunks;
+  uint base = head * max_chunks;
+
+  float best = -INFINITY;
+  for (uint c = 0; c < n_chunks; c++)
+    best = max (best, chunk_max[base + c]);
+
+  float total = 0.0f;
+  float acc = 0.0f;
+  for (uint c = 0; c < n_chunks; c++)
+    {
+      float rescale = precise::exp (chunk_max[base + c] - best);
+      total += chunk_sum[base + c] * rescale;
+      acc += scratch[(base + c) * head_dim + d] * rescale;
+    }
+  out[head * head_dim + d] = acc / total;
 }
 
 /* Run the gated short convolution on the 3 * N_EMBD floats at BCX, which

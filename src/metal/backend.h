@@ -78,14 +78,19 @@ void gip_metal_qk_norm_rope (struct gip_metal *metal,
                              uint32_t head_dim, uint32_t pos, float theta,
                              float eps);
 
+/* Return the floats of scratch gip_metal_attention needs for N_HEADS
+   query heads of HEAD_DIM floats over up to N_CTX positions.  */
+size_t gip_metal_attention_scratch (uint32_t n_heads, uint32_t head_dim,
+                                    uint32_t n_ctx);
+
 /* Record attention of the N_HEADS query heads at Q over the first N_KEYS
-   positions of K_CACHE and V_CACHE into OUT.  Each cache holds N_CTX
-   positions of N_KV_HEADS heads of HEAD_DIM floats.  SCORES holds
-   N_HEADS * N_CTX floats of scratch.  */
+   positions of K_CACHE and V_CACHE into OUT.  Each cache holds
+   N_KV_HEADS heads of HEAD_DIM floats per position.  SCRATCH holds the
+   floats gip_metal_attention_scratch returns for N_CTX positions.  */
 void gip_metal_attention (struct gip_metal *metal, struct gip_metal_view q,
                           struct gip_metal_view k_cache,
                           struct gip_metal_view v_cache,
-                          struct gip_metal_view scores,
+                          struct gip_metal_view scratch,
                           struct gip_metal_view out, uint32_t n_heads,
                           uint32_t n_kv_heads, uint32_t head_dim,
                           uint32_t n_keys, uint32_t n_ctx);

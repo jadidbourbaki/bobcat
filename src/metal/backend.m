@@ -25,6 +25,8 @@ enum
      kernels.  */
   REDUCE_THREADS = 256,
   ELEMENTWISE_THREADS = 256,
+  /* Must match ATTENTION_CHUNK in kernels.metal.  */
+  ATTENTION_CHUNK = 64,
   /* Distinct kernel and shape pairs a profile keeps.  A model has far
      fewer.  */
   MAX_PROFILE_ENTRIES = 64
@@ -44,7 +46,8 @@ struct profile_table
 @property (nonatomic, strong) id<MTLComputePipelineState> matvec_q8_0;
 @property (nonatomic, strong) id<MTLComputePipelineState> rms_norm;
 @property (nonatomic, strong) id<MTLComputePipelineState> qk_norm_rope;
-@property (nonatomic, strong) id<MTLComputePipelineState> attention;
+@property (nonatomic, strong) id<MTLComputePipelineState> attention_chunk;
+@property (nonatomic, strong) id<MTLComputePipelineState> attention_combine;
 @property (nonatomic, strong) id<MTLComputePipelineState> short_conv;
 @property (nonatomic, strong) id<MTLComputePipelineState> swiglu;
 @property (nonatomic, strong) id<MTLComputePipelineState> add_in_place;
@@ -133,7 +136,10 @@ gip_metal_open (struct gip_metal **out, char *err, size_t err_size)
     metal.rms_norm = make_pipeline (device, library, @"rms_norm", 0, &error);
     metal.qk_norm_rope
         = make_pipeline (device, library, @"qk_norm_rope", 0, &error);
-    metal.attention = make_pipeline (device, library, @"attention", 0, &error);
+    metal.attention_chunk
+        = make_pipeline (device, library, @"attention_chunk", 0, &error);
+    metal.attention_combine
+        = make_pipeline (device, library, @"attention_combine", 0, &error);
     metal.short_conv
         = make_pipeline (device, library, @"short_conv", 0, &error);
     metal.swiglu = make_pipeline (device, library, @"swiglu", 0, &error);
@@ -142,9 +148,10 @@ gip_metal_open (struct gip_metal **out, char *err, size_t err_size)
     metal.float_copy
         = make_pipeline (device, library, @"copy_floats", 0, &error);
     if (metal.queue == nil || metal.matvec_q8_0 == nil || metal.rms_norm == nil
-        || metal.qk_norm_rope == nil || metal.attention == nil
-        || metal.short_conv == nil || metal.swiglu == nil
-        || metal.add_in_place == nil || metal.float_copy == nil)
+        || metal.qk_norm_rope == nil || metal.attention_chunk == nil
+        || metal.attention_combine == nil || metal.short_conv == nil
+        || metal.swiglu == nil || metal.add_in_place == nil
+        || metal.float_copy == nil)
       {
         gip_format_error (err, err_size, "cannot create Metal pipelines: %s",
                           error != nil ? error.localizedDescription.UTF8String
@@ -415,33 +422,62 @@ gip_metal_qk_norm_rope (struct gip_metal *metal, struct gip_metal_view vec,
   op_done (m, "qk_norm_rope", 0, 0, 0);
 }
 
+/* Return the number of attention chunks covering N positions.  */
+static uint32_t
+attention_chunks (uint32_t n)
+{
+  return (n + ATTENTION_CHUNK - 1) / ATTENTION_CHUNK;
+}
+
+size_t
+gip_metal_attention_scratch (uint32_t n_heads, uint32_t head_dim,
+                             uint32_t n_ctx)
+{
+  /* Each chunk of each head keeps a weighted sum of values, a largest
+     score, and a sum of exponentials.  */
+  return (size_t)n_heads * attention_chunks (n_ctx) * (head_dim + 2);
+}
+
 void
 gip_metal_attention (struct gip_metal *metal, struct gip_metal_view q,
                      struct gip_metal_view k_cache,
                      struct gip_metal_view v_cache,
-                     struct gip_metal_view scores, struct gip_metal_view out,
+                     struct gip_metal_view scratch, struct gip_metal_view out,
                      uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
                      uint32_t n_keys, uint32_t n_ctx)
 {
   GipMetal *m = backend (metal);
-  id<MTLComputeCommandEncoder> encoder = op_encoder (m);
   float scale = 1.0f / sqrtf ((float)head_dim);
+  uint32_t n_chunks = attention_chunks (n_keys);
+  uint32_t max_chunks = attention_chunks (n_ctx);
 
-  [encoder setComputePipelineState:m.attention];
+  id<MTLComputeCommandEncoder> encoder = op_encoder (m);
+  [encoder setComputePipelineState:m.attention_chunk];
   bind (encoder, q, 0);
   bind (encoder, k_cache, 1);
   bind (encoder, v_cache, 2);
-  bind (encoder, scores, 3);
-  bind (encoder, out, 4);
-  bind_bytes (encoder, &n_heads, sizeof n_heads, 5);
-  bind_bytes (encoder, &n_kv_heads, sizeof n_kv_heads, 6);
-  bind_bytes (encoder, &head_dim, sizeof head_dim, 7);
-  bind_bytes (encoder, &n_keys, sizeof n_keys, 8);
-  bind_bytes (encoder, &n_ctx, sizeof n_ctx, 9);
-  bind_bytes (encoder, &scale, sizeof scale, 10);
+  bind (encoder, scratch, 3);
+  bind_bytes (encoder, &n_heads, sizeof n_heads, 4);
+  bind_bytes (encoder, &n_kv_heads, sizeof n_kv_heads, 5);
+  bind_bytes (encoder, &head_dim, sizeof head_dim, 6);
+  bind_bytes (encoder, &n_keys, sizeof n_keys, 7);
+  bind_bytes (encoder, &max_chunks, sizeof max_chunks, 8);
+  bind_bytes (encoder, &scale, sizeof scale, 9);
+  [encoder dispatchThreadgroups:MTLSizeMake (n_kv_heads, n_chunks, 1)
+          threadsPerThreadgroup:MTLSizeMake (ATTENTION_CHUNK, 1, 1)];
+  op_done (m, "attention_chunk", 0, 0, 0);
+
+  encoder = op_encoder (m);
+  [encoder setComputePipelineState:m.attention_combine];
+  bind (encoder, scratch, 0);
+  bind (encoder, out, 1);
+  bind_bytes (encoder, &n_heads, sizeof n_heads, 2);
+  bind_bytes (encoder, &head_dim, sizeof head_dim, 3);
+  bind_bytes (encoder, &n_chunks, sizeof n_chunks, 4);
+  bind_bytes (encoder, &max_chunks, sizeof max_chunks, 5);
   [encoder dispatchThreadgroups:MTLSizeMake (n_heads, 1, 1)
-          threadsPerThreadgroup:MTLSizeMake (REDUCE_THREADS, 1, 1)];
-  op_done (m, "attention", 0, 0, 0);
+          threadsPerThreadgroup:MTLSizeMake (head_dim, 1, 1)];
+  op_done (m, "attention_combine", 0, 0, 0);
 }
 
 void

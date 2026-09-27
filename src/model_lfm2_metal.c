@@ -12,9 +12,12 @@
 
 enum
 {
-  /* The attention kernel splits its 256 threads into groups of one head
-     each, so the head size must divide 256.  */
-  ATTENTION_THREADS = 256
+  /* The attention kernel's limits from kernels.metal.  Each lane holds
+     a whole number of elements of a head, and a threadgroup serves at
+     most four query heads of up to 128 elements.  */
+  SIMD_WIDTH = 32,
+  ATTENTION_MAX_GROUP = 4,
+  ATTENTION_MAX_HEAD_DIM = 128
 };
 
 /* Return the monotonic clock time in seconds.  */
@@ -84,13 +87,17 @@ gip_lfm2_metal_init (const struct gip_lfm2_model *model,
                         "the Metal path needs every matrix in Q8_0");
       return GIP_ERR_UNSUPPORTED;
     }
-  if (model->head_dim > ATTENTION_THREADS
-      || ATTENTION_THREADS % model->head_dim != 0)
+  if (model->head_dim % SIMD_WIDTH != 0
+      || model->head_dim > ATTENTION_MAX_HEAD_DIM
+      || model->n_heads / model->n_kv_heads > ATTENTION_MAX_GROUP)
     {
       gip_format_error (err, err_size,
-                        "the Metal path needs a head size dividing %d, "
-                        "got %u",
-                        ATTENTION_THREADS, model->head_dim);
+                        "the Metal path needs a head size that is a "
+                        "multiple of %d up to %d and at most %d query heads "
+                        "per KV head, got %u and %u",
+                        SIMD_WIDTH, ATTENTION_MAX_HEAD_DIM,
+                        ATTENTION_MAX_GROUP, model->head_dim,
+                        model->n_heads / model->n_kv_heads);
       return GIP_ERR_UNSUPPORTED;
     }
 
@@ -126,7 +133,8 @@ gip_lfm2_metal_init (const struct gip_lfm2_model *model,
   gpu->conv_out = new_floats (gpu, n_embd);
   gpu->q = new_floats (gpu, q_dim);
   gpu->attn = new_floats (gpu, q_dim);
-  gpu->scores = new_floats (gpu, (size_t)model->n_heads * n_ctx);
+  gpu->scores = new_floats (gpu, gip_metal_attention_scratch (
+                                     model->n_heads, model->head_dim, n_ctx));
   gpu->gate = new_floats (gpu, model->n_ff);
   gpu->up = new_floats (gpu, model->n_ff);
   gpu->logits = new_floats (gpu, model->n_vocab);
