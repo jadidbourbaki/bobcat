@@ -39,4 +39,8 @@ add_project_arguments(
 
 threads = dependency('threads')
 
+install_headers('include/gip.h')
+
+subdir('src')
+subdir('tests')
 subdir('tools')

@@ -1,2 +1,3 @@
 BasedOnStyle: GNU
 ColumnLimit: 79
+IndentExternBlock: NoIndent
