@@ -16,14 +16,15 @@ extern const char gip_metal_source[];
 enum
 {
   SIMD_WIDTH = 32,
-  /* A sweep of 1 to 8 rows per simdgroup and 1 to 8 simdgroups per
-     threadgroup on an M4 Pro found no setting clearly best.  One row
-     favored LFM2.5-350M at about 407 tokens per second, four rows
-     favored LFM2.5-2.6B at about 73, and most settings fell within 3%
-     of each other.  Four rows and two simdgroups sit near the best for
-     both.  */
-  MATVEC_Q8_0_ROWS_PER_SIMDGROUP = 4,
-  MATVEC_Q8_0_SIMDGROUPS = 2,
+  /* A sweep of 1, 2, and 4 rows per threadgroup against 2, 4, and 8
+     simdgroups on an M4 Pro put two rows first on every model.  Two
+     simdgroups won on rows of 1024 columns, lifting LFM2.5-350M from
+     445 to 495 tokens per second.  Four simdgroups won by about 1% on
+     the wider rows of LFM2.5-1.2B and LFM2.5-2.6B.  */
+  MATVEC_Q8_0_ROWS_PER_THREADGROUP = 2,
+  MATVEC_Q8_0_NARROW_SIMDGROUPS = 2,
+  MATVEC_Q8_0_WIDE_SIMDGROUPS = 4,
+  MATVEC_Q8_0_WIDE_COLS = 2048,
   /* Threads per threadgroup for the reduction and elementwise
      kernels.  */
   REDUCE_THREADS = 256,
@@ -107,7 +108,7 @@ metal_buffer (struct gip_metal_buffer *buffer)
 
 /* Return a pipeline for the matrix-vector kernel NAME in LIBRARY on
    DEVICE, or nil.  The function constants take the values ROWS for
-   rows_per_simdgroup, FUSE_NORM for fuse_norm, and ACCUMULATE for
+   rows_per_threadgroup, FUSE_NORM for fuse_norm, and ACCUMULATE for
    accumulate.  Store any error in ERROR.  */
 static id<MTLComputePipelineState>
 make_pipeline (id<MTLDevice> device, id<MTLLibrary> library, NSString *name,
@@ -169,7 +170,7 @@ gip_metal_open (struct gip_metal **out, char *err, size_t err_size)
     GipMetal *metal = [GipMetal new];
     metal.device = device;
     metal.queue = [device newCommandQueue];
-    uint32_t rows = MATVEC_Q8_0_ROWS_PER_SIMDGROUP;
+    uint32_t rows = MATVEC_Q8_0_ROWS_PER_THREADGROUP;
     for (int norm = 0; norm < 2; norm++)
       for (int acc = 0; acc < 2; acc++)
         metal->matvec_q8_0[norm][acc] = make_pipeline (
@@ -424,19 +425,21 @@ gip_metal_profile (struct gip_metal *metal,
 }
 
 /* Dispatch the current matrix-vector pipeline of ENCODER over N_ROWS
-   rows.  */
+   rows of N_COLS columns.  Wider rows get more simdgroups to split
+   them.  */
 static void
-dispatch_matvec (id<MTLComputeCommandEncoder> encoder, uint32_t n_rows)
+dispatch_matvec (id<MTLComputeCommandEncoder> encoder, uint32_t n_rows,
+                 uint32_t n_cols)
 {
-  uint32_t rows_per_threadgroup
-      = MATVEC_Q8_0_ROWS_PER_SIMDGROUP * MATVEC_Q8_0_SIMDGROUPS;
+  uint32_t rows_per_threadgroup = MATVEC_Q8_0_ROWS_PER_THREADGROUP;
   NSUInteger n_threadgroups
       = (n_rows + rows_per_threadgroup - 1) / rows_per_threadgroup;
+  NSUInteger simdgroups = n_cols >= MATVEC_Q8_0_WIDE_COLS
+                              ? MATVEC_Q8_0_WIDE_SIMDGROUPS
+                              : MATVEC_Q8_0_NARROW_SIMDGROUPS;
 
-  [encoder
-       dispatchThreadgroups:MTLSizeMake (n_threadgroups, 1, 1)
-      threadsPerThreadgroup:MTLSizeMake (SIMD_WIDTH * MATVEC_Q8_0_SIMDGROUPS,
-                                         1, 1)];
+  [encoder dispatchThreadgroups:MTLSizeMake (n_threadgroups, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake (SIMD_WIDTH * simdgroups, 1, 1)];
 }
 
 /* Return the bytes of a Q8_0 matrix of N_ROWS rows of N_COLS
@@ -469,7 +472,7 @@ gip_metal_matvec_q8_0 (struct gip_metal *metal, struct gip_metal_view weights,
       bind (encoder, options->norm_weight, 5);
       bind_bytes (encoder, &options->eps, sizeof options->eps, 6);
     }
-  dispatch_matvec (encoder, n_rows);
+  dispatch_matvec (encoder, n_rows, n_cols);
   op_done (m, "matvec_q8_0", n_rows, n_cols, q8_0_bytes (n_rows, n_cols));
 }
 
@@ -493,7 +496,7 @@ gip_metal_matvec_q8_0_swiglu (struct gip_metal *metal,
   bind_bytes (encoder, &n_cols, sizeof n_cols, 5);
   bind (encoder, norm_weight, 6);
   bind_bytes (encoder, &eps, sizeof eps, 7);
-  dispatch_matvec (encoder, n_rows);
+  dispatch_matvec (encoder, n_rows, n_cols);
   op_done (m, "matvec_q8_0_swiglu", n_rows, n_cols,
            2 * q8_0_bytes (n_rows, n_cols));
 }

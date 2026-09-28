@@ -4,9 +4,9 @@
 #include <metal_stdlib>
 using namespace metal;
 
-/* The rows each simdgroup of the matrix-vector kernels computes.  The
+/* The rows each threadgroup of the matrix-vector kernels computes.  The
    host sets the value when it creates the pipelines.  */
-constant uint rows_per_simdgroup [[function_constant (0)]];
+constant uint rows_per_threadgroup [[function_constant (0)]];
 
 /* Whether a matrix-vector kernel RMS-normalizes its input and scales it
    by NORM_WEIGHT before multiplying.  */
@@ -21,7 +21,13 @@ enum
   QK8_0 = 32,
   Q8_0_BLOCK_BYTES = 34,
   SIMD_WIDTH = 32,
-  MAX_ROWS_PER_SIMDGROUP = 8,
+  MAX_MATVEC_ROWS = 8,
+  /* In the matrix-vector kernels each lane takes 8 of a block's 32
+     quants, so 4 lanes share a block and a simdgroup covers 8 blocks at
+     a time.  */
+  QUANTS_PER_LANE = 8,
+  LANES_PER_BLOCK = QK8_0 / QUANTS_PER_LANE,
+  BLOCKS_PER_SIMDGROUP = SIMD_WIDTH / LANES_PER_BLOCK,
   /* Threadgroups of the reduction kernels hold at most this many
      simdgroups.  */
   MAX_SIMDGROUPS = 32,
@@ -80,56 +86,67 @@ struct q8_0_block
   char quants[QK8_0];
 };
 
-/* Return the dot product of BLOCK with the 32 floats at INPUTS.  */
+/* Return the dot product of the 8 quants of BLOCK starting at quant
+   8 * PART with the 8 floats at INPUTS, times the block's scale.  */
 static float
-q8_0_block_dot (device const q8_0_block *block, thread const float4 *inputs)
+q8_0_part_dot (device const q8_0_block *block, uint part,
+               thread const float4 *inputs)
 {
   /* The quants start two bytes into the block, so four-byte loads go
      through the packed type, which needs only byte alignment.  */
   device const packed_char4 *quants
-      = (device const packed_char4 *)block->quants;
-  float block_dot = 0.0f;
-
-  for (int i = 0; i < QK8_0 / 4; i++)
-    block_dot += dot (float4 (char4 (quants[i])), inputs[i]);
-  return float (block->scale) * block_dot;
+      = (device const packed_char4 *)(block->quants + part * QUANTS_PER_LANE);
+  float part_dot = dot (float4 (char4 (quants[0])), inputs[0])
+                   + dot (float4 (char4 (quants[1])), inputs[1]);
+  return float (block->scale) * part_dot;
 }
 
-/* Load the 32 inputs of block B from X into INPUTS and add their squares
-   to SUM_SQUARES.  With fuse_norm, multiply each input by its entry of
+/* Load the 8 floats of X starting at START into INPUTS.  With fuse_norm,
+   add their squares to SUM_SQUARES and multiply each by its entry of
    NORM_WEIGHT.
 
    The RMS norm scale is one number for the whole vector, so the kernels
    multiply by the weighted inputs and apply the scale to each finished
-   row sum.  The lanes of a simdgroup load every block between them, so
-   their squares add up to the whole norm with no extra reads.  */
+   row sum.  The threads of a threadgroup load every input between them,
+   so their squares add up to the whole norm with no extra reads.  */
 static void
-load_inputs (device const float *x, device const float *norm_weight, uint b,
-             thread float4 *inputs, thread float &sum_squares)
+load_inputs (device const float *x, device const float *norm_weight,
+             uint start, thread float4 *inputs, thread float &sum_squares)
 {
-  device const float4 *xb = (device const float4 *)(x + b * QK8_0);
+  device const float4 *xs = (device const float4 *)(x + start);
 
-  for (int i = 0; i < QK8_0 / 4; i++)
-    inputs[i] = xb[i];
+  inputs[0] = xs[0];
+  inputs[1] = xs[1];
   if (fuse_norm)
     {
-      device const float4 *wb
-          = (device const float4 *)(norm_weight + b * QK8_0);
-      for (int i = 0; i < QK8_0 / 4; i++)
-        {
-          sum_squares += dot (inputs[i], inputs[i]);
-          inputs[i] *= wb[i];
-        }
+      device const float4 *ws = (device const float4 *)(norm_weight + start);
+      sum_squares += dot (inputs[0], inputs[0]) + dot (inputs[1], inputs[1]);
+      inputs[0] *= ws[0];
+      inputs[1] *= ws[1];
     }
 }
 
-/* Return the RMS norm scale of N_COLS inputs whose squares, spread over
-   the lanes of a simdgroup, are SUM_SQUARES.  Every lane must call the
-   function.  */
-static float
-norm_scale (float sum_squares, uint n_cols, float eps)
+/* Replace each of the N floats at VALUES with its sum over the whole
+   threadgroup.  PARTIALS is threadgroup scratch of N * MAX_SIMDGROUPS
+   floats.  Every thread of the threadgroup must call the function.  */
+static void
+threadgroup_sums (thread float *values, uint n, threadgroup float *partials,
+                  uint simdgroup_index, uint simdgroups, uint lane)
 {
-  return precise::rsqrt (simd_sum (sum_squares) / float (n_cols) + eps);
+  for (uint i = 0; i < n; i++)
+    {
+      float simd_total = simd_sum (values[i]);
+      if (lane == 0)
+        partials[i * MAX_SIMDGROUPS + simdgroup_index] = simd_total;
+    }
+  threadgroup_barrier (mem_flags::mem_threadgroup);
+  for (uint i = 0; i < n; i++)
+    {
+      float total = 0.0f;
+      for (uint s = 0; s < simdgroups; s++)
+        total += partials[i * MAX_SIMDGROUPS + s];
+      values[i] = total;
+    }
 }
 
 /* Multiply the Q8_0 matrix WEIGHTS, which has N_ROWS rows of N_COLS
@@ -137,9 +154,11 @@ norm_scale (float sum_squares, uint n_cols, float eps)
    With fuse_norm, X is first RMS-normalized with epsilon EPS and scaled
    by NORM_WEIGHT.  With accumulate, the results add to Y.
 
-   Each simdgroup computes ROWS_PER_SIMDGROUP consecutive rows.  Each
-   lane takes every 32nd block of those rows and loads the matching 32
-   inputs once for all of them.  */
+   The layout follows llama.cpp's Q8_0 matrix-vector kernel.  Each
+   threadgroup computes ROWS_PER_THREADGROUP consecutive rows, and its
+   simdgroups split the columns between them.  Four lanes share each
+   block, so a simdgroup reads 8 neighboring blocks at a time and a small
+   matrix still spreads over many threadgroups.  */
 kernel void
 matvec_q8_0 (device const uchar *weights [[buffer (0)]],
              device const float *x [[buffer (1)]],
@@ -154,43 +173,48 @@ matvec_q8_0 (device const uchar *weights [[buffer (0)]],
              uint simdgroups [[simdgroups_per_threadgroup]],
              uint lane [[thread_index_in_simdgroup]])
 {
-  uint first_row
-      = (threadgroup_index * simdgroups + simdgroup_index) * rows_per_simdgroup;
+  threadgroup float partials[(MAX_MATVEC_ROWS + 1) * MAX_SIMDGROUPS];
+  uint first_row = threadgroup_index * rows_per_threadgroup;
   uint n_blocks = n_cols / QK8_0;
   ulong row_bytes = ulong (n_blocks) * Q8_0_BLOCK_BYTES;
-  float sums[MAX_ROWS_PER_SIMDGROUP] = { 0.0f };
-  float sum_squares = 0.0f;
+  uint part = lane % LANES_PER_BLOCK;
+  uint stride = simdgroups * BLOCKS_PER_SIMDGROUP;
 
-  for (uint b = lane; b < n_blocks; b += SIMD_WIDTH)
+  /* SUMS holds one sum per row, then the sum of squares of X.  */
+  float sums[MAX_MATVEC_ROWS + 1] = { 0.0f };
+  uint n_sums = rows_per_threadgroup + 1;
+
+  for (uint b = simdgroup_index * BLOCKS_PER_SIMDGROUP + lane / LANES_PER_BLOCK;
+       b < n_blocks; b += stride)
     {
-      float4 inputs[QK8_0 / 4];
-      load_inputs (x, norm_weight, b, inputs, sum_squares);
-
-      for (uint r = 0; r < rows_per_simdgroup; r++)
+      float4 inputs[2];
+      load_inputs (x, norm_weight, b * QK8_0 + part * QUANTS_PER_LANE, inputs,
+                   sums[rows_per_threadgroup]);
+      for (uint r = 0; r < rows_per_threadgroup; r++)
         {
           uint row = first_row + r;
           if (row >= n_rows)
             break;
           device const q8_0_block *block
               = (device const q8_0_block *)(weights + row * row_bytes) + b;
-          sums[r] += q8_0_block_dot (block, inputs);
+          sums[r] += q8_0_part_dot (block, part, inputs);
         }
     }
 
+  threadgroup_sums (sums, n_sums, partials, simdgroup_index, simdgroups, lane);
+  if (simdgroup_index != 0 || lane != 0)
+    return;
+
   float scale = 1.0f;
   if (fuse_norm)
-    scale = norm_scale (sum_squares, n_cols, eps);
-
-  /* Every lane of a simdgroup sees the same rows, so all lanes reach
-     each simd_sum together.  */
-  for (uint r = 0; r < rows_per_simdgroup; r++)
+    scale = precise::rsqrt (sums[rows_per_threadgroup] / float (n_cols) + eps);
+  for (uint r = 0; r < rows_per_threadgroup; r++)
     {
       uint row = first_row + r;
       if (row >= n_rows)
         break;
-      float total = simd_sum (sums[r]) * scale;
-      if (lane == 0)
-        y[row] = accumulate ? y[row] + total : total;
+      float total = sums[r] * scale;
+      y[row] = accumulate ? y[row] + total : total;
     }
 }
 
@@ -215,45 +239,53 @@ matvec_q8_0_swiglu (device const uchar *gate [[buffer (0)]],
                     uint simdgroups [[simdgroups_per_threadgroup]],
                     uint lane [[thread_index_in_simdgroup]])
 {
-  uint first_row
-      = (threadgroup_index * simdgroups + simdgroup_index) * rows_per_simdgroup;
+  threadgroup float partials[(2 * MAX_MATVEC_ROWS + 1) * MAX_SIMDGROUPS];
+  uint rows = rows_per_threadgroup;
+  uint first_row = threadgroup_index * rows;
   uint n_blocks = n_cols / QK8_0;
   ulong row_bytes = ulong (n_blocks) * Q8_0_BLOCK_BYTES;
-  float gate_sums[MAX_ROWS_PER_SIMDGROUP] = { 0.0f };
-  float up_sums[MAX_ROWS_PER_SIMDGROUP] = { 0.0f };
-  float sum_squares = 0.0f;
+  uint part = lane % LANES_PER_BLOCK;
+  uint stride = simdgroups * BLOCKS_PER_SIMDGROUP;
 
-  for (uint b = lane; b < n_blocks; b += SIMD_WIDTH)
+  /* SUMS holds the gate sums, then the up sums, then the sum of squares
+     of X.  */
+  float sums[2 * MAX_MATVEC_ROWS + 1] = { 0.0f };
+  uint n_sums = 2 * rows + 1;
+
+  for (uint b = simdgroup_index * BLOCKS_PER_SIMDGROUP + lane / LANES_PER_BLOCK;
+       b < n_blocks; b += stride)
     {
-      float4 inputs[QK8_0 / 4];
-      load_inputs (x, norm_weight, b, inputs, sum_squares);
-
-      for (uint r = 0; r < rows_per_simdgroup; r++)
+      float4 inputs[2];
+      load_inputs (x, norm_weight, b * QK8_0 + part * QUANTS_PER_LANE, inputs,
+                   sums[2 * rows]);
+      for (uint r = 0; r < rows; r++)
         {
           uint row = first_row + r;
           if (row >= n_rows)
             break;
           ulong offset = row * row_bytes;
-          gate_sums[r] += q8_0_block_dot (
-              (device const q8_0_block *)(gate + offset) + b, inputs);
-          up_sums[r] += q8_0_block_dot (
-              (device const q8_0_block *)(up + offset) + b, inputs);
+          sums[r] += q8_0_part_dot (
+              (device const q8_0_block *)(gate + offset) + b, part, inputs);
+          sums[rows + r] += q8_0_part_dot (
+              (device const q8_0_block *)(up + offset) + b, part, inputs);
         }
     }
 
+  threadgroup_sums (sums, n_sums, partials, simdgroup_index, simdgroups, lane);
+  if (simdgroup_index != 0 || lane != 0)
+    return;
+
   float scale = 1.0f;
   if (fuse_norm)
-    scale = norm_scale (sum_squares, n_cols, eps);
-
-  for (uint r = 0; r < rows_per_simdgroup; r++)
+    scale = precise::rsqrt (sums[2 * rows] / float (n_cols) + eps);
+  for (uint r = 0; r < rows; r++)
     {
       uint row = first_row + r;
       if (row >= n_rows)
         break;
-      float g = simd_sum (gate_sums[r]) * scale;
-      float u = simd_sum (up_sums[r]) * scale;
-      if (lane == 0)
-        y[row] = g / (1.0f + precise::exp (-g)) * u;
+      float g = sums[r] * scale;
+      float u = sums[rows + r] * scale;
+      y[row] = g / (1.0f + precise::exp (-g)) * u;
     }
 }
 
