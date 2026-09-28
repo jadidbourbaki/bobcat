@@ -39,6 +39,17 @@ struct q4_0_format
     return { float4 (w[0], w[1], w[2], w[3]),
              float4 (w[4], w[5], w[6], w[7]) };
   }
+
+  static void
+  load16 (device const uchar *row, uint e, thread half4 *out)
+  {
+    weights8 first = load8 (row, e);
+    weights8 second = load8 (row, e + 8);
+    out[0] = half4 (first.low);
+    out[1] = half4 (first.high);
+    out[2] = half4 (second.low);
+    out[3] = half4 (second.high);
+  }
 };
 
 /* The Q4_K format: super-blocks of 256 weights.  Each holds fp16 scales
@@ -81,6 +92,39 @@ struct q4k_format
     return { float4 (w[0], w[1], w[2], w[3]),
              float4 (w[4], w[5], w[6], w[7]) };
   }
+
+  static void
+  load16 (device const uchar *row, uint e, thread half4 *out)
+  {
+    device const uchar *block = row + (e / 256) * block_bytes;
+    float d = float (*(device const half *)block);
+    float dmin = float (*(device const half *)(block + 2));
+    device const uchar *scales = block + 4;
+    uint o = e % 256;
+    uint j = o / 32;
+    uint scale;
+    uint min;
+    if (j < 4)
+      {
+        scale = scales[j] & 63;
+        min = scales[j + 4] & 63;
+      }
+    else
+      {
+        scale = (scales[j + 4] & 0xf) | ((scales[j - 4] >> 6) << 4);
+        min = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+      }
+    float group_scale = d * float (scale);
+    float group_min = dmin * float (min);
+    device const uchar *quants = block + 16 + (j / 2) * 32 + o % 32;
+    uint shift = j % 2 == 0 ? 0 : 4;
+    for (uint i = 0; i < 4; i++)
+      {
+        uint4 q = uint4 (quants[4 * i], quants[4 * i + 1], quants[4 * i + 2],
+                         quants[4 * i + 3]);
+        out[i] = half4 (group_scale * float4 ((q >> shift) & 0xf) - group_min);
+      }
+  }
 };
 
 /* The Q6_K format: super-blocks of 256 weights.  Each holds 128 bytes
@@ -119,6 +163,17 @@ struct q6k_format
       }
     return { float4 (w[0], w[1], w[2], w[3]),
              float4 (w[4], w[5], w[6], w[7]) };
+  }
+
+  static void
+  load16 (device const uchar *row, uint e, thread half4 *out)
+  {
+    weights8 first = load8 (row, e);
+    weights8 second = load8 (row, e + 8);
+    out[0] = half4 (first.low);
+    out[1] = half4 (first.high);
+    out[2] = half4 (second.low);
+    out[3] = half4 (second.high);
   }
 };
 

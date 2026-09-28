@@ -255,10 +255,8 @@ matmul_q (device const uchar *weights [[buffer (0)]],
          wait for every simdgroup to finish multiplying the previous
          group.  The loads overlap that work.  */
       uint e = g * QK8_0 + 16 * weight_half;
-      weights8 first = F::load8 (row_weights, e);
-      weights8 second = F::load8 (row_weights, e + 8);
-      half4 w[4] = { half4 (first.low), half4 (first.high), half4 (second.low),
-                     half4 (second.high) };
+      half4 w[4];
+      F::load16 (row_weights, e, w);
       device const float4 *xs = token_inputs + g * (QK8_0 / 4);
       float4 in0 = xs[0];
       float4 in1 = xs[1];
