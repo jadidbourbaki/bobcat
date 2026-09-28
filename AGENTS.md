@@ -98,7 +98,7 @@ crates/
     src/lfm2.rs            LFM2 on the CPU with the scalar ops
     src/lfm2_metal.rs      LFM2 on the Metal GPU
     tests/                 reference and kernel tests
-  gip-cli/                 the gip command, which chats with a model
+  gip-cli/                 the gip command, with respond and chat
   gip-bench/               gip-bench, gpu-bw, and cpu-bw programs
 tools/                     Python reference dumps and benchmark scripts
 bench/                     baseline engine checkouts, gitignored
@@ -309,6 +309,29 @@ field's name with no `get_` prefix. Conversions follow the `as_`,
   `cargo update --precise`, one dependency at a time.
 - Before adding a dependency, check that it is maintained and widely
   used. State in the commit message what it replaces.
+
+## Command-line design
+
+gip's commands follow the Unix conventions that make tools compose.
+Apple's `fm`, Simon Willison's `llm`, and `ollama run` are the
+references for how an LLM command behaves.
+
+- Each subcommand does one job. `gip respond` answers one prompt for
+  scripts and pipes. `gip chat` holds a conversation for a person at a
+  terminal.
+- Standard output carries only data, such as the answer. Thinking,
+  progress, and prompts go to standard error or appear only on a
+  terminal.
+- Text on standard input joins the prompt argument, so
+  `cat notes.md | gip respond "Summarize this."` works. Neither source
+  is ever dropped in silence.
+- Styling such as dim text appears only when the output is a terminal
+  and `NO_COLOR` is unset, as [no-color.org](https://no-color.org)
+  describes.
+- A failure prints `gip: message` to standard error and exits with
+  status 1.
+- Defaults cover the common case. A flag earns its place only when a
+  user needs to change the default.
 
 ## Unsafe code
 

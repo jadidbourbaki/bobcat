@@ -1,46 +1,91 @@
-//! gip chats with a model on the Metal GPU.
+//! gip runs language models on the Metal GPU.
 //!
-//! With `--prompt`, gip answers one message and exits. Otherwise gip reads one message per line
-//! from standard input and answers each in turn until the input ends. The model's own chat template
-//! formats the conversation, and Hugging Face's tokenizer converts text to tokens and back.
+//! `gip respond` answers one prompt and writes only the answer to standard output, so it composes
+//! with pipes. `gip chat` holds an interactive conversation in the terminal.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 
-/// Decode this many tokens per GPU call. Each call pipelines its steps, and text streams out after
-/// each call, so the count trades pipelining against output latency.
 #[cfg(target_os = "macos")]
-const DECODE_CHUNK: usize = 8;
+mod conversation;
 
-/// Chat with a model on the Metal GPU.
+type Error = Box<dyn std::error::Error + Send + Sync>;
+
+/// Run language models on the Metal GPU.
 #[derive(Debug, Parser)]
 #[command(version)]
 struct Options {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Answer one prompt and write the answer to standard output.
+    ///
+    /// Text on standard input follows the prompt, so `cat notes.md | gip respond -m MODEL
+    /// "Summarize this."` answers about the file.
+    Respond {
+        #[command(flatten)]
+        model: ModelOptions,
+        /// Write the model's thinking to standard error.
+        #[arg(long)]
+        think: bool,
+        /// The prompt. Words join with spaces.
+        prompt: Vec<String>,
+    },
+    /// Chat with the model in the terminal. Ctrl-D ends the chat.
+    Chat {
+        #[command(flatten)]
+        model: ModelOptions,
+    },
+}
+
+/// The options every command shares.
+#[derive(Debug, Args)]
+struct ModelOptions {
     /// The GGUF model file.
+    #[arg(short, long)]
     model: PathBuf,
-    /// The model's Hugging Face `tokenizer.json`.
+    /// The model's Hugging Face `tokenizer.json`. Defaults to `tokenizer.json` beside the model.
     #[arg(short, long)]
-    tokenizer: PathBuf,
-    /// Answer this message and exit.
-    #[arg(short, long)]
-    prompt: Option<String>,
+    tokenizer: Option<PathBuf>,
     /// The system message that opens the conversation.
     #[arg(short, long)]
     system: Option<String>,
-    /// The most tokens in one answer.
-    #[arg(short = 'n', long, default_value_t = 2048)]
+    /// The most tokens in one reply.
+    #[arg(short = 'n', long, default_value_t = 4096)]
     max_tokens: usize,
     /// The most tokens in the whole conversation.
     #[arg(short, long, default_value_t = 8192)]
     context: u32,
 }
 
+impl ModelOptions {
+    /// Return the tokenizer file to load.
+    fn tokenizer_path(&self) -> Result<PathBuf, Error> {
+        if let Some(path) = &self.tokenizer {
+            return Ok(path.clone());
+        }
+        let beside = self.model.with_file_name("tokenizer.json");
+        if beside.exists() {
+            Ok(beside)
+        } else {
+            Err(format!(
+                "no tokenizer.json beside {}, so pass one with --tokenizer",
+                self.model.display()
+            )
+            .into())
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let options = Options::parse();
-    match run(&options) {
+    match run(options.command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             #[expect(clippy::print_stderr, reason = "gip reports errors on stderr")]
@@ -53,155 +98,147 @@ fn main() -> ExitCode {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn run(_: &Options) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn run(_: Command) -> Result<(), Error> {
     Err("gip runs models on the Metal GPU, which needs macOS".into())
 }
 
-/// Load the model and hold the conversation `options` asks for.
 #[cfg(target_os = "macos")]
-fn run(options: &Options) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let model = gip::Model::load(&options.model)?;
-    let tokenizer = tokenizers::Tokenizer::from_file(&options.tokenizer)?;
-    let mut chat = Chat::new(&model, &tokenizer, options)?;
-    let mut metal = gip::metal::Metal::open()?;
-    let mut out = io::stdout().lock();
+fn run(command: Command) -> Result<(), Error> {
+    match command {
+        Command::Respond {
+            model,
+            think,
+            prompt,
+        } => respond(&model, think, &prompt.join(" ")),
+        Command::Chat { model } => chat(&model),
+    }
+}
 
-    if let Some(prompt) = &options.prompt {
-        return chat.answer(&mut metal, prompt, &mut out);
+/// Return the prompt, followed by any text on standard input.
+fn full_prompt(prompt: &str) -> Result<String, Error> {
+    let mut stdin = io::stdin();
+    let mut input = String::new();
+    if !stdin.is_terminal() {
+        stdin.read_to_string(&mut input)?;
     }
-    for line in io::stdin().lock().lines() {
-        let line = line?;
-        if !line.trim().is_empty() {
-            chat.answer(&mut metal, &line, &mut out)?;
+    let text = match (prompt.trim().is_empty(), input.trim().is_empty()) {
+        (true, true) => {
+            return Err("no prompt, so pass one as an argument or on standard input".into());
         }
+        (false, true) => prompt.to_owned(),
+        (true, false) => input,
+        (false, false) => format!("{prompt}\n\n{input}"),
+    };
+    Ok(text)
+}
+
+/// Load the model and tokenizer that `options` name.
+#[cfg(target_os = "macos")]
+fn load(options: &ModelOptions) -> Result<(gip::Model, tokenizers::Tokenizer), Error> {
+    let tokenizer = tokenizers::Tokenizer::from_file(options.tokenizer_path()?)?;
+    Ok((gip::Model::load(&options.model)?, tokenizer))
+}
+
+#[cfg(target_os = "macos")]
+fn limits(options: &ModelOptions) -> conversation::Limits {
+    conversation::Limits {
+        max_tokens: options.max_tokens,
+        context: options.context,
     }
+}
+
+/// Answer `prompt` and stdin's text, writing the answer to stdout and, when `think` is true, the
+/// thinking to stderr.
+#[cfg(target_os = "macos")]
+fn respond(options: &ModelOptions, think: bool, prompt: &str) -> Result<(), Error> {
+    use conversation::{Conversation, Part};
+
+    let text = full_prompt(prompt)?;
+    let (model, tokenizer) = load(options)?;
+    let mut metal = gip::metal::Metal::open()?;
+    let mut conversation = Conversation::new(
+        &model,
+        &tokenizer,
+        options.system.as_deref(),
+        limits(options),
+    )?;
+
+    let mut stdout = io::stdout().lock();
+    let mut stderr = io::stderr().lock();
+    let mut thought = false;
+    conversation.reply(&mut metal, &text, |part, piece| {
+        match part {
+            Part::Thinking if think => {
+                stderr.write_all(piece.as_bytes())?;
+                stderr.flush()?;
+                thought = true;
+            }
+            Part::Thinking => {}
+            Part::Answer => {
+                if thought {
+                    // End the thinking's line before the answer starts.
+                    stderr.write_all(b"\n")?;
+                    thought = false;
+                }
+                stdout.write_all(piece.as_bytes())?;
+                stdout.flush()?;
+            }
+        }
+        Ok(())
+    })?;
+    writeln!(stdout)?;
     Ok(())
 }
 
-/// A conversation with a model.
+/// Hold an interactive conversation until the user ends the input.
 #[cfg(target_os = "macos")]
-struct Chat<'a> {
-    model: &'a gip::Model,
-    tokenizer: &'a tokenizers::Tokenizer,
-    template: minijinja::Environment<'static>,
-    bos_token: String,
-    stop_token: u32,
-    /// Every message so far, as maps with a `role` and a `content`.
-    messages: Vec<minijinja::Value>,
-    max_tokens: usize,
-    context: u32,
-}
+fn chat(options: &ModelOptions) -> Result<(), Error> {
+    use conversation::{Conversation, Part};
+    use rustyline::error::ReadlineError;
 
-#[cfg(target_os = "macos")]
-impl<'a> Chat<'a> {
-    fn new(
-        model: &'a gip::Model,
-        tokenizer: &'a tokenizers::Tokenizer,
-        options: &Options,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let source = model
-            .chat_template()
-            .ok_or("the model file holds no chat template")?;
-        let stop_token = model
-            .eos_token()
-            .ok_or("the model file names no end-of-turn token")?;
-        let bos_token = model
-            .bos_token()
-            .and_then(|id| tokenizer.id_to_token(id))
-            .unwrap_or_default();
+    let (model, tokenizer) = load(options)?;
+    let mut metal = gip::metal::Metal::open()?;
+    let mut conversation = Conversation::new(
+        &model,
+        &tokenizer,
+        options.system.as_deref(),
+        limits(options),
+    )?;
+    let mut editor = rustyline::DefaultEditor::new()?;
+    let mut stdout = io::stdout().lock();
+    // Dim text marks the thinking, unless the output goes elsewhere or the user asks for no
+    // color, as https://no-color.org describes.
+    let styled = stdout.is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    let (dim, reset) = if styled {
+        ("\x1b[2m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
 
-        let mut template = minijinja::Environment::new();
-        // Hugging Face templates call Python string and dictionary methods, which pycompat
-        // provides.
-        template.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-        template.add_function("raise_exception", |message: String| -> Result<(), _> {
-            Err(minijinja::Error::new(
-                minijinja::ErrorKind::InvalidOperation,
-                message,
-            ))
-        });
-        // The generation tag marks assistant text for training masks in transformers and has no
-        // effect on the rendered text. MiniJinja does not know the tag.
-        let source = source
-            .replace("{%- generation -%}", "")
-            .replace("{%- endgeneration -%}", "");
-        template.add_template_owned("chat", source)?;
-
-        let messages = options
-            .system
-            .iter()
-            .map(|content| message("system", content))
-            .collect();
-        Ok(Self {
-            model,
-            tokenizer,
-            template,
-            bos_token,
-            stop_token,
-            messages,
-            max_tokens: options.max_tokens,
-            context: options.context,
-        })
-    }
-
-    /// Answer the user message `text`, streaming the answer to `out`.
-    ///
-    /// The template may render earlier turns differently once a new turn follows, for example
-    /// by dropping an earlier answer's thinking. LFM2's convolution state cannot rewind to a
-    /// shared prefix, so each answer prefills the whole conversation from a fresh state.
-    fn answer(
-        &mut self,
-        metal: &mut gip::metal::Metal,
-        text: &str,
-        out: &mut impl Write,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.messages.push(message("user", text));
-        let prompt = self
-            .template
-            .get_template("chat")?
-            .render(minijinja::context! {
-                messages => &self.messages,
-                bos_token => &self.bos_token,
-                add_generation_prompt => true,
-            })?;
-        // The template writes the special tokens as text, including the one that begins the
-        // sequence, so the tokenizer adds none of its own.
-        let tokens = self.tokenizer.encode(prompt, false)?.get_ids().to_vec();
-
-        let mut gpu = gip::Lfm2Metal::new(self.model, metal, self.context, true)?;
-        gpu.prefill(&tokens, None, None)?;
-
-        let mut decoder = self.tokenizer.decode_stream(false);
-        let mut answer = String::new();
-        let mut chunk = [0; DECODE_CHUNK];
-        let mut remaining = self.max_tokens;
-        'decode: while remaining > 0 {
-            let room = self.context as usize - tokens.len() - (self.max_tokens - remaining);
-            let count = DECODE_CHUNK.min(remaining).min(room);
-            if count == 0 {
-                break;
-            }
-            gpu.generate(&mut chunk[..count])?;
-            for &token in &chunk[..count] {
-                if token == self.stop_token {
-                    break 'decode;
-                }
-                if let Some(piece) = decoder.step(token)? {
-                    out.write_all(piece.as_bytes())?;
-                    answer.push_str(&piece);
-                }
-            }
-            out.flush()?;
-            remaining -= count;
+    loop {
+        let line = match editor.readline("› ") {
+            Ok(line) => line,
+            Err(ReadlineError::Eof | ReadlineError::Interrupted) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if line.trim().is_empty() {
+            continue;
         }
-        writeln!(out)?;
-        self.messages.push(message("assistant", &answer));
-        Ok(())
-    }
-}
+        editor.add_history_entry(line.as_str())?;
 
-/// Return a chat message from `role` holding `content`.
-#[cfg(target_os = "macos")]
-fn message(role: &str, content: &str) -> minijinja::Value {
-    minijinja::context! { role => role, content => content }
+        let mut last = None;
+        conversation.reply(&mut metal, &line, |part, piece| {
+            if last.is_none() && part == Part::Thinking {
+                write!(stdout, "{dim}")?;
+            }
+            if last == Some(Part::Thinking) && part == Part::Answer {
+                write!(stdout, "{reset}\n\n")?;
+            }
+            last = Some(part);
+            stdout.write_all(piece.as_bytes())?;
+            stdout.flush()?;
+            Ok(())
+        })?;
+        write!(stdout, "{reset}\n\n")?;
+    }
 }
