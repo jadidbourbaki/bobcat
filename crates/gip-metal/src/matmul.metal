@@ -301,6 +301,21 @@ matmul_q (device const uchar *weights [[buffer (0)]],
 
   uint row_offset = 8 * row_block_base;
   uint token_offset = 8 * token_block_base;
+  if constexpr (is_same<F, f16_format>::value)
+    {
+      bool full = first_row + MATMUL_ROWS <= n_rows
+                  && first_token + MATMUL_TOKENS <= n_tokens;
+      if (full && !accumulate && !swiglu_store)
+        {
+          device float *out = y + ulong (first_token + token_offset) * n_rows
+                              + first_row + row_offset;
+          for (uint j = 0; j < 2; j++)
+            for (uint i = 0; i < 4; i++)
+              simdgroup_store (acc[4 * j + i],
+                               out + ulong (8 * j) * n_rows + 8 * i, n_rows);
+          return;
+        }
+    }
   for (uint j = 0; j < 2; j++)
     for (uint i = 0; i < 4; i++)
       simdgroup_store (acc[4 * j + i],
@@ -333,6 +348,8 @@ matmul_q (device const uchar *weights [[buffer (0)]],
 
 template [[host_name ("matmul_q4_0")]] kernel decltype (matmul_q<q4_0_format>)
     matmul_q<q4_0_format>;
+template [[host_name ("matmul_f16")]] kernel decltype (matmul_q<f16_format>)
+    matmul_q<f16_format>;
 template [[host_name ("matmul_q4k")]] kernel decltype (matmul_q<q4k_format>)
     matmul_q<q4k_format>;
 template [[host_name ("matmul_q6k")]] kernel decltype (matmul_q<q6k_format>)

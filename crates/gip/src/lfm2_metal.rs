@@ -31,6 +31,8 @@ const GENERATE_IN_FLIGHT: usize = 3;
 
 /// Prefill runs the prompt through the model this many tokens at a time.
 const PREFILL_BATCH: u32 = 512;
+/// Expansion pays for itself on a full prefill batch.
+const K_EXPAND_MIN_TOKENS: u32 = 512;
 
 const FLOAT_BYTES: usize = 4;
 const TOKEN_BYTES: usize = 4;
@@ -39,6 +41,7 @@ const TOKEN_BYTES: usize = 4;
 #[derive(Debug)]
 struct Buffers {
     weights: Buffer,
+    expanded_weights: Option<Buffer>,
     k_cache: Buffer,
     v_cache: Buffer,
     k: Buffer,
@@ -123,11 +126,28 @@ impl<'a> Lfm2Metal<'a> {
         let cache_bytes = cache_elements * if kv_half { 2 } else { FLOAT_BYTES };
         let conv_floats = to_usize(hp.n_conv_layers) * to_usize(hp.conv_kernel - 1) * n_embd;
         let batch = n_ctx.min(PREFILL_BATCH);
+        let expanded_bytes = model
+            .layers
+            .iter()
+            .flat_map(layer_matrices)
+            .filter(|matrix| {
+                batch >= K_EXPAND_MIN_TOKENS
+                    && matches!(matrix.tensor.data_type(), TensorType::Q4K | TensorType::Q6K)
+            })
+            .map(|matrix| to_usize(matrix.n_rows) * to_usize(matrix.n_cols) * 2)
+            .max()
+            .unwrap_or(0);
+        let expanded_weights = if expanded_bytes > 0 {
+            Some(metal.new_buffer(expanded_bytes)?)
+        } else {
+            None
+        };
         let rows = to_usize(batch);
         let floats = |count: usize| metal.new_buffer(count * FLOAT_BYTES);
 
         let buffers = Buffers {
             weights,
+            expanded_weights,
             k_cache: metal.new_buffer(cache_bytes)?,
             v_cache: metal.new_buffer(cache_bytes)?,
             k: floats(rows * kv_dim)?,
@@ -576,8 +596,41 @@ impl<'r> Recorder<'r> {
         store: Store,
     ) -> Result<(), Error> {
         let weights = self.buffers.weights(&matrix.tensor);
+        let format = format(matrix)?;
+        if matches!(format, Format::Q4K | Format::Q6K) && n >= K_EXPAND_MIN_TOKENS {
+            let expanded = self
+                .buffers
+                .expanded_weights
+                .as_ref()
+                .expect("K-quant matrices have expansion scratch");
+            match format {
+                Format::Q4K => {
+                    self.metal
+                        .expand_q4k(weights, expanded.at(0), matrix.n_rows, matrix.n_cols)?;
+                }
+                Format::Q6K => {
+                    self.metal
+                        .expand_q6k(weights, expanded.at(0), matrix.n_rows, matrix.n_cols)?;
+                }
+                _ => unreachable!("only K-quant matrices enter the expansion path"),
+            }
+            self.metal.barrier();
+            self.metal.matmul(
+                Format::F16,
+                expanded.at(0),
+                matrix.n_rows,
+                matrix.n_cols,
+                x,
+                y,
+                n,
+                store,
+            )?;
+            // The next matrix may reuse the expansion buffer in the same concurrent encoder.
+            self.metal.barrier();
+            return Ok(());
+        }
         self.metal.matmul(
-            format(matrix)?,
+            format,
             weights,
             matrix.n_rows,
             matrix.n_cols,

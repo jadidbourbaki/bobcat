@@ -11,6 +11,7 @@ use clap::{Parser, ValueEnum};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Quant {
+    F16,
     Q8_0,
     Q4_0,
     Q4k,
@@ -46,6 +47,9 @@ struct Options {
     /// How the result combines with the output buffer.
     #[arg(long, value_enum, default_value_t = StoreMode::Overwrite)]
     store: StoreMode,
+    /// Expand Q4_K or Q6_K weights to half precision before each matrix multiply.
+    #[arg(long)]
+    expand: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -77,11 +81,15 @@ fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
     use gip::metal::{Format, Metal, Store};
 
     let (format, block_weights, block_bytes) = match options.format {
+        Quant::F16 => (Format::F16, 32, 64),
         Quant::Q8_0 => (Format::Q8_0, 32, 34),
         Quant::Q4_0 => (Format::Q4_0, 32, 18),
         Quant::Q4k => (Format::Q4K, 256, 144),
         Quant::Q6k => (Format::Q6K, 256, 210),
     };
+    if options.expand && !matches!(options.format, Quant::Q4k | Quant::Q6k) {
+        return Err("--expand requires --format q4k or q6k".into());
+    }
     let store = match options.store {
         StoreMode::Overwrite => Store::Overwrite,
         StoreMode::Accumulate => Store::Accumulate,
@@ -106,14 +114,35 @@ fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
     let weights = metal.new_buffer(weight_bytes)?;
     let input = metal.new_buffer(input_len.checked_mul(4).ok_or("input size overflow")?)?;
     let output = metal.new_buffer(output_len.checked_mul(4).ok_or("output size overflow")?)?;
+    let expanded = if options.expand {
+        let bytes = rows
+            .checked_mul(cols)
+            .and_then(|elements| elements.checked_mul(2))
+            .ok_or("weight size overflow")?;
+        Some(metal.new_buffer(bytes)?)
+    } else {
+        None
+    };
     metal.write(input.at(0), &vec![1.0_f32; input_len])?;
 
     let mut samples = Vec::with_capacity(options.reps as usize);
     for rep in 0..=options.reps {
         metal.begin()?;
+        if let Some(expanded) = &expanded {
+            match options.format {
+                Quant::Q4k => {
+                    metal.expand_q4k(weights.at(0), expanded.at(0), options.rows, options.cols)?;
+                }
+                Quant::Q6k => {
+                    metal.expand_q6k(weights.at(0), expanded.at(0), options.rows, options.cols)?;
+                }
+                _ => unreachable!("only K-quants may expand"),
+            }
+            metal.barrier();
+        }
         metal.matmul(
-            format,
-            weights.at(0),
+            if options.expand { Format::F16 } else { format },
+            expanded.as_ref().unwrap_or(&weights).at(0),
             options.rows,
             options.cols,
             input.at(0),

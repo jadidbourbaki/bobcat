@@ -247,6 +247,8 @@ mod sealed {
 /// A weight format the matrix and embedding kernels read. The block layouts match ggml's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
+    /// Contiguous fp16 weights.
+    F16,
     /// Blocks of 32 weights: an fp16 scale and 32 int8 quants.
     Q8_0,
     /// Blocks of 32 weights: an fp16 scale and 32 4-bit quants.
@@ -258,20 +260,22 @@ pub enum Format {
 }
 
 impl Format {
-    const ALL: [Self; 4] = [Self::Q8_0, Self::Q4_0, Self::Q4K, Self::Q6K];
+    const ALL: [Self; 5] = [Self::F16, Self::Q8_0, Self::Q4_0, Self::Q4K, Self::Q6K];
 
     fn index(self) -> usize {
         match self {
-            Self::Q8_0 => 0,
-            Self::Q4_0 => 1,
-            Self::Q4K => 2,
-            Self::Q6K => 3,
+            Self::F16 => 0,
+            Self::Q8_0 => 1,
+            Self::Q4_0 => 2,
+            Self::Q4K => 3,
+            Self::Q6K => 4,
         }
     }
 
     /// Return the weights and bytes of one block.
     fn block(self) -> (usize, usize) {
         match self {
+            Self::F16 => (32, 64),
             Self::Q8_0 => (32, 34),
             Self::Q4_0 => (32, 18),
             Self::Q4K => (256, 144),
@@ -289,6 +293,7 @@ impl Format {
     /// matrix-matrix product, and the embedding lookup.
     fn kernel_names(self) -> [&'static str; 4] {
         match self {
+            Self::F16 => ["matvec_f16", "matvec_f16_swiglu", "matmul_f16", "embed_f16"],
             Self::Q8_0 => [
                 "matvec_q8_0",
                 "matvec_q8_0_swiglu",
@@ -329,6 +334,8 @@ enum Kernel {
     ShortConvBatch,
     ShortConvHistory,
     Matmul(Format, Store),
+    ExpandQ4K,
+    ExpandQ6K,
     Copy,
     Embed(Format),
     Argmax,
@@ -353,6 +360,8 @@ impl Kernel {
             Self::Matmul(format, Store::Overwrite | Store::Accumulate | Store::Swiglu) => {
                 format.kernel_names()[2]
             }
+            Self::ExpandQ4K => "expand_q4k",
+            Self::ExpandQ6K => "expand_q6k",
             Self::Copy => "copy",
             Self::Embed(format) => format.kernel_names()[3],
             Self::Argmax => "argmax",
@@ -432,6 +441,8 @@ impl FormatPipelines {
 struct Pipelines {
     /// Indexed by [`Format::index`].
     formats: Vec<FormatPipelines>,
+    expand_q4k: Pipeline,
+    expand_q6k: Pipeline,
     rms_norm: Pipeline,
     /// Indexed by whether the output is half precision.
     norm_rope: [Pipeline; 2],
@@ -457,6 +468,8 @@ impl Pipelines {
                 .into_iter()
                 .map(|format| FormatPipelines::new(device, library, format))
                 .collect::<Result<_, _>>()?,
+            expand_q4k: plain("expand_q4k")?,
+            expand_q6k: plain("expand_q6k")?,
             rms_norm: plain("rms_norm")?,
             norm_rope: [plain("norm_rope_f32")?, plain("norm_rope_f16")?],
             convert_half: plain("convert_half")?,
@@ -494,6 +507,8 @@ impl Pipelines {
                 };
                 &self.formats[format.index()].matmul[index]
             }
+            Kernel::ExpandQ4K => &self.expand_q4k,
+            Kernel::ExpandQ6K => &self.expand_q6k,
             Kernel::Copy => &self.copy,
             Kernel::Embed(format) => &self.formats[format.index()].embed,
             Kernel::Argmax => &self.argmax,
@@ -1329,6 +1344,58 @@ impl Metal {
         })
     }
 
+    /// Expand a Q4_K matrix into contiguous half-precision rows.
+    pub fn expand_q4k(
+        &mut self,
+        weights: View<'_>,
+        out: View<'_>,
+        n_rows: u32,
+        n_cols: u32,
+    ) -> Result<(), Error> {
+        let rows = to_usize(n_rows);
+        let cols = to_usize(n_cols);
+        let args = [
+            buffer(weights, Format::Q4K.matrix_bytes(rows, cols)),
+            buffer(out, Format::F16.matrix_bytes(rows, cols)),
+            Arg::U32(n_rows),
+            Arg::U32(n_cols),
+        ];
+        self.launch(&Launch {
+            kernel: Kernel::ExpandQ4K,
+            args: &args,
+            dispatch: Dispatch::Threads([product(&[rows, cols / 16]), 1, 1], [256, 1, 1]),
+            n_rows,
+            n_cols,
+            weight_bytes: to_u64(Format::Q4K.matrix_bytes(rows, cols)),
+        })
+    }
+
+    /// Expand a Q6_K matrix into contiguous half-precision rows.
+    pub fn expand_q6k(
+        &mut self,
+        weights: View<'_>,
+        out: View<'_>,
+        n_rows: u32,
+        n_cols: u32,
+    ) -> Result<(), Error> {
+        let rows = to_usize(n_rows);
+        let cols = to_usize(n_cols);
+        let args = [
+            buffer(weights, Format::Q6K.matrix_bytes(rows, cols)),
+            buffer(out, Format::F16.matrix_bytes(rows, cols)),
+            Arg::U32(n_rows),
+            Arg::U32(n_cols),
+        ];
+        self.launch(&Launch {
+            kernel: Kernel::ExpandQ6K,
+            args: &args,
+            dispatch: Dispatch::Threads([product(&[rows, cols / 16]), 1, 1], [256, 1, 1]),
+            n_rows,
+            n_cols,
+            weight_bytes: to_u64(Format::Q6K.matrix_bytes(rows, cols)),
+        })
+    }
+
     /// Record a copy of `n` floats from `src` to `dst`.
     pub fn copy(&mut self, src: View<'_>, dst: View<'_>, n: u32) -> Result<(), Error> {
         let bytes = product(&[to_usize(n), FLOAT_BYTES]);
@@ -1361,7 +1428,7 @@ impl Metal {
         // The Q8_0 kernel dequantizes one weight per thread, and the others 8.
         let per_thread = match format {
             Format::Q8_0 => 1,
-            Format::Q4_0 | Format::Q4K | Format::Q6K => 8,
+            Format::F16 | Format::Q4_0 | Format::Q4K | Format::Q6K => 8,
         };
         let args = [
             buffer(

@@ -207,6 +207,8 @@ matvec_q (device const uchar *weights [[buffer (0)]],
 
 template [[host_name ("matvec_q4_0")]] kernel decltype (matvec_q<q4_0_format>)
     matvec_q<q4_0_format>;
+template [[host_name ("matvec_f16")]] kernel decltype (matvec_q<f16_format>)
+    matvec_q<f16_format>;
 
 /* Multiply the matrices GATE and UP of format F, which each have N_ROWS
    rows of N_COLS weights, by the N_COLS floats at X, and store SiLU of
@@ -284,6 +286,9 @@ matvec_q_swiglu (device const uchar *gate [[buffer (0)]],
 template [[host_name (
     "matvec_q4_0_swiglu")]] kernel decltype (matvec_q_swiglu<q4_0_format>)
     matvec_q_swiglu<q4_0_format>;
+template [[host_name (
+    "matvec_f16_swiglu")]] kernel decltype (matvec_q_swiglu<f16_format>)
+    matvec_q_swiglu<f16_format>;
 
 /* Multiply the matrix WEIGHTS of K-quant format K, which has N_ROWS rows
    of N_COLS weights, by the N_COLS floats at X and store the N_ROWS

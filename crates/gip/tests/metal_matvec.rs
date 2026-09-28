@@ -11,6 +11,7 @@ use std::error::Error;
 use gip::TensorType;
 use gip::metal::{Format, MatvecOptions, Metal, Norm};
 use gip::scalar;
+use half::f16;
 
 /// The largest error allowed, relative to the largest magnitude in the scalar result. The GPU
 /// sums in float32 and the scalar code sums in double, and rows of a few thousand elements stay
@@ -140,8 +141,19 @@ fn launch_error(
     let cols = n_cols as usize;
     let block_bytes = data_type.block().1;
     let weight_bytes = scalar::row_bytes(data_type, cols) * rows;
-    let gate_weights = random.blocks(weight_bytes, block_bytes, scales);
-    let up_weights = random.blocks(weight_bytes, block_bytes, scales);
+    let weights = |random: &mut Random| {
+        if format == Format::F16 {
+            let mut bytes = Vec::with_capacity(weight_bytes);
+            for _ in 0..weight_bytes / 2 {
+                bytes.extend_from_slice(&f16::from_f32(random.unit()).to_bits().to_le_bytes());
+            }
+            bytes
+        } else {
+            random.blocks(weight_bytes, block_bytes, scales)
+        }
+    };
+    let gate_weights = weights(random);
+    let up_weights = weights(random);
     let x: Vec<f32> = (0..cols).map(|_| random.unit()).collect();
     let norm_weight: Vec<f32> = (0..cols).map(|_| 1.0 + 0.5 * random.unit()).collect();
     let prior: Vec<f32> = (0..rows).map(|_| random.unit()).collect();
@@ -225,6 +237,26 @@ fn launch_error(
         Mode::Swiglu => max_magnitude(&want),
     };
     Ok(max_difference(&got, &want) / scale)
+}
+
+#[test]
+fn f16_matvec_matches_scalar() -> Result<(), Box<dyn Error>> {
+    let mut metal = match Metal::open() {
+        Ok(metal) => metal,
+        Err(error) => {
+            eprintln!("skip: {error}");
+            return Ok(());
+        }
+    };
+    let mut random = Random(0x60e7_927b_081d_a5ef);
+    let format = (Format::F16, TensorType::F16, &[][..]);
+    for mode in [Mode::Plain, Mode::Norm, Mode::Accumulate, Mode::Swiglu] {
+        for (rows, cols) in [(7, 256), (1000, 1024)] {
+            let error = launch_error(&mut metal, &mut random, format, mode, rows, cols)?;
+            assert!(error < TOLERANCE, "F16 {mode:?} {rows}x{cols}: {error:e}");
+        }
+    }
+    Ok(())
 }
 
 #[test]

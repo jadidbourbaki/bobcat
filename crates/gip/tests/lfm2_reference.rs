@@ -79,6 +79,40 @@ fn q4_k_m_metal_batch() -> TestResult {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn q4_k_m_long_prefill_matches_steps() -> TestResult {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/LFM2.5-350M-Q4_K_M.gguf");
+    if !path.exists() {
+        eprintln!("skip: {} is missing", path.display());
+        return Ok(());
+    }
+    let model = Model::load(path)?;
+    let mut metal = match gip::metal::Metal::open() {
+        Ok(metal) => metal,
+        Err(error) => {
+            eprintln!("skip: {error}");
+            return Ok(());
+        }
+    };
+    let prompt = vec![1000_u32; 512];
+    let mut batch_logits = vec![0.0; model.hyperparameters().n_vocab as usize];
+    let mut step_logits = batch_logits.clone();
+    {
+        let mut gpu = gip::Lfm2Metal::new(&model, &mut metal, 513, true)?;
+        gpu.prefill(&prompt, Some(&mut batch_logits), None)?;
+    }
+    {
+        let mut gpu = gip::Lfm2Metal::new(&model, &mut metal, 513, true)?;
+        for token in prompt {
+            gpu.step(token, Some(&mut step_logits), None)?;
+        }
+    }
+    let error = relative_error(&batch_logits, &step_logits);
+    assert!(error < HALF_KV_TOLERANCE, "long Q4_K prefill error {error}");
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn q8_0_metal_f32_kv() -> TestResult {
     check_metal("LFM2.5-350M-Q8_0", false, false)
 }

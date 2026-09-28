@@ -214,6 +214,8 @@ embed_q (device const uchar *weights [[buffer (0)]],
 template [[host_name ("embed_q4_0")]] kernel decltype (embed_q<q4_0_format>)
     embed_q<q4_0_format>;
 template [[host_name (
+    "embed_f16")]] kernel decltype (embed_q<f16_format>) embed_q<f16_format>;
+template [[host_name (
     "embed_q4k")]] kernel decltype (embed_q<q4k_format>) embed_q<q4k_format>;
 template [[host_name (
     "embed_q6k")]] kernel decltype (embed_q<q6k_format>) embed_q<q6k_format>;

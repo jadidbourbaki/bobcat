@@ -16,6 +16,28 @@ struct weights8
   float4 high;
 };
 
+/* Plain half-precision weights, stored as contiguous rows.  */
+struct f16_format
+{
+  static constant constexpr uint block_weights = 32;
+  static constant constexpr uint block_bytes = 64;
+
+  static weights8
+  load8 (device const uchar *row, uint e)
+  {
+    device const half4 *values = (device const half4 *)(row + 2 * e);
+    return { float4 (values[0]), float4 (values[1]) };
+  }
+
+  static void
+  load16 (device const uchar *row, uint e, thread half4 *out)
+  {
+    device const half4 *values = (device const half4 *)(row + 2 * e);
+    for (uint i = 0; i < 4; i++)
+      out[i] = values[i];
+  }
+};
+
 /* The Q4_0 format: blocks of 32 weights, each an fp16 scale and 16
    bytes whose low nibbles hold weights 0 to 15 and whose high nibbles
    hold weights 16 to 31, each offset by 8.  */
@@ -176,6 +198,50 @@ struct q6k_format
     out[3] = half4 (second.high);
   }
 };
+
+/* Expand one Q4_K matrix into contiguous half-precision rows.  */
+kernel void
+expand_q4k (device const uchar *weights [[buffer (0)]],
+            device half *out [[buffer (1)]],
+            constant uint &n_rows [[buffer (2)]],
+            constant uint &n_cols [[buffer (3)]],
+            uint index [[thread_position_in_grid]])
+{
+  uint chunks_per_row = n_cols / 16;
+  if (ulong (index) >= ulong (n_rows) * chunks_per_row)
+    return;
+  uint row = index / chunks_per_row;
+  uint e = (index % chunks_per_row) * 16;
+  half4 values[4];
+  q4k_format::load16 (
+      weights + ulong (row) * (n_cols / 256) * q4k_format::block_bytes, e,
+      values);
+  device half4 *dst = (device half4 *)(out + ulong (row) * n_cols + e);
+  for (uint i = 0; i < 4; i++)
+    dst[i] = values[i];
+}
+
+/* Expand one Q6_K matrix into contiguous half-precision rows.  */
+kernel void
+expand_q6k (device const uchar *weights [[buffer (0)]],
+            device half *out [[buffer (1)]],
+            constant uint &n_rows [[buffer (2)]],
+            constant uint &n_cols [[buffer (3)]],
+            uint index [[thread_position_in_grid]])
+{
+  uint chunks_per_row = n_cols / 16;
+  if (ulong (index) >= ulong (n_rows) * chunks_per_row)
+    return;
+  uint row = index / chunks_per_row;
+  uint e = (index % chunks_per_row) * 16;
+  half4 values[4];
+  q6k_format::load16 (
+      weights + ulong (row) * (n_cols / 256) * q6k_format::block_bytes, e,
+      values);
+  device half4 *dst = (device half4 *)(out + ulong (row) * n_cols + e);
+  for (uint i = 0; i < 4; i++)
+    dst[i] = values[i];
+}
 
 /* Return the bytes of one row of N_COLS weights of format F.  */
 template <typename F>
