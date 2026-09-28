@@ -522,3 +522,78 @@ copy_floats (device const float *src [[buffer (0)]],
   if (i < n)
     dst[i] = src[i];
 }
+
+/* Dequantize row TOKEN[0] of the Q8_0 matrix WEIGHTS, whose rows hold
+   N_EMBD elements, into the N_EMBD floats at OUT.  One thread handles
+   one element.  */
+kernel void
+embed_q8_0 (device const uchar *weights [[buffer (0)]],
+            device const int *token [[buffer (1)]],
+            device float *out [[buffer (2)]],
+            constant uint &n_embd [[buffer (3)]],
+            uint i [[thread_position_in_grid]])
+{
+  if (i >= n_embd)
+    return;
+  ulong row_bytes = ulong (n_embd / QK8_0) * Q8_0_BLOCK_BYTES;
+  device const q8_0_block *block
+      = (device const q8_0_block *)(weights + ulong (token[0]) * row_bytes)
+        + i / QK8_0;
+  out[i] = float (block->scale) * float (block->quants[i % QK8_0]);
+}
+
+/* Store at OUT the index of the largest of the N floats at X.  Ties go
+   to the lowest index, as a sequential scan would choose.  One
+   threadgroup handles the whole vector.  */
+kernel void
+argmax (device const float *x [[buffer (0)]], device int *out [[buffer (1)]],
+        constant uint &n [[buffer (2)]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint threads [[threads_per_threadgroup]],
+        uint simdgroup_index [[simdgroup_index_in_threadgroup]],
+        uint simdgroups [[simdgroups_per_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]])
+{
+  threadgroup float best_values[MAX_SIMDGROUPS];
+  threadgroup uint best_indices[MAX_SIMDGROUPS];
+
+  /* Each thread scans a strided slice, so its first maximum is also its
+     lowest-index maximum.  */
+  float best = -INFINITY;
+  uint best_index = 0;
+  for (uint i = tid; i < n; i += threads)
+    if (x[i] > best)
+      {
+        best = x[i];
+        best_index = i;
+      }
+
+  for (uint offset = SIMD_WIDTH / 2; offset > 0; offset /= 2)
+    {
+      float other = simd_shuffle_down (best, offset);
+      uint other_index = simd_shuffle_down (best_index, offset);
+      if (other > best || (other == best && other_index < best_index))
+        {
+          best = other;
+          best_index = other_index;
+        }
+    }
+  if (lane == 0)
+    {
+      best_values[simdgroup_index] = best;
+      best_indices[simdgroup_index] = best_index;
+    }
+  threadgroup_barrier (mem_flags::mem_threadgroup);
+
+  if (tid == 0)
+    {
+      for (uint s = 1; s < simdgroups; s++)
+        if (best_values[s] > best
+            || (best_values[s] == best && best_indices[s] < best_index))
+          {
+            best = best_values[s];
+            best_index = best_indices[s];
+          }
+      out[0] = int (best_index);
+    }
+}

@@ -35,6 +35,8 @@ struct gip_lfm2_metal
   struct gip_metal_buffer *scores;
   struct gip_metal_buffer *ffn;
   struct gip_metal_buffer *logits;
+  struct gip_metal_buffer *tokens;
+  struct gip_metal_buffer *trace_embedding;
   struct gip_metal_buffer *trace_layers;
   struct gip_metal_buffer *trace_final;
 };
@@ -56,5 +58,13 @@ void gip_lfm2_metal_free (struct gip_lfm2_metal *gpu);
 enum gip_status gip_lfm2_metal_step (struct gip_lfm2_metal *gpu, int32_t token,
                                      float *logits,
                                      const struct gip_lfm2_trace *trace);
+
+/* Decode N tokens greedily on GPU and store them at OUT.  The first
+   token is the argmax of the logits of the previous step, which must
+   have asked for logits.  Each token then runs through the model to
+   choose the next.  The GPU picks every token itself, and the CPU
+   submits several steps ahead, so the GPU never waits for the CPU.  */
+enum gip_status gip_lfm2_metal_generate (struct gip_lfm2_metal *gpu,
+                                         uint32_t n, int32_t *out);
 
 #endif /* GIP_MODEL_LFM2_METAL_H */

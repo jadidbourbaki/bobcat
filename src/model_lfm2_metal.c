@@ -7,7 +7,6 @@
 #include <time.h>
 
 #include "error.h"
-#include "kernels/scalar.h"
 #include "model_lfm2_metal.h"
 
 enum
@@ -17,7 +16,11 @@ enum
      most four query heads of up to 128 elements.  */
   SIMD_WIDTH = 32,
   ATTENTION_MAX_GROUP = 4,
-  ATTENTION_MAX_HEAD_DIM = 128
+  ATTENTION_MAX_HEAD_DIM = 128,
+  /* Generation keeps up to this many steps submitted ahead of the GPU.
+     Each step depends on the one before, so more steps in flight save
+     nothing once the GPU never waits for the CPU.  */
+  GENERATE_IN_FLIGHT = 3
 };
 
 /* Return the monotonic clock time in seconds.  */
@@ -142,6 +145,9 @@ gip_lfm2_metal_init (const struct gip_lfm2_model *model,
                                      model->n_heads, model->head_dim, n_ctx));
   gpu->ffn = new_floats (gpu, model->n_ff);
   gpu->logits = new_floats (gpu, model->n_vocab);
+  /* An int32_t token id takes the space of one float.  */
+  gpu->tokens = new_floats (gpu, n_ctx);
+  gpu->trace_embedding = new_floats (gpu, n_embd);
   gpu->trace_layers = new_floats (gpu, (size_t)model->n_layers * n_embd);
   gpu->trace_final = new_floats (gpu, n_embd);
 
@@ -149,7 +155,8 @@ gip_lfm2_metal_init (const struct gip_lfm2_model *model,
       || gpu->k == NULL || gpu->v == NULL || gpu->conv_state == NULL
       || gpu->hidden == NULL || gpu->bcx == NULL || gpu->conv_out == NULL
       || gpu->q == NULL || gpu->attn == NULL || gpu->scores == NULL
-      || gpu->ffn == NULL || gpu->logits == NULL || gpu->trace_layers == NULL
+      || gpu->ffn == NULL || gpu->logits == NULL || gpu->tokens == NULL
+      || gpu->trace_embedding == NULL || gpu->trace_layers == NULL
       || gpu->trace_final == NULL)
     {
       gip_format_error (err, err_size, "cannot allocate Metal buffers");
@@ -163,10 +170,24 @@ void
 gip_lfm2_metal_free (struct gip_lfm2_metal *gpu)
 {
   struct gip_metal_buffer *buffers[] = {
-    gpu->weights,  gpu->k_cache,    gpu->v_cache,      gpu->k,
-    gpu->v,        gpu->conv_state, gpu->hidden,       gpu->bcx,
-    gpu->conv_out, gpu->q,          gpu->attn,         gpu->scores,
-    gpu->ffn,      gpu->logits,     gpu->trace_layers, gpu->trace_final,
+    gpu->weights,
+    gpu->k_cache,
+    gpu->v_cache,
+    gpu->k,
+    gpu->v,
+    gpu->conv_state,
+    gpu->hidden,
+    gpu->bcx,
+    gpu->conv_out,
+    gpu->q,
+    gpu->attn,
+    gpu->scores,
+    gpu->ffn,
+    gpu->logits,
+    gpu->tokens,
+    gpu->trace_embedding,
+    gpu->trace_layers,
+    gpu->trace_final,
   };
 
   for (size_t i = 0; i < sizeof buffers / sizeof buffers[0]; i++)
@@ -291,34 +312,26 @@ record_attention (struct gip_lfm2_metal *gpu,
           &add_to_residual);
 }
 
-enum gip_status
-gip_lfm2_metal_step (struct gip_lfm2_metal *gpu, int32_t token, float *logits,
-                     const struct gip_lfm2_trace *trace)
+/* Record one forward pass of GPU's model on the token at TOKENS[POS]:
+   the embedding lookup, every layer, and, when WANT_LOGITS is nonzero,
+   the output matrix into the logits buffer.  When TRACE is not null,
+   also record copies of the activations its members ask for.  */
+static void
+record_step (struct gip_lfm2_metal *gpu, uint32_t pos, int want_logits,
+             const struct gip_lfm2_trace *trace)
 {
   const struct gip_lfm2_model *model = gpu->model;
   struct gip_metal *metal = gpu->metal;
   uint32_t n_embd = model->n_embd;
-  uint32_t pos = gpu->n_past;
-  enum gip_status status;
-
-  if (pos >= gpu->n_ctx || token < 0 || (uint32_t)token >= model->n_vocab)
-    return GIP_ERR_ARGUMENT;
-
-  /* One embedding row is cheap to dequantize on the CPU, and the buffer
-     is shared with the GPU.  */
-  float *hidden = gip_metal_buffer_contents (gpu->hidden);
-  gip_get_row (model->token_embd->type, model->token_embd->data, n_embd,
-               (size_t)token, hidden);
-  if (trace != NULL && trace->embedding != NULL)
-    memcpy (trace->embedding, hidden, n_embd * sizeof (float));
-
-  double encode_start = now_seconds ();
-  status = gip_metal_begin (metal);
-  if (status != GIP_OK)
-    return status;
-
   struct gip_metal_view h = floats_at (gpu->hidden, 0);
   struct gip_metal_view ffn = floats_at (gpu->ffn, 0);
+
+  gip_metal_embed_q8_0 (metal, weights_of (gpu, model->token_embd),
+                        gip_metal_at (gpu->tokens, pos * sizeof (int32_t)), h,
+                        n_embd);
+  if (trace != NULL && trace->embedding != NULL)
+    gip_metal_copy (metal, h, floats_at (gpu->trace_embedding, 0), n_embd);
+
   for (uint32_t il = 0; il < model->n_layers; il++)
     {
       const struct gip_lfm2_layer *layer = &model->layers[il];
@@ -346,21 +359,47 @@ gip_lfm2_metal_step (struct gip_lfm2_metal *gpu, int32_t token, float *logits,
     gip_metal_rms_norm (metal, h, weights_of (gpu, model->output_norm),
                         floats_at (gpu->trace_final, 0), n_embd,
                         model->norm_eps);
-  if (logits != NULL)
+  if (want_logits)
     {
       struct gip_metal_matvec_options norm
           = normalized (gpu, model->output_norm);
       matvec (gpu, model->output, h, floats_at (gpu->logits, 0), &norm);
     }
+}
 
+enum gip_status
+gip_lfm2_metal_step (struct gip_lfm2_metal *gpu, int32_t token, float *logits,
+                     const struct gip_lfm2_trace *trace)
+{
+  const struct gip_lfm2_model *model = gpu->model;
+  uint32_t n_embd = model->n_embd;
+  uint32_t pos = gpu->n_past;
+  enum gip_status status;
+
+  if (pos >= gpu->n_ctx || token < 0 || (uint32_t)token >= model->n_vocab)
+    return GIP_ERR_ARGUMENT;
+
+  /* Nothing is in flight between steps, so the CPU can write the token
+     straight into the shared buffer.  */
+  int32_t *tokens = gip_metal_buffer_contents (gpu->tokens);
+  tokens[pos] = token;
+
+  double encode_start = now_seconds ();
+  status = gip_metal_begin (gpu->metal);
+  if (status != GIP_OK)
+    return status;
+  record_step (gpu, pos, logits != NULL, trace);
   gpu->last_encode_seconds = now_seconds () - encode_start;
-  status = gip_metal_end (metal, &gpu->last_gpu_seconds);
+  status = gip_metal_end (gpu->metal, &gpu->last_gpu_seconds);
   if (status != GIP_OK)
     return status;
 
   if (logits != NULL)
     memcpy (logits, gip_metal_buffer_contents (gpu->logits),
             (size_t)model->n_vocab * sizeof (float));
+  if (trace != NULL && trace->embedding != NULL)
+    memcpy (trace->embedding, gip_metal_buffer_contents (gpu->trace_embedding),
+            n_embd * sizeof (float));
   if (trace != NULL && trace->layers != NULL)
     memcpy (trace->layers, gip_metal_buffer_contents (gpu->trace_layers),
             (size_t)model->n_layers * n_embd * sizeof (float));
@@ -369,5 +408,64 @@ gip_lfm2_metal_step (struct gip_lfm2_metal *gpu, int32_t token, float *logits,
             n_embd * sizeof (float));
 
   gpu->n_past++;
+  return GIP_OK;
+}
+
+enum gip_status
+gip_lfm2_metal_generate (struct gip_lfm2_metal *gpu, uint32_t n, int32_t *out)
+{
+  const struct gip_lfm2_model *model = gpu->model;
+  uint64_t tickets[GENERATE_IN_FLIGHT] = { 0 };
+  enum gip_status status = GIP_OK;
+  double gpu_seconds = 0.0;
+  double encode_seconds = 0.0;
+
+  if (gpu->n_past == 0 || n > gpu->n_ctx - gpu->n_past)
+    return GIP_ERR_ARGUMENT;
+
+  for (uint32_t i = 0; i < n && status == GIP_OK; i++)
+    {
+      uint32_t pos = gpu->n_past + i;
+
+      /* Bound the steps in flight, so the CPU runs only a few steps ahead
+         of the GPU.  */
+      uint64_t *slot = &tickets[i % GENERATE_IN_FLIGHT];
+      if (*slot != 0)
+        status = gip_metal_wait (gpu->metal, *slot, &gpu_seconds);
+      if (status != GIP_OK)
+        break;
+
+      double encode_start = now_seconds ();
+      status = gip_metal_begin (gpu->metal);
+      if (status != GIP_OK)
+        break;
+      gip_metal_argmax (gpu->metal, floats_at (gpu->logits, 0),
+                        gip_metal_at (gpu->tokens, pos * sizeof (int32_t)),
+                        model->n_vocab);
+      record_step (gpu, pos, 1, NULL);
+      status = gip_metal_commit (gpu->metal, slot);
+      encode_seconds += now_seconds () - encode_start;
+    }
+
+  /* Waiting on the newest command buffer waits on all the others.  */
+  uint64_t last = 0;
+  for (size_t s = 0; s < GENERATE_IN_FLIGHT; s++)
+    if (tickets[s] > last)
+      last = tickets[s];
+  if (last != 0)
+    {
+      enum gip_status wait_status
+          = gip_metal_wait (gpu->metal, last, &gpu_seconds);
+      if (status == GIP_OK)
+        status = wait_status;
+    }
+  if (status != GIP_OK)
+    return status;
+
+  const int32_t *tokens = gip_metal_buffer_contents (gpu->tokens);
+  memcpy (out, tokens + gpu->n_past, n * sizeof (int32_t));
+  gpu->n_past += n;
+  gpu->last_encode_seconds = encode_seconds;
+  gpu->last_gpu_seconds = gpu_seconds;
   return GIP_OK;
 }

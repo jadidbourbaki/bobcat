@@ -301,11 +301,33 @@ main (int argc, char **argv)
     }
 
   /* The prompt's last logits predict the first generated token.  Each
-     prediction then feeds the next step.  */
+     prediction then feeds the next step.  The Metal pass picks every
+     token on the GPU in one pipelined call.  */
+  int32_t *gpu_tokens = NULL;
+#if GIP_HAVE_METAL
+  if (use_metal)
+    {
+      gpu_tokens = malloc (n_generated * sizeof *gpu_tokens);
+      if (gpu_tokens == NULL)
+        {
+          fprintf (stderr, "lfm2_reference: out of memory\n");
+          return EXIT_FAILURE;
+        }
+      status = gip_lfm2_metal_generate (&runner.gpu, (uint32_t)n_generated,
+                                        gpu_tokens);
+      if (status != GIP_OK)
+        {
+          fprintf (stderr, "lfm2_reference: generation failed: %s\n",
+                   gip_status_string (status));
+          return EXIT_FAILURE;
+        }
+    }
+#endif
   size_t matched = 0;
   for (size_t g = 0; g < n_generated; g++)
     {
-      int32_t predicted = argmax (logits, n_vocab);
+      int32_t predicted
+          = gpu_tokens != NULL ? gpu_tokens[g] : argmax (logits, n_vocab);
       if (predicted != generated[g])
         {
           printf ("FAIL: generated token %zu is %d, transformers chose %d\n",
@@ -313,7 +335,7 @@ main (int argc, char **argv)
           return EXIT_FAILURE;
         }
       matched++;
-      if (g + 1 < n_generated)
+      if (gpu_tokens == NULL && g + 1 < n_generated)
         {
           status = run_step (&runner, predicted, logits, NULL);
           if (status != GIP_OK)
@@ -339,6 +361,7 @@ main (int argc, char **argv)
   free (logits);
   free (tokens);
   free (generated);
+  free (gpu_tokens);
 #if GIP_HAVE_METAL
   if (use_metal)
     {

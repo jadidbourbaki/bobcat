@@ -30,6 +30,9 @@ enum
   ELEMENTWISE_THREADS = 256,
   /* Must match ATTENTION_CHUNK in kernels.metal.  */
   ATTENTION_CHUNK = 64,
+  /* One threadgroup of the largest size scans a vocabulary in a few
+     hundred loads per thread.  */
+  ARGMAX_THREADS = 1024,
   /* Distinct kernel and shape pairs a profile keeps.  A model has far
      fewer.  */
   MAX_PROFILE_ENTRIES = 64
@@ -66,8 +69,15 @@ struct profile_table
 /* Objective-C treats a property named copy... as returning an owned
    object, so the copy pipeline takes a different name.  */
 @property (nonatomic, strong) id<MTLComputePipelineState> float_copy;
+@property (nonatomic, strong) id<MTLComputePipelineState> embed_q8_0;
+@property (nonatomic, strong) id<MTLComputePipelineState> argmax;
 @property (nonatomic, strong) id<MTLCommandBuffer> command_buffer;
 @property (nonatomic, strong) id<MTLComputeCommandEncoder> encoder;
+/* Submitted command buffers not yet waited on, oldest first.  COMMITTED
+   and COMPLETED count the command buffers submitted and waited on.  */
+@property (nonatomic, strong) NSMutableArray<id<MTLCommandBuffer>> *in_flight;
+@property (nonatomic) uint64_t committed;
+@property (nonatomic) uint64_t completed;
 @property (nonatomic) BOOL profiling;
 @property (nonatomic, strong) id<MTLCommandBuffer> op_command_buffer;
 @property (nonatomic, strong) id<MTLComputeCommandEncoder> op_encoder;
@@ -182,6 +192,9 @@ gip_metal_open (struct gip_metal **out, char *err, size_t err_size)
     metal.short_conv = plain_pipeline (device, library, @"short_conv", &error);
     metal.float_copy
         = plain_pipeline (device, library, @"copy_floats", &error);
+    metal.embed_q8_0 = plain_pipeline (device, library, @"embed_q8_0", &error);
+    metal.argmax = plain_pipeline (device, library, @"argmax", &error);
+    metal.in_flight = [NSMutableArray new];
     bool have_all = true;
     for (int norm = 0; norm < 2; norm++)
       for (int acc = 0; acc < 2; acc++)
@@ -192,7 +205,8 @@ gip_metal_open (struct gip_metal **out, char *err, size_t err_size)
     if (metal.queue == nil || !have_all || metal.matvec_q8_0_swiglu == nil
         || metal.rms_norm == nil || metal.convert_half == nil
         || metal.attention_combine == nil || metal.short_conv == nil
-        || metal.float_copy == nil)
+        || metal.float_copy == nil || metal.embed_q8_0 == nil
+        || metal.argmax == nil)
       {
         gip_format_error (err, err_size, "cannot create Metal pipelines: %s",
                           error != nil ? error.localizedDescription.UTF8String
@@ -624,6 +638,19 @@ gip_metal_copy (struct gip_metal *metal, struct gip_metal_view src,
 enum gip_status
 gip_metal_end (struct gip_metal *metal, double *gpu_seconds)
 {
+  uint64_t ticket;
+  enum gip_status status = gip_metal_commit (metal, &ticket);
+
+  if (gpu_seconds != NULL)
+    *gpu_seconds = 0.0;
+  if (status != GIP_OK)
+    return status;
+  return gip_metal_wait (metal, ticket, gpu_seconds);
+}
+
+enum gip_status
+gip_metal_commit (struct gip_metal *metal, uint64_t *ticket)
+{
   GipMetal *m = backend (metal);
   id<MTLCommandBuffer> command_buffer = m.command_buffer;
 
@@ -631,13 +658,66 @@ gip_metal_end (struct gip_metal *metal, double *gpu_seconds)
     return GIP_ERR_ARGUMENT;
   [m.encoder endEncoding];
   [command_buffer commit];
-  [command_buffer waitUntilCompleted];
+  [m.in_flight addObject:command_buffer];
   m.encoder = nil;
   m.command_buffer = nil;
-
-  if (command_buffer.status != MTLCommandBufferStatusCompleted)
-    return GIP_ERR_IO;
-  if (gpu_seconds != NULL)
-    *gpu_seconds = command_buffer.GPUEndTime - command_buffer.GPUStartTime;
+  m.committed++;
+  *ticket = m.committed;
   return GIP_OK;
+}
+
+enum gip_status
+gip_metal_wait (struct gip_metal *metal, uint64_t ticket, double *gpu_seconds)
+{
+  GipMetal *m = backend (metal);
+  enum gip_status status = GIP_OK;
+
+  /* In-flight command buffers finish in submission order, so the oldest
+     one always comes next.  */
+  while (m.completed < ticket && m.in_flight.count > 0)
+    {
+      id<MTLCommandBuffer> command_buffer = m.in_flight.firstObject;
+      [command_buffer waitUntilCompleted];
+      [m.in_flight removeObjectAtIndex:0];
+      m.completed++;
+      if (command_buffer.status != MTLCommandBufferStatusCompleted)
+        status = GIP_ERR_IO;
+      if (gpu_seconds != NULL)
+        *gpu_seconds
+            += command_buffer.GPUEndTime - command_buffer.GPUStartTime;
+    }
+  return status;
+}
+
+void
+gip_metal_embed_q8_0 (struct gip_metal *metal, struct gip_metal_view weights,
+                      struct gip_metal_view token, struct gip_metal_view out,
+                      uint32_t n_embd)
+{
+  GipMetal *m = backend (metal);
+  id<MTLComputeCommandEncoder> encoder = op_encoder (m);
+
+  [encoder setComputePipelineState:m.embed_q8_0];
+  bind (encoder, weights, 0);
+  bind (encoder, token, 1);
+  bind (encoder, out, 2);
+  bind_bytes (encoder, &n_embd, sizeof n_embd, 3);
+  dispatch_elements (encoder, n_embd);
+  op_done (m, "embed_q8_0", 0, 0, 0);
+}
+
+void
+gip_metal_argmax (struct gip_metal *metal, struct gip_metal_view x,
+                  struct gip_metal_view out, uint32_t n)
+{
+  GipMetal *m = backend (metal);
+  id<MTLComputeCommandEncoder> encoder = op_encoder (m);
+
+  [encoder setComputePipelineState:m.argmax];
+  bind (encoder, x, 0);
+  bind (encoder, out, 1);
+  bind_bytes (encoder, &n, sizeof n, 2);
+  [encoder dispatchThreadgroups:MTLSizeMake (1, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake (ARGMAX_THREADS, 1, 1)];
+  op_done (m, "argmax", 0, 0, 0);
 }

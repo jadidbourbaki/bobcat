@@ -141,6 +141,30 @@ void gip_metal_short_conv (struct gip_metal *metal, struct gip_metal_view bcx,
 void gip_metal_copy (struct gip_metal *metal, struct gip_metal_view src,
                      struct gip_metal_view dst, uint32_t n);
 
+/* Record a dequantization of the Q8_0 row TOKEN[0] of WEIGHTS, whose
+   rows hold N_EMBD elements, into the N_EMBD floats at OUT.  TOKEN views
+   one int32_t.  */
+void gip_metal_embed_q8_0 (struct gip_metal *metal,
+                           struct gip_metal_view weights,
+                           struct gip_metal_view token,
+                           struct gip_metal_view out, uint32_t n_embd);
+
+/* Record a store at OUT, one int32_t, of the index of the largest of the
+   N floats at X.  Ties go to the lowest index.  */
+void gip_metal_argmax (struct gip_metal *metal, struct gip_metal_view x,
+                       struct gip_metal_view out, uint32_t n);
+
+/* Submit the recorded launches of METAL to the GPU without waiting for
+   them, and store in TICKET a number to wait on with gip_metal_wait.
+   Command buffers run in the order they are submitted.  */
+enum gip_status gip_metal_commit (struct gip_metal *metal, uint64_t *ticket);
+
+/* Wait until the command buffer with TICKET, and every one submitted
+   before it, has finished.  Add their GPU time in seconds to
+   GPU_SECONDS unless it is null.  */
+enum gip_status gip_metal_wait (struct gip_metal *metal, uint64_t ticket,
+                                double *gpu_seconds);
+
 /* Run the recorded launches of METAL and wait for them.  Store the GPU
    time in seconds in GPU_SECONDS unless it is null.  */
 enum gip_status gip_metal_end (struct gip_metal *metal, double *gpu_seconds);

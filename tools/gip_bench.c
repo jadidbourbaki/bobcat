@@ -247,9 +247,11 @@ main (int argc, char **argv)
     }
 
   float *logits = malloc ((size_t)model.n_vocab * sizeof (float));
+  int32_t *generated = malloc (n_generate * sizeof *generated);
   double *prefill_rates = calloc (reps, sizeof *prefill_rates);
   double *decode_rates = calloc (reps, sizeof *decode_rates);
-  if (logits == NULL || prefill_rates == NULL || decode_rates == NULL)
+  if (logits == NULL || generated == NULL || prefill_rates == NULL
+      || decode_rates == NULL)
     {
       fprintf (stderr, "gip_bench: out of memory\n");
       return EXIT_FAILURE;
@@ -285,22 +287,16 @@ main (int argc, char **argv)
           }
       double prefill_seconds = now_seconds () - start;
 
-      double encode_seconds = 0.0;
-      double gpu_seconds = 0.0;
+      /* Decode runs pipelined, the way an application generates text.  */
       start = now_seconds ();
-      for (unsigned t = 0; t < n_generate; t++)
+      if (gip_lfm2_metal_generate (&gpu, n_generate, generated) != GIP_OK)
         {
-          if (gip_lfm2_metal_step (&gpu, argmax (logits, model.n_vocab),
-                                   logits, NULL)
-              != GIP_OK)
-            {
-              fprintf (stderr, "gip_bench: decode step failed\n");
-              return EXIT_FAILURE;
-            }
-          encode_seconds += gpu.last_encode_seconds;
-          gpu_seconds += gpu.last_gpu_seconds;
+          fprintf (stderr, "gip_bench: decode failed\n");
+          return EXIT_FAILURE;
         }
       double decode_seconds = now_seconds () - start;
+      double encode_seconds = gpu.last_encode_seconds;
+      double gpu_seconds = gpu.last_gpu_seconds;
       gip_lfm2_metal_free (&gpu);
 
       if (rep > 0)
@@ -318,20 +314,20 @@ main (int argc, char **argv)
   print_rates ("prefill", prefill_rates, reps);
   print_rates ("decode", decode_rates, reps);
 
-  /* The rest of each decode step is the wait for the GPU to start, the
-     argmax, and the copy of the logits.  */
+  /* Encoding overlaps the GPU in pipelined decode.  The GPU sits idle
+     for whatever part of each token its own work does not cover.  */
   double per_token = 1e3 / ((double)n_generate * reps);
-  printf ("decode per token: %.3f ms total, %.3f ms GPU, %.3f ms encoding, "
-          "%.3f ms other\n",
+  printf ("decode per token: %.3f ms total, %.3f ms GPU busy, %.3f ms GPU "
+          "idle, %.3f ms CPU encoding\n",
           total_decode_seconds * per_token, total_gpu_seconds * per_token,
-          total_encode_seconds * per_token,
-          (total_decode_seconds - total_gpu_seconds - total_encode_seconds)
-              * per_token);
+          (total_decode_seconds - total_gpu_seconds) * per_token,
+          total_encode_seconds * per_token);
 
   if (profile)
     profile_decode (&model, metal, n_prompt, n_generate, kv_half, logits);
 
   free (logits);
+  free (generated);
   free (prefill_rates);
   free (decode_rates);
   gip_metal_close (metal);
