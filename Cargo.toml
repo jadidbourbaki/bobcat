@@ -16,6 +16,7 @@ gip = { path = "crates/gip" }
 gip-gguf = { path = "crates/gip-gguf" }
 gip-metal = { path = "crates/gip-metal" }
 half = { version = "2.7.1", default-features = false }
+hf-hub = { version = "1.0.0", features = ["blocking"] }
 libc = { version = "0.2.189", default-features = false }
 memmap2 = { version = "0.9.11" }
 minijinja = { version = "2.24.0", features = ["json", "loop_controls"] }

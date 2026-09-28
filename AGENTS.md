@@ -98,7 +98,7 @@ crates/
     src/lfm2.rs            LFM2 on the CPU with the scalar ops
     src/lfm2_metal.rs      LFM2 on the Metal GPU
     tests/                 reference and kernel tests
-  gip-cli/                 the gip command, with respond and chat
+  gip-cli/                 the gip command: respond, chat, pull, list, and rm
   gip-bench/               gip-bench, gpu-bw, and cpu-bw programs
 tools/                     Python reference dumps and benchmark scripts
 bench/                     baseline engine checkouts, gitignored
@@ -646,6 +646,16 @@ Match the scope of a change to what the user asked. A bug fix gets no
 free refactor of the surrounding code. A side-improvement of one line
 with no behavior change needs no ceremony. Anything larger goes to the
 user as a separate option.
+
+## Working alongside other agents
+
+More than one agent may work in this repository at the same time,
+currently Claude Code and Codex. The gitignored file
+`.agents/board.md` assigns each agent an area of the codebase and holds
+their status notes and questions. Read it before starting a task, and
+update it when a task starts, finishes, or needs the other agent. Stage
+only your own files, since the working tree may hold another agent's
+uncommitted changes.
 
 ## When in doubt
 

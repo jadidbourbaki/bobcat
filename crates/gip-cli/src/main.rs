@@ -1,7 +1,8 @@
 //! gip runs language models on the Metal GPU.
 //!
 //! `gip respond` answers one prompt and writes only the answer to standard output, so it composes
-//! with pipes. `gip chat` holds an interactive conversation in the terminal.
+//! with pipes. `gip chat` holds an interactive conversation in the terminal. `gip pull`, `gip
+//! list`, and `gip rm` manage models in the Hugging Face cache.
 
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -11,6 +12,7 @@ use clap::{Args, Parser, Subcommand};
 
 #[cfg(target_os = "macos")]
 mod conversation;
+mod models;
 #[cfg(target_os = "macos")]
 mod tokenizer;
 
@@ -44,14 +46,27 @@ enum Command {
         #[command(flatten)]
         model: ModelOptions,
     },
+    /// Download a model from Hugging Face and print the path of its file.
+    Pull {
+        /// The model, as in `LiquidAI/LFM2.5-2.6B-GGUF:Q8_0`. The tag defaults to Q8_0.
+        name: String,
+    },
+    /// List the downloaded models and their sizes.
+    List,
+    /// Remove a downloaded model.
+    Rm {
+        /// The model, as `gip list` shows it.
+        name: String,
+    },
 }
 
-/// The options every command shares.
+/// The options that running a model takes.
 #[derive(Debug, Args)]
 struct ModelOptions {
-    /// The GGUF model file.
+    /// A GGUF file or a model name such as `LiquidAI/LFM2.5-2.6B-GGUF:Q8_0`, which downloads on
+    /// first use.
     #[arg(short, long)]
-    model: PathBuf,
+    model: String,
     /// A Hugging Face `tokenizer.json` to use in place of the tokenizer inside the model file.
     #[arg(short, long)]
     tokenizer: Option<PathBuf>,
@@ -80,12 +95,6 @@ fn main() -> ExitCode {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-fn run(_: Command) -> Result<(), Error> {
-    Err("gip runs models on the Metal GPU, which needs macOS".into())
-}
-
-#[cfg(target_os = "macos")]
 fn run(command: Command) -> Result<(), Error> {
     match command {
         Command::Respond {
@@ -94,7 +103,30 @@ fn run(command: Command) -> Result<(), Error> {
             prompt,
         } => respond(&model, think, &prompt.join(" ")),
         Command::Chat { model } => chat(&model),
+        Command::Pull { name } => {
+            let path = models::pull(&models::Name::parse(&name)?)?;
+            writeln!(io::stdout(), "{}", path.display())?;
+            Ok(())
+        }
+        Command::List => {
+            let mut stdout = io::stdout().lock();
+            for (name, size) in models::list()? {
+                writeln!(stdout, "{name}\t{}", models::human_size(size))?;
+            }
+            Ok(())
+        }
+        Command::Rm { name } => models::remove(&models::Name::parse(&name)?),
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn respond(_: &ModelOptions, _: bool, _: &str) -> Result<(), Error> {
+    Err("gip runs models on the Metal GPU, which needs macOS".into())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn chat(_: &ModelOptions) -> Result<(), Error> {
+    Err("gip runs models on the Metal GPU, which needs macOS".into())
 }
 
 /// Return the prompt, followed by any text on standard input.
@@ -118,7 +150,7 @@ fn full_prompt(prompt: &str) -> Result<String, Error> {
 /// Load the model and tokenizer that `options` name.
 #[cfg(target_os = "macos")]
 fn load(options: &ModelOptions) -> Result<(gip::Model, tokenizers::Tokenizer), Error> {
-    let model = gip::Model::load(&options.model)?;
+    let model = gip::Model::load(models::resolve(&options.model)?)?;
     let tokenizer = match &options.tokenizer {
         Some(path) => tokenizers::Tokenizer::from_file(path)?,
         None => tokenizer::from_gguf(model.gguf())?,

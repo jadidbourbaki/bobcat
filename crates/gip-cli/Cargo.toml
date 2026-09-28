@@ -18,6 +18,7 @@ doc = false
 clap = { workspace = true }
 gip = { workspace = true }
 gip-gguf = { workspace = true }
+hf-hub = { workspace = true }
 minijinja = { workspace = true }
 minijinja-contrib = { workspace = true }
 rustyline = { workspace = true }
