@@ -1,9 +1,10 @@
 //! Models in the Hugging Face cache: names, downloads, listing, and removal.
 //!
 //! A model name is a Hugging Face repository with an optional quantization tag, as in
-//! `LiquidAI/LFM2.5-2.6B-GGUF:Q8_0`. The tag picks the GGUF file whose name ends in `-TAG.gguf`.
-//! Files live in the shared cache at `~/.cache/huggingface/hub`, which other Hugging Face tools
-//! read too, so no model downloads twice.
+//! `LiquidAI/LFM2.5-2.6B-GGUF:Q8_0`, or an alias such as `lfm2.5:2.6b` for a model gip supports.
+//! The tag picks the GGUF file whose name ends in `-TAG.gguf`. Files live in the shared cache at
+//! `~/.cache/huggingface/hub`, which other Hugging Face tools read too, so no model downloads
+//! twice.
 
 use std::fmt;
 use std::fs;
@@ -18,8 +19,20 @@ use hf_hub::repository::RepoTreeEntry;
 
 use crate::Error;
 
-/// The tag a name without one picks: the only quantization gip's Metal path runs today.
+/// The tag a Hugging Face name without one picks.
 const DEFAULT_TAG: &str = "Q8_0";
+
+/// The short names of the models gip supports, with the Hugging Face repository each one names.
+/// Supporting a new model adds a line here.
+const ALIASES: [(&str, &str, &str); 3] = [
+    ("lfm2.5:350m", "LiquidAI", "LFM2.5-350M-GGUF"),
+    ("lfm2.5:1.2b", "LiquidAI", "LFM2.5-1.2B-Instruct-GGUF"),
+    ("lfm2.5:2.6b", "LiquidAI", "LFM2.5-2.6B-GGUF"),
+];
+
+/// The tag an alias without one picks. Q4_K_M files are half the size of Q8_0 ones, and gip
+/// decodes them faster.
+const ALIAS_TAG: &str = "Q4_K_M";
 
 /// A model name: a Hugging Face repository and an optional quantization tag.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,8 +43,12 @@ pub(crate) struct Name {
 }
 
 impl Name {
-    /// Parse `text` as `owner/repo` or `owner/repo:tag`.
+    /// Parse `text` as `owner/repo`, `owner/repo:tag`, or an alias. An alias takes a tag as a
+    /// suffix, as in `lfm2.5:2.6b-q8_0`.
     pub(crate) fn parse(text: &str) -> Result<Self, Error> {
+        if !text.contains('/') {
+            return Self::from_alias(text);
+        }
         let (id, tag) = match text.split_once(':') {
             Some((id, tag)) => (id, Some(tag.to_owned())),
             None => (text, None),
@@ -48,8 +65,50 @@ impl Name {
         })
     }
 
+    /// Return the name that the alias `text` stands for.
+    fn from_alias(text: &str) -> Result<Self, Error> {
+        let lower = text.to_ascii_lowercase();
+        for (alias, owner, repo) in ALIASES {
+            let tag = if lower == alias {
+                ALIAS_TAG.to_owned()
+            } else if let Some(tag) = lower
+                .strip_prefix(alias)
+                .and_then(|rest| rest.strip_prefix('-'))
+                && !tag.is_empty()
+            {
+                tag.to_ascii_uppercase()
+            } else {
+                continue;
+            };
+            return Ok(Self {
+                owner: owner.to_owned(),
+                repo: repo.to_owned(),
+                tag: Some(tag),
+            });
+        }
+        let known: Vec<&str> = ALIASES.iter().map(|(alias, _, _)| *alias).collect();
+        Err(format!(
+            "{text} is no model gip knows, so name one of {} or a Hugging Face repository like \
+             LiquidAI/LFM2.5-2.6B-GGUF:Q4_K_M",
+            known.join(", ")
+        )
+        .into())
+    }
+
     fn repo_id(&self) -> String {
         format!("{}/{}", self.owner, self.repo)
+    }
+}
+
+/// Return the alias of the model `repo_id` with `tag`, if an alias names its repository.
+fn alias_of(repo_id: &str, tag: &str) -> Option<String> {
+    let (alias, _, _) = ALIASES
+        .iter()
+        .find(|(_, owner, repo)| repo_id.eq_ignore_ascii_case(&format!("{owner}/{repo}")))?;
+    if tag.eq_ignore_ascii_case(ALIAS_TAG) {
+        Some((*alias).to_owned())
+    } else {
+        Some(format!("{alias}-{}", tag.to_ascii_lowercase()))
     }
 }
 
@@ -103,8 +162,10 @@ pub(crate) fn resolve(model: &str) -> Result<PathBuf, Error> {
     if path.exists() {
         return Ok(path.to_owned());
     }
-    let name = Name::parse(model)
-        .map_err(|_| format!("{model} is neither a file nor a model name like owner/repo:Q8_0"))?;
+    if model.to_ascii_lowercase().ends_with(".gguf") {
+        return Err(format!("no file {model}").into());
+    }
+    let name = Name::parse(model)?;
     match cached(&name)? {
         Some(file) => Ok(file.file_path),
         None => pull(&name),
@@ -190,8 +251,9 @@ fn cached(name: &Name) -> Result<Option<CachedFileInfo>, Error> {
     Ok(files.iter().find(|file| file.file_name == chosen).cloned())
 }
 
-/// Return every cached GGUF model as its name and size in bytes.
-pub(crate) fn list() -> Result<Vec<(String, u64)>, Error> {
+/// Return every cached GGUF model as its full name, its size in bytes, and its alias when it has
+/// one.
+pub(crate) fn list() -> Result<Vec<(String, u64, Option<String>)>, Error> {
     let cache = HFClientSync::new()?.scan_cache().send()?;
     let mut models = Vec::new();
     for repo in cache.repos.iter().filter(|repo| repo.repo_type == "model") {
@@ -202,7 +264,11 @@ pub(crate) fn list() -> Result<Vec<(String, u64)>, Error> {
                 == Some(file.file_name.as_str())
             {
                 let tag = tag_of(&file.file_name, &names);
-                models.push((format!("{}:{tag}", repo.repo_id), file.size_on_disk));
+                models.push((
+                    format!("{}:{tag}", repo.repo_id),
+                    file.size_on_disk,
+                    alias_of(&repo.repo_id, &tag),
+                ));
             }
         }
     }
@@ -336,5 +402,21 @@ mod tests {
         assert_eq!(name.to_string(), "LiquidAI/LFM2.5-2.6B-GGUF:Q8_0");
         assert!(Name::parse("models/x.gguf/extra").is_err());
         assert!(Name::parse("LiquidAI/LFM2.5-2.6B-GGUF:").is_err());
+    }
+
+    #[test]
+    fn aliases_expand_to_hugging_face_names() {
+        let expand = |text| Name::parse(text).unwrap().to_string();
+        assert_eq!(expand("lfm2.5:2.6b"), "LiquidAI/LFM2.5-2.6B-GGUF:Q4_K_M");
+        assert_eq!(
+            expand("LFM2.5:1.2B-q8_0"),
+            "LiquidAI/LFM2.5-1.2B-Instruct-GGUF:Q8_0"
+        );
+        assert!(Name::parse("lfm2.5:9b").is_err());
+        assert!(Name::parse("lfm2.5:2.6b-").is_err());
+        assert_eq!(
+            alias_of("LiquidAI/LFM2.5-2.6B-GGUF", "Q8_0").as_deref(),
+            Some("lfm2.5:2.6b-q8_0")
+        );
     }
 }

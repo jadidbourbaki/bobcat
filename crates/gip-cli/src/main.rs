@@ -22,7 +22,7 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 
 /// Run language models on the Metal GPU.
 #[derive(Debug, Parser)]
-#[command(version)]
+#[command(name = "gip", version)]
 struct Options {
     #[command(subcommand)]
     command: Command,
@@ -50,7 +50,9 @@ enum Command {
     },
     /// Download a model from Hugging Face and print the path of its file.
     Pull {
-        /// The model, as in `LiquidAI/LFM2.5-2.6B-GGUF:Q8_0`. The tag defaults to Q8_0.
+        /// The model, as an alias such as `lfm2.5:2.6b` or a Hugging Face name such as
+        /// `LiquidAI/LFM2.5-2.6B-GGUF:Q8_0`. Aliases default to Q4_K_M and Hugging Face names to
+        /// Q8_0.
         name: String,
     },
     /// List the downloaded models and their sizes.
@@ -65,8 +67,8 @@ enum Command {
 /// The options that running a model takes.
 #[derive(Debug, Args)]
 struct ModelOptions {
-    /// A GGUF file or a model name such as `LiquidAI/LFM2.5-2.6B-GGUF:Q8_0`, which downloads on
-    /// first use.
+    /// A model alias such as `lfm2.5:2.6b`, a Hugging Face name such as
+    /// `LiquidAI/LFM2.5-2.6B-GGUF:Q8_0`, or a GGUF file. A named model downloads on first use.
     #[arg(short, long)]
     model: String,
     /// A Hugging Face `tokenizer.json` to use in place of the tokenizer inside the model file.
@@ -139,8 +141,13 @@ fn run(command: Command) -> Result<(), Error> {
         }
         Command::List => {
             let mut stdout = io::stdout().lock();
-            for (name, size) in models::list()? {
-                writeln!(stdout, "{name}\t{}", models::human_size(size))?;
+            // A model with an alias lists the alias first and its full name last.
+            for (name, size, alias) in models::list()? {
+                let size = models::human_size(size);
+                match alias {
+                    Some(alias) => writeln!(stdout, "{alias}\t{size}\t{name}")?,
+                    None => writeln!(stdout, "{name}\t{size}")?,
+                }
             }
             Ok(())
         }
