@@ -13,6 +13,10 @@ name = "gip-bench"
 path = "src/bin/gip_bench.rs"
 
 [[bin]]
+name = "gip-matmul-bench"
+path = "src/bin/gip_matmul_bench.rs"
+
+[[bin]]
 name = "gpu-bw"
 path = "src/bin/gpu_bw.rs"
 

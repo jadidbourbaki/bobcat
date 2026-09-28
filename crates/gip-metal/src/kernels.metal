@@ -708,9 +708,14 @@ matmul_q8_0 (device const uchar *weights [[buffer (0)]],
      columns 8K through 8K + 7 of rows 8R through 8R + 7.  INPUT_TILE
      holds 8 by 8 blocks of tokens by columns, with block K * 4 + T
      covering columns 8K through 8K + 7 of tokens 8T through 8T + 7.  */
-  threadgroup half weight_tile[MATMUL_ROWS * QK8_0];
-  threadgroup float input_tile[MATMUL_TOKENS * QK8_0];
-  threadgroup float out_tile[MATMUL_ROWS * MATMUL_TOKENS];
+  /* The output tile reuses the input and weight scratch after the final
+     multiply.  The barrier before the stores ends all earlier reads.  */
+  threadgroup uchar scratch[MATMUL_ROWS * QK8_0 * sizeof (half)
+                            + MATMUL_TOKENS * QK8_0 * sizeof (float)];
+  threadgroup half *weight_tile = (threadgroup half *)scratch;
+  threadgroup float *input_tile
+      = (threadgroup float *)(scratch + MATMUL_ROWS * QK8_0 * sizeof (half));
+  threadgroup float *out_tile = (threadgroup float *)scratch;
 
   uint tid = thread_position.x;
   /* Token tiles vary fastest across the grid, so neighboring threadgroups
