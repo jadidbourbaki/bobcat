@@ -194,7 +194,8 @@ matvec_q8_0 (device const uchar *weights [[buffer (0)]],
   float sums[MAX_MATVEC_ROWS + 1] = { 0.0f };
   uint n_sums = rows_per_threadgroup + 1;
 
-  for (uint b = simdgroup_index * BLOCKS_PER_SIMDGROUP + lane / LANES_PER_BLOCK;
+  for (uint b
+       = simdgroup_index * BLOCKS_PER_SIMDGROUP + lane / LANES_PER_BLOCK;
        b < n_blocks; b += stride)
     {
       float4 inputs[2];
@@ -262,7 +263,8 @@ matvec_q8_0_swiglu (device const uchar *gate [[buffer (0)]],
   float sums[2 * MAX_MATVEC_ROWS + 1] = { 0.0f };
   uint n_sums = 2 * rows + 1;
 
-  for (uint b = simdgroup_index * BLOCKS_PER_SIMDGROUP + lane / LANES_PER_BLOCK;
+  for (uint b
+       = simdgroup_index * BLOCKS_PER_SIMDGROUP + lane / LANES_PER_BLOCK;
        b < n_blocks; b += stride)
     {
       float4 inputs[2];
@@ -384,10 +386,10 @@ norm_rope (device const float *src [[buffer (0)]],
 
 /* The element type appears in the signature, so each instantiation
    names its own type.  */
-template [[host_name ("norm_rope_f32")]] kernel decltype (norm_rope<float>)
-    norm_rope<float>;
-template [[host_name ("norm_rope_f16")]] kernel decltype (norm_rope<half>)
-    norm_rope<half>;
+template [[host_name (
+    "norm_rope_f32")]] kernel decltype (norm_rope<float>) norm_rope<float>;
+template [[host_name (
+    "norm_rope_f16")]] kernel decltype (norm_rope<half>) norm_rope<half>;
 
 /* Convert the N floats at SRC to half precision at DST.  */
 kernel void
@@ -492,8 +494,8 @@ attention_chunk (device const float *q [[buffer (0)]],
                                     simdgroups, lane);
       float e = valid ? precise::exp (score[g] - best) : 0.0f;
       weights[g * ATTENTION_CHUNK + tid] = e;
-      float total = threadgroup_sum (e, partials, simdgroup_index,
-                                     simdgroups, lane);
+      float total
+          = threadgroup_sum (e, partials, simdgroup_index, simdgroups, lane);
       if (tid == 0)
         {
           uint slot = (first_head + g) * max_chunks + chunk;
@@ -518,10 +520,12 @@ attention_chunk (device const float *q [[buffer (0)]],
     }
 }
 
-template [[host_name ("attention_chunk_f32")]] kernel decltype (
-    attention_chunk<float>) attention_chunk<float>;
-template [[host_name ("attention_chunk_f16")]] kernel decltype (
-    attention_chunk<half>) attention_chunk<half>;
+template [[host_name (
+    "attention_chunk_f32")]] kernel decltype (attention_chunk<float>)
+    attention_chunk<float>;
+template [[host_name (
+    "attention_chunk_f16")]] kernel decltype (attention_chunk<half>)
+    attention_chunk<half>;
 
 /* Combine the chunk results of attention_chunk in SCRATCH into the
    result of each query head of each query at OUT, as the second of two
@@ -731,12 +735,12 @@ matmul_q8_0 (device const uchar *weights [[buffer (0)]],
 
   /* Where this thread's weights and inputs land in the blocked tiles.
      Weight K of a block goes to block K / 8, row K % 8.  */
-  ushort weight_base = 64 * (weight_row / 8) + weight_row % 8
-                       + 64 * 8 * (2 * weight_half);
+  ushort weight_base
+      = 64 * (weight_row / 8) + weight_row % 8 + 64 * 8 * (2 * weight_half);
   threadgroup float4 *input_slot
       = (threadgroup float4 *)(input_tile
-                              + 64 * (4 * input_part + input_token / 8)
-                              + 8 * (input_token % 8));
+                               + 64 * (4 * input_part + input_token / 8)
+                               + 8 * (input_token % 8));
   device const q8_0_block *row_blocks
       = (device const q8_0_block *)(weights + row * row_bytes);
   device const float4 *token_inputs
@@ -788,13 +792,12 @@ matmul_q8_0 (device const uchar *weights [[buffer (0)]],
           simdgroup_float8x8 bm[2];
           simdgroup_barrier (mem_flags::mem_none);
           for (ushort i = 0; i < 4; i++)
-            simdgroup_load (a[i],
-                            weight_tile + 64 * (8 * k + row_block_base + i), 8);
+            simdgroup_load (
+                a[i], weight_tile + 64 * (8 * k + row_block_base + i), 8);
           simdgroup_barrier (mem_flags::mem_none);
           for (ushort j = 0; j < 2; j++)
-            simdgroup_load (bm[j],
-                            input_tile + 64 * (4 * k + token_block_base + j),
-                            8);
+            simdgroup_load (
+                bm[j], input_tile + 64 * (4 * k + token_block_base + j), 8);
           simdgroup_barrier (mem_flags::mem_none);
           for (ushort j = 0; j < 2; j++)
             for (ushort i = 0; i < 4; i++)
@@ -883,7 +886,8 @@ embed_q8_0 (device const uchar *weights [[buffer (0)]],
   device const q8_0_block *block
       = (device const q8_0_block *)(weights + ulong (tokens[t]) * row_bytes)
         + i / QK8_0;
-  out[t * n_embd + i] = float (block->scale) * float (block->quants[i % QK8_0]);
+  out[t * n_embd + i]
+      = float (block->scale) * float (block->quants[i % QK8_0]);
 }
 
 /* Store at OUT the index of the largest of the N floats at X.  Ties go

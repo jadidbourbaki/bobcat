@@ -20,6 +20,7 @@ test:
 check:
     cargo fmt --all --check
     cargo sort --workspace --check
+    clang-format --dry-run -Werror {{kernels}}
     cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
     cargo test --workspace --locked
