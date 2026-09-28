@@ -41,6 +41,20 @@ fn read_slice(slice: &[f32]) -> f32 {
     lanes.iter().sum()
 }
 
+/// Steer the calling thread toward the performance cores. macOS offers no thread pinning, so the
+/// thread takes the highest quality of service class instead. Other systems leave the thread as it
+/// is.
+fn prefer_performance_cores() {
+    #[cfg(target_os = "macos")]
+    #[expect(unsafe_code, reason = "macOS sets a thread's QoS class through libc")]
+    // SAFETY: `pthread_set_qos_class_self_np` acts only on the calling thread and has no
+    // preconditions. A failure leaves the thread at its default class, which only slows the
+    // measurement.
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+}
+
 /// Return the best read bandwidth in GB/s over [`REPS`] passes in which `n_threads` threads split
 /// `data`.
 fn measure(data: &[f32], n_threads: usize) -> f64 {
@@ -50,7 +64,10 @@ fn measure(data: &[f32], n_threads: usize) -> f64 {
         let start = Instant::now();
         thread::scope(|scope| {
             for slice in data.chunks_exact(per_thread).take(n_threads) {
-                scope.spawn(move || black_box(read_slice(slice)));
+                scope.spawn(move || {
+                    prefer_performance_cores();
+                    black_box(read_slice(slice))
+                });
             }
         });
         best_seconds = best_seconds.min(start.elapsed().as_secs_f64());

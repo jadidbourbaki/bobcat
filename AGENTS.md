@@ -313,13 +313,14 @@ field's name with no `get_` prefix. Conversions follow the `as_`,
 
 `unsafe_code` is denied across the workspace. `gip-gguf` goes further
 with `#![forbid(unsafe_code)]`, so the parser that reads untrusted files
-holds no unsafe code at all. Two modules opt out with
-`#![expect(unsafe_code, reason = "...")]`:
+holds no unsafe code at all. Three places opt out with
+`#[expect(unsafe_code, reason = "...")]`:
 
 | Module | Why it needs unsafe |
 |---|---|
 | `gip-metal` | Metal's API is Objective-C, reached through `objc2-metal`. The crate also holds the GPU bandwidth probe that `gpu-bw` runs |
 | `gip::storage` | `memmap2` maps model files |
+| `cpu-bw` | macOS sets a thread's quality of service class through `libc` |
 
 Adding unsafe code anywhere else needs the user's approval first.
 
