@@ -92,14 +92,14 @@ justfile                   everyday commands
 crates/
   gip-gguf/                GGUF parser in safe Rust
   gip-metal/               Metal host code through objc2-metal
-    src/kernels.metal      Metal kernels, embedded at build time
+    src/*.metal            Metal kernels by operation, embedded at build time
   gip/                     model loading, scalar reference ops, and the LFM2 graph
     src/scalar.rs          reference implementation of every op
     src/lfm2.rs            LFM2 on the CPU with the scalar ops
     src/lfm2_metal.rs      LFM2 on the Metal GPU
     tests/                 reference and kernel tests
   gip-cli/                 the gip command: respond, chat, pull, list, and rm
-  gip-bench/               gip-bench, gpu-bw, and cpu-bw programs
+  gip-bench/               gip-bench, gip-matmul-bench, gpu-bw, and cpu-bw programs
 tools/                     Python reference dumps and benchmark scripts
 bench/                     baseline engine checkouts, gitignored
 models/                    downloaded GGUF files, gitignored

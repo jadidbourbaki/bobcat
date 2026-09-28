@@ -1,6 +1,6 @@
 //! gip's Metal GPU backend.
 //!
-//! [`Metal`] compiles the kernels in `kernels.metal` when it opens and records kernel launches into
+//! [`Metal`] compiles the embedded Metal sources when it opens and records kernel launches into
 //! one command buffer at a time. [`measure_bandwidth`] measures the GPU's memory read bandwidth.
 //! The backend exists only on macOS. On other systems the crate is empty.
 

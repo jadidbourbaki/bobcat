@@ -27,11 +27,15 @@ use objc2_metal::{
     MTLFunctionConstantValues, MTLLibrary, MTLMathMode, MTLResourceOptions, MTLSize,
 };
 
-/// The kernel source, embedded at build time. `kernels_q4.metal` uses the helpers that
-/// `kernels.metal` defines, so it comes second.
+/// The kernel source, embedded at build time. Shared definitions precede the operation kernels.
 const SOURCE: &str = concat!(
-    include_str!("kernels.metal"),
-    include_str!("kernels_q4.metal")
+    include_str!("common.metal"),
+    include_str!("quant.metal"),
+    include_str!("matvec.metal"),
+    include_str!("norm.metal"),
+    include_str!("attention.metal"),
+    include_str!("conv.metal"),
+    include_str!("matmul.metal")
 );
 
 const SIMD_WIDTH: usize = 32;
@@ -49,7 +53,7 @@ const MATVEC_Q8_0_WIDE_COLS: u32 = 2048;
 /// per simdgroup in place of llama.cpp's two lifted LFM2.5-2.6B Q4_K_M decode from 106 to 116
 /// tokens per second and left LFM2.5-350M at 598. Eight rows fell to 114 and 538. Four
 /// simdgroups measured within noise of two. `K_QUANT_ROWS_PER_SIMDGROUP` must match
-/// `K_ROWS_PER_SIMDGROUP` in `kernels_q4.metal`.
+/// `K_ROWS_PER_SIMDGROUP` in `quant.metal`.
 const K_QUANT_SIMDGROUPS: u32 = 2;
 const K_QUANT_ROWS_PER_SIMDGROUP: u32 = 4;
 
@@ -57,10 +61,10 @@ const K_QUANT_ROWS_PER_SIMDGROUP: u32 = 4;
 const REDUCE_THREADS: usize = 256;
 const ELEMENTWISE_THREADS: usize = 256;
 
-/// Must match `ATTENTION_CHUNK` in `kernels.metal`.
+/// Must match `ATTENTION_CHUNK` in `common.metal`.
 const ATTENTION_CHUNK: u32 = 64;
 
-/// Must match `MATMUL_ROWS`, `MATMUL_TOKENS`, and `MATMUL_SIMDGROUPS` in `kernels.metal`.
+/// Must match `MATMUL_ROWS`, `MATMUL_TOKENS`, and `MATMUL_SIMDGROUPS` in `common.metal`.
 const MATMUL_ROWS: u32 = 64;
 const MATMUL_TOKENS: u32 = 32;
 const MATMUL_SIMDGROUPS: usize = 4;
@@ -84,7 +88,7 @@ pub enum Error {
     /// The system has no Metal device.
     #[error("no Metal device")]
     NoDevice,
-    /// The Metal compiler rejected `kernels.metal`.
+    /// The Metal compiler rejected the joined kernel source.
     #[error("cannot compile Metal kernels: {0}")]
     Compile(String),
     /// A kernel is missing or its pipeline failed to build.
@@ -356,7 +360,7 @@ impl Kernel {
     }
 }
 
-/// The values of the function constants in `kernels.metal`.
+/// The values of the function constants in `common.metal`.
 #[derive(Debug, Clone, Copy)]
 struct Constants {
     rows_per_threadgroup: u32,

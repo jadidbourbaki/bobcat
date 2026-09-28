@@ -16,12 +16,12 @@ use crate::storage::Storage;
 
 /// Each lane of the attention kernel holds a whole number of elements of a head, and a
 /// threadgroup serves at most four query heads of up to 128 elements. Must match
-/// `ATTENTION_MAX_GROUP` and `ATTENTION_MAX_HEAD_DIM` in `kernels.metal`.
+/// `ATTENTION_MAX_GROUP` and `ATTENTION_MAX_HEAD_DIM` in `common.metal`.
 const SIMD_WIDTH: u32 = 32;
 const ATTENTION_MAX_GROUP: u32 = 4;
 const ATTENTION_MAX_HEAD_DIM: u32 = 128;
 
-/// `short_conv_history` in `kernels.metal` keeps up to 8 history inputs per channel in
+/// `short_conv_history` in `conv.metal` keeps up to 8 history inputs per channel in
 /// registers.
 const CONV_MAX_KERNEL: u32 = 9;
 
