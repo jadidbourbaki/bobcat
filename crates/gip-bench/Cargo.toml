@@ -1,0 +1,28 @@
+[package]
+name = "gip-bench"
+description = "Benchmark programs for gip"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "gip-bench"
+path = "src/bin/gip_bench.rs"
+
+[[bin]]
+name = "gpu-bw"
+path = "src/bin/gpu_bw.rs"
+
+[[bin]]
+name = "cpu-bw"
+path = "src/bin/cpu_bw.rs"
+
+[dependencies]
+clap = { workspace = true }
+gip = { workspace = true }
+
+[lints]
+workspace = true

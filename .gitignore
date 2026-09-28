@@ -1,6 +1,6 @@
 models/
 bench/
-build/
+target/
 .venv/
 __pycache__/
 .ruff_cache/

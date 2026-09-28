@@ -1,0 +1,89 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+repository = "https://github.com/jadidbourbaki/gip"
+
+[workspace.dependencies]
+block2 = { version = "0.6.2", default-features = false, features = ["std"] }
+clap = { version = "4.6.7", features = ["derive"] }
+gip = { path = "crates/gip" }
+gip-gguf = { path = "crates/gip-gguf" }
+gip-metal = { path = "crates/gip-metal" }
+half = { version = "2.7.1", default-features = false }
+libc = { version = "0.2.189", default-features = false }
+memmap2 = { version = "0.9.11" }
+objc2 = { version = "0.6.4" }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "NSError",
+  "NSString",
+] }
+objc2-metal = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "block2",
+  "objc2-core-foundation",
+  "MTLAllocation",
+  "MTLBuffer",
+  "MTLCommandBuffer",
+  "MTLCommandEncoder",
+  "MTLCommandQueue",
+  "MTLComputeCommandEncoder",
+  "MTLComputePipeline",
+  "MTLDataType",
+  "MTLDevice",
+  "MTLFunctionConstantValues",
+  "MTLLibrary",
+  "MTLResource",
+  "MTLTypes",
+] }
+thiserror = { version = "2.0.21" }
+
+[workspace.lints.rust]
+unreachable_pub = "warn"
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -2 }
+# Every fallible function returns the crate's error enum, whose variants document the failures.
+missing_errors_doc = "allow"
+# Kernel launches and forward passes take many shape parameters.
+too_many_arguments = "allow"
+too_many_lines = "allow"
+# Names such as q, k, and v or n_rows and n_cols are the domain's names.
+similar_names = "allow"
+many_single_char_names = "allow"
+# Kernel math converts token counts and positions to float on purpose.
+cast_precision_loss = "allow"
+# Module names such as lfm2_metal repeat inside type names such as Lfm2Metal.
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+# Restriction lints, following uv.
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+dbg_macro = "warn"
+exit = "warn"
+get_unwrap = "warn"
+multiple_unsafe_ops_per_block = "warn"
+print_stderr = "warn"
+print_stdout = "warn"
+todo = "warn"
+undocumented_unsafe_blocks = "warn"
+unimplemented = "warn"
+unwrap_used = "warn"
+
+[profile.test]
+# The scalar reference pass runs a whole model, which takes minutes unoptimized.
+opt-level = 2
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+# Host code takes a small share of each token, so overflow checks stay on.
+overflow-checks = true

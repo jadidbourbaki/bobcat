@@ -1,5 +1,0 @@
-include/**
-src/**
-tests/**
-tools/*.c
-tools/*.m
