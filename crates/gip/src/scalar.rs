@@ -6,21 +6,20 @@
 use gip_gguf::TensorType;
 use half::{bf16, f16};
 
-/// Block sizes in bytes and elements, which must match [`TensorType::block`].
-const Q4_0_BYTES: usize = 18;
-const Q8_0_BYTES: usize = 34;
-const Q4K_BYTES: usize = 144;
-const Q6K_BYTES: usize = 210;
-const BLOCK_ELEMENTS: usize = 32;
-const SUPER_BLOCK_ELEMENTS: usize = 256;
+const Q4_0_BYTES: usize = TensorType::Q4_0.block().1;
+const Q8_0_BYTES: usize = TensorType::Q8_0.block().1;
+const Q4K_BYTES: usize = TensorType::Q4K.block().1;
+const Q6K_BYTES: usize = TensorType::Q6K.block().1;
+const BLOCK_ELEMENTS: usize = TensorType::Q8_0.block().0;
+const SUPER_BLOCK_ELEMENTS: usize = TensorType::Q4K.block().0;
 
 /// Return the float value of the IEEE half-precision bits `bits`.
-pub fn f16_to_f32(bits: u16) -> f32 {
+fn f16_to_f32(bits: u16) -> f32 {
     f16::from_bits(bits).to_f32()
 }
 
 /// Return the float value of the bfloat16 bits `bits`.
-pub fn bf16_to_f32(bits: u16) -> f32 {
+fn bf16_to_f32(bits: u16) -> f32 {
     bf16::from_bits(bits).to_f32()
 }
 
@@ -40,7 +39,7 @@ fn u16s(bytes: &[u8]) -> impl Iterator<Item = u16> {
 }
 
 /// Return the little-endian floats in `bytes`.
-pub fn f32s(bytes: &[u8]) -> impl Iterator<Item = f32> {
+pub(crate) fn f32s(bytes: &[u8]) -> impl Iterator<Item = f32> {
     bytes
         .as_chunks::<4>()
         .0
@@ -176,7 +175,7 @@ fn dequantize_q6k(block: &[u8; Q6K_BYTES], out: &mut [f32; SUPER_BLOCK_ELEMENTS]
 
 /// Dequantize row `row` of the matrix in `weights`, whose rows hold `out.len()` elements of
 /// `data_type`, into `out`.
-pub fn get_row(data_type: TensorType, weights: &[u8], row: usize, out: &mut [f32]) {
+pub(crate) fn get_row(data_type: TensorType, weights: &[u8], row: usize, out: &mut [f32]) {
     let bytes = row_bytes(data_type, out.len());
     dequantize(data_type, &weights[row * bytes..(row + 1) * bytes], out);
 }
@@ -202,7 +201,7 @@ pub fn rms_norm(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
 }
 
 /// Normalize `x` in place by its root mean square and scale it by `weight`.
-pub fn rms_norm_in_place(x: &mut [f32], weight: &[f32], eps: f32) {
+pub(crate) fn rms_norm_in_place(x: &mut [f32], weight: &[f32], eps: f32) {
     let scale = rms_scale(x, eps);
     for (x, &w) in x.iter_mut().zip(weight) {
         *x = w * (*x * scale);
@@ -223,7 +222,7 @@ fn rms_scale(x: &[f32], eps: f32) -> f32 {
 
 /// Rotate the head `vec` for position `pos` with base `theta`. Element `i` pairs with element
 /// `i + vec.len() / 2`, as in GPT-NeoX.
-pub fn rope_neox(vec: &mut [f32], pos: u32, theta: f32) {
+pub(crate) fn rope_neox(vec: &mut [f32], pos: u32, theta: f32) {
     let head_dim = vec.len();
     let (first, second) = vec.split_at_mut(head_dim / 2);
     for (i, (x0, x1)) in first.iter_mut().zip(second).enumerate() {
@@ -244,7 +243,7 @@ pub fn silu(x: f32) -> f32 {
 }
 
 /// Replace `x` with its softmax.
-pub fn softmax(x: &mut [f32]) {
+pub(crate) fn softmax(x: &mut [f32]) {
     let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0_f64;
     for value in x.iter_mut() {
@@ -262,7 +261,7 @@ pub fn softmax(x: &mut [f32]) {
 }
 
 /// Return the dot product of `a` and `b`.
-pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
     let sum: f64 = a
         .iter()
         .zip(b)

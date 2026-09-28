@@ -13,7 +13,7 @@ use std::collections::hash_map::Entry;
 use std::ops::Range;
 
 /// The most dimensions a GGUF tensor has.
-pub const MAX_DIMS: usize = 4;
+const MAX_DIMS: usize = 4;
 
 const MAGIC: u32 = 0x4655_4747;
 const DEFAULT_ALIGNMENT: u64 = 32;
@@ -54,7 +54,7 @@ pub enum Error {
     /// A tensor entry runs past the end of the file.
     #[error("tensor {0} is malformed")]
     MalformedTensor(u64),
-    /// A tensor has no dimensions or more than [`MAX_DIMS`].
+    /// A tensor has no dimensions or more than four.
     #[error("tensor {name} has {n_dims} dimensions")]
     Dimensions {
         /// The tensor's name.
@@ -120,7 +120,7 @@ pub enum TensorType {
 
 impl TensorType {
     /// Return the type with ggml type id `id`, if gip reads it.
-    pub fn from_id(id: u32) -> Option<Self> {
+    fn from_id(id: u32) -> Option<Self> {
         match id {
             0 => Some(Self::F32),
             1 => Some(Self::F16),
@@ -148,7 +148,7 @@ impl TensorType {
 
     /// Return the number of elements in one block of the type and the bytes the block occupies.
     /// Unquantized types have blocks of one element.
-    pub fn block(self) -> (usize, usize) {
+    pub const fn block(self) -> (usize, usize) {
         match self {
             Self::F32 => (1, 4),
             Self::F16 | Self::Bf16 => (1, 2),
@@ -162,7 +162,7 @@ impl TensorType {
     /// Return the bytes that `n_elements` consecutive elements of the type occupy.
     ///
     /// Return `None` when the count overflows or fills no whole number of blocks.
-    pub fn bytes_for(self, n_elements: u64) -> Option<u64> {
+    fn bytes_for(self, n_elements: u64) -> Option<u64> {
         let (elements, bytes) = self.block();
         let (elements, bytes) = (u64::try_from(elements).ok()?, u64::try_from(bytes).ok()?);
         if !n_elements.is_multiple_of(elements) {

@@ -16,7 +16,7 @@ pub enum Error {
         /// The system's error.
         source: io::Error,
     },
-    /// The model file is no well-formed GGUF file.
+    /// The model file is a malformed GGUF file.
     #[error("{}: {source}", path.display())]
     Gguf {
         /// The model file.

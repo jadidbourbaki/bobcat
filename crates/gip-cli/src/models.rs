@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use hf_hub::HFClientSync;
-use hf_hub::cache::CachedFileInfo;
+use hf_hub::cache::{CachedFileInfo, CachedRepoInfo};
 use hf_hub::progress::{DownloadEvent, Progress, ProgressEvent, ProgressHandler};
 use hf_hub::repository::RepoTreeEntry;
 
@@ -145,6 +145,15 @@ fn select<'f>(files: &[&'f str], tag: Option<&str>) -> Option<&'f str> {
         .min_by_key(|file| file.len())
 }
 
+/// Return each file among `files` that some tag selects, with the shortest such tag.
+fn tagged<'f>(files: &[&'f str]) -> Vec<(&'f str, String)> {
+    files
+        .iter()
+        .map(|&file| (file, tag_of(file, files)))
+        .filter(|(file, tag)| select(files, Some(tag)) == Some(*file))
+        .collect()
+}
+
 /// Return the shortest tag that selects `file` among `files`.
 fn tag_of(file: &str, files: &[&str]) -> String {
     let stem = file.strip_suffix(".gguf").unwrap_or(file);
@@ -199,11 +208,7 @@ pub(crate) fn pull(name: &Name) -> Result<PathBuf, Error> {
 
 /// Return the error for a repository that holds no file `name` picks, listing the tags it holds.
 fn missing(name: &Name, files: &[&str]) -> Error {
-    let tags: Vec<String> = files
-        .iter()
-        .filter(|file| select(files, Some(&tag_of(file, files))) == Some(file))
-        .map(|file| tag_of(file, files))
-        .collect();
+    let tags: Vec<String> = tagged(files).into_iter().map(|(_, tag)| tag).collect();
     let tag = name.tag.as_deref().unwrap_or(DEFAULT_TAG);
     if tags.is_empty() {
         format!("{} holds no GGUF files", name.repo_id()).into()
@@ -217,17 +222,17 @@ fn missing(name: &Name, files: &[&str]) -> Error {
     }
 }
 
-/// Return every cached GGUF file of the repository `repo_id`, from the revision `main` names when
-/// the cache holds it.
-fn cached_files(repo_id: &str) -> Result<Vec<CachedFileInfo>, Error> {
+/// Return the cached model repositories.
+fn cached_repos() -> Result<impl Iterator<Item = CachedRepoInfo>, Error> {
     let cache = HFClientSync::new()?.scan_cache().send()?;
-    let Some(repo) = cache
+    Ok(cache
         .repos
         .into_iter()
-        .find(|repo| repo.repo_type == "model" && repo.repo_id == repo_id)
-    else {
-        return Ok(Vec::new());
-    };
+        .filter(|repo| repo.repo_type == "model"))
+}
+
+/// Return every cached file of `repo`, from the revision `main` names when the cache holds it.
+fn cached_files(repo: CachedRepoInfo) -> Vec<CachedFileInfo> {
     let mut revisions = repo.revisions;
     revisions.sort_by_key(|revision| !revision.refs.iter().any(|name| name == "main"));
     let mut files: Vec<CachedFileInfo> = Vec::new();
@@ -238,12 +243,16 @@ fn cached_files(repo_id: &str) -> Result<Vec<CachedFileInfo>, Error> {
             }
         }
     }
-    Ok(files)
+    files
 }
 
 /// Return the cached file `name` picks, if the cache holds it.
 fn cached(name: &Name) -> Result<Option<CachedFileInfo>, Error> {
-    let files = cached_files(&name.repo_id())?;
+    let repo_id = name.repo_id();
+    let Some(repo) = cached_repos()?.find(|repo| repo.repo_id == repo_id) else {
+        return Ok(None);
+    };
+    let files = cached_files(repo);
     let names: Vec<&str> = files.iter().map(|file| file.file_name.as_str()).collect();
     let Some(chosen) = select(&names, name.tag.as_deref()) else {
         return Ok(None);
@@ -254,22 +263,18 @@ fn cached(name: &Name) -> Result<Option<CachedFileInfo>, Error> {
 /// Return every cached GGUF model as its full name, its size in bytes, and its alias when it has
 /// one.
 pub(crate) fn list() -> Result<Vec<(String, u64, Option<String>)>, Error> {
-    let cache = HFClientSync::new()?.scan_cache().send()?;
     let mut models = Vec::new();
-    for repo in cache.repos.iter().filter(|repo| repo.repo_type == "model") {
-        let files = cached_files(&repo.repo_id)?;
+    for repo in cached_repos()? {
+        let repo_id = repo.repo_id.clone();
+        let files = cached_files(repo);
         let names: Vec<&str> = files.iter().map(|file| file.file_name.as_str()).collect();
-        for file in &files {
-            if select(&names, Some(&tag_of(&file.file_name, &names)))
-                == Some(file.file_name.as_str())
-            {
-                let tag = tag_of(&file.file_name, &names);
-                models.push((
-                    format!("{}:{tag}", repo.repo_id),
-                    file.size_on_disk,
-                    alias_of(&repo.repo_id, &tag),
-                ));
-            }
+        for (file, tag) in tagged(&names) {
+            let size = files
+                .iter()
+                .find(|cached| cached.file_name == file)
+                .map_or(0, |cached| cached.size_on_disk);
+            let alias = alias_of(&repo_id, &tag);
+            models.push((format!("{repo_id}:{tag}"), size, alias));
         }
     }
     models.sort();
@@ -281,8 +286,7 @@ pub(crate) fn list() -> Result<Vec<(String, u64, Option<String>)>, Error> {
 pub(crate) fn remove(name: &Name) -> Result<(), Error> {
     let file = cached(name)?.ok_or_else(|| format!("the cache holds no {name}"))?;
     fs::remove_file(&file.file_path)?;
-    let cache = HFClientSync::new()?.scan_cache().send()?;
-    let shared = cache.repos.iter().any(|repo| {
+    let shared = cached_repos()?.any(|repo| {
         repo.revisions
             .iter()
             .flat_map(|revision| &revision.files)
