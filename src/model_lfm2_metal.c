@@ -17,6 +17,9 @@ enum
   SIMD_WIDTH = 32,
   ATTENTION_MAX_GROUP = 4,
   ATTENTION_MAX_HEAD_DIM = 128,
+  /* short_conv_history keeps up to 8 history inputs per channel in
+     registers.  */
+  CONV_MAX_KERNEL = 9,
   /* Generation keeps up to this many steps submitted ahead of the GPU.
      Each step depends on the one before, so more steps in flight save
      nothing once the GPU never waits for the CPU.  */
@@ -106,6 +109,14 @@ gip_lfm2_metal_init (const struct gip_lfm2_model *model,
                         model->n_heads / model->n_kv_heads);
       return GIP_ERR_UNSUPPORTED;
     }
+  if (model->conv_kernel > CONV_MAX_KERNEL)
+    {
+      gip_format_error (err, err_size,
+                        "the Metal path needs a convolution of at most %d "
+                        "taps, got %u",
+                        CONV_MAX_KERNEL, model->conv_kernel);
+      return GIP_ERR_UNSUPPORTED;
+    }
 
   gpu->model = model;
   gpu->metal = metal;
@@ -153,7 +164,6 @@ gip_lfm2_metal_init (const struct gip_lfm2_model *model,
       gpu, gip_metal_attention_scratch (model->n_heads, model->head_dim, n_ctx,
                                         (uint32_t)batch));
   gpu->ffn = new_floats (gpu, batch * model->n_ff);
-  gpu->up = new_floats (gpu, batch * model->n_ff);
   gpu->logits = new_floats (gpu, model->n_vocab);
   /* An int32_t token id takes the space of one float.  */
   gpu->tokens = new_floats (gpu, n_ctx);
@@ -166,10 +176,9 @@ gip_lfm2_metal_init (const struct gip_lfm2_model *model,
       || gpu->k == NULL || gpu->v == NULL || gpu->conv_state == NULL
       || gpu->hidden == NULL || gpu->normed == NULL || gpu->bcx == NULL
       || gpu->conv_out == NULL || gpu->q == NULL || gpu->attn == NULL
-      || gpu->scores == NULL || gpu->ffn == NULL || gpu->up == NULL
-      || gpu->logits == NULL || gpu->tokens == NULL
-      || gpu->trace_embedding == NULL || gpu->trace_layers == NULL
-      || gpu->trace_final == NULL)
+      || gpu->scores == NULL || gpu->ffn == NULL || gpu->logits == NULL
+      || gpu->tokens == NULL || gpu->trace_embedding == NULL
+      || gpu->trace_layers == NULL || gpu->trace_final == NULL)
     {
       gip_format_error (err, err_size, "cannot allocate Metal buffers");
       gip_lfm2_metal_free (gpu);
@@ -196,7 +205,6 @@ gip_lfm2_metal_free (struct gip_lfm2_metal *gpu)
     gpu->attn,
     gpu->scores,
     gpu->ffn,
-    gpu->up,
     gpu->logits,
     gpu->tokens,
     gpu->trace_embedding,
@@ -525,16 +533,16 @@ ensure_trace_rows (struct gip_lfm2_metal *gpu, uint32_t rows)
   return GIP_OK;
 }
 
-/* Record a multiply of the matrix TENSOR by each of the N tokens at X
-   into Y, added to Y when ACCUMULATE is nonzero.  */
+/* Record a multiply of the matrix TENSOR by each of the N tokens at X,
+   combined with Y as STORE says.  */
 static void
 matmul (struct gip_lfm2_metal *gpu, const struct gip_gguf_tensor *tensor,
         struct gip_metal_view x, struct gip_metal_view y, uint32_t n,
-        int accumulate)
+        enum gip_metal_store store)
 {
   gip_metal_matmul_q8_0 (gpu->metal, weights_of (gpu, tensor),
                          (uint32_t)tensor->ne[1], (uint32_t)tensor->ne[0], x,
-                         y, n, accumulate);
+                         y, n, store);
 }
 
 /* Record the gated short convolution of LAYER over the N normalized
@@ -550,15 +558,15 @@ record_conv_batch (struct gip_lfm2_metal *gpu,
       = (size_t)layer->cache_index * (model->conv_kernel - 1) * n_embd;
 
   matmul (gpu, layer->conv_in_proj, floats_at (gpu->normed, 0),
-          floats_at (gpu->bcx, 0), n, 0);
+          floats_at (gpu->bcx, 0), n, GIP_METAL_OVERWRITE);
   gip_metal_barrier (metal);
-  gip_metal_short_conv (
+  gip_metal_short_conv_batch (
       metal, floats_at (gpu->bcx, 0), weights_of (gpu, layer->conv),
       floats_at (gpu->conv_state, history), floats_at (gpu->conv_out, 0),
       (uint32_t)n_embd, model->conv_kernel, n);
   gip_metal_barrier (metal);
   matmul (gpu, layer->conv_out_proj, floats_at (gpu->conv_out, 0),
-          floats_at (gpu->hidden, 0), n, 1);
+          floats_at (gpu->hidden, 0), n, GIP_METAL_ACCUMULATE);
   gip_metal_barrier (metal);
 }
 
@@ -586,9 +594,10 @@ record_attention_batch (struct gip_lfm2_metal *gpu,
   struct gip_metal_view k = floats_at (gpu->k, 0);
   struct gip_metal_view v = floats_at (gpu->v, 0);
 
-  matmul (gpu, layer->attn_q, normed, q, n, 0);
-  matmul (gpu, layer->attn_k, normed, k, n, 0);
-  matmul (gpu, layer->attn_v, normed, gpu->kv_half ? v : v_rows, n, 0);
+  matmul (gpu, layer->attn_q, normed, q, n, GIP_METAL_OVERWRITE);
+  matmul (gpu, layer->attn_k, normed, k, n, GIP_METAL_OVERWRITE);
+  matmul (gpu, layer->attn_v, normed, gpu->kv_half ? v : v_rows, n,
+          GIP_METAL_OVERWRITE);
   gip_metal_barrier (metal);
   gip_metal_norm_rope (metal, q, q, 0, weights_of (gpu, layer->attn_q_norm),
                        model->n_heads, model->head_dim, pos, n, q_dim, q_dim,
@@ -607,7 +616,7 @@ record_attention_batch (struct gip_lfm2_metal *gpu,
                        n, gpu->n_ctx);
   gip_metal_barrier (metal);
   matmul (gpu, layer->attn_output, floats_at (gpu->attn, 0),
-          floats_at (gpu->hidden, 0), n, 1);
+          floats_at (gpu->hidden, 0), n, GIP_METAL_ACCUMULATE);
   gip_metal_barrier (metal);
 }
 
@@ -623,7 +632,6 @@ record_batch (struct gip_lfm2_metal *gpu, uint32_t pos, uint32_t n,
   const struct gip_lfm2_model *model = gpu->model;
   struct gip_metal *metal = gpu->metal;
   uint32_t n_embd = model->n_embd;
-  uint32_t n_ff = model->n_ff;
   struct gip_metal_view h = floats_at (gpu->hidden, 0);
   struct gip_metal_view normed = floats_at (gpu->normed, 0);
 
@@ -649,13 +657,16 @@ record_batch (struct gip_lfm2_metal *gpu, uint32_t pos, uint32_t n,
       gip_metal_rms_norm (metal, h, weights_of (gpu, layer->ffn_norm), normed,
                           n_embd, n, model->norm_eps);
       gip_metal_barrier (metal);
-      matmul (gpu, layer->ffn_gate, normed, floats_at (gpu->ffn, 0), n, 0);
-      matmul (gpu, layer->ffn_up, normed, floats_at (gpu->up, 0), n, 0);
+      /* The up projection's store combines with the gate projection
+         already in the buffer, which applies the SwiGLU.  */
+      matmul (gpu, layer->ffn_gate, normed, floats_at (gpu->ffn, 0), n,
+              GIP_METAL_OVERWRITE);
       gip_metal_barrier (metal);
-      gip_metal_swiglu (metal, floats_at (gpu->ffn, 0), floats_at (gpu->up, 0),
-                        n * n_ff);
+      matmul (gpu, layer->ffn_up, normed, floats_at (gpu->ffn, 0), n,
+              GIP_METAL_SWIGLU);
       gip_metal_barrier (metal);
-      matmul (gpu, layer->ffn_down, floats_at (gpu->ffn, 0), h, n, 1);
+      matmul (gpu, layer->ffn_down, floats_at (gpu->ffn, 0), h, n,
+              GIP_METAL_ACCUMULATE);
       gip_metal_barrier (metal);
 
       if (traced)

@@ -118,35 +118,11 @@ compare_entries (const void *a, const void *b)
   return (x->seconds < y->seconds) - (x->seconds > y->seconds);
 }
 
-/* Prefill N_PROMPT tokens of MODEL on METAL, then decode N_GENERATE
-   tokens with profiling on and print each kernel's GPU time per token.
-   The KV cache holds half precision when KV_HALF is nonzero.  LOGITS
-   holds the model's vocabulary size in floats.  */
+/* Print METAL's profile under LABEL, with GPU times divided by
+   N_UNITS, the number of tokens or passes the profile covers.  */
 static void
-profile_decode (const struct gip_lfm2_model *model, struct gip_metal *metal,
-                unsigned n_prompt, unsigned n_generate, int kv_half,
-                float *logits)
+print_profile (struct gip_metal *metal, const char *label, unsigned n_units)
 {
-  struct gip_lfm2_metal gpu;
-  char err[512] = "";
-
-  if (gip_lfm2_metal_init (model, metal, n_prompt + n_generate, kv_half, &gpu,
-                           err, sizeof err)
-      != GIP_OK)
-    {
-      fprintf (stderr, "gip_bench: %s\n", err);
-      exit (EXIT_FAILURE);
-    }
-  for (unsigned t = 0; t < n_prompt; t++)
-    gip_lfm2_metal_step (&gpu, PROMPT_TOKEN, t + 1 == n_prompt ? logits : NULL,
-                         NULL);
-
-  gip_metal_set_profiling (metal, 1);
-  for (unsigned t = 0; t < n_generate; t++)
-    gip_lfm2_metal_step (&gpu, argmax (logits, model->n_vocab), logits, NULL);
-  gip_metal_set_profiling (metal, 0);
-  gip_lfm2_metal_free (&gpu);
-
   const struct gip_metal_profile_entry *entries;
   size_t count = gip_metal_profile (metal, &entries);
   struct gip_metal_profile_entry *sorted = malloc (count * sizeof *sorted);
@@ -161,26 +137,60 @@ profile_decode (const struct gip_lfm2_model *model, struct gip_metal *metal,
   double total = 0.0;
   for (size_t i = 0; i < count; i++)
     total += sorted[i].seconds;
-  printf ("\nprofiled decode, one command buffer per launch:\n");
-  printf ("%-14s %13s %10s %9s %6s %8s\n", "kernel", "shape", "launches",
-          "ms/token", "share", "GB/s");
+  printf ("\nprofiled %s, one command buffer per launch:\n", label);
+  printf ("%-18s %13s %10s %9s %6s %8s\n", "kernel", "shape", "launches",
+          "ms/unit", "share", "GB/s");
   for (size_t i = 0; i < count; i++)
     {
       char shape[32] = "";
       if (sorted[i].n_rows != 0)
         snprintf (shape, sizeof shape, "%ux%u", sorted[i].n_rows,
                   sorted[i].n_cols);
-      double ms = sorted[i].seconds * 1e3 / n_generate;
-      printf ("%-14s %13s %10llu %9.3f %5.1f%%", sorted[i].name, shape,
-              (unsigned long long)(sorted[i].calls / n_generate), ms,
+      double ms = sorted[i].seconds * 1e3 / n_units;
+      printf ("%-18s %13s %10llu %9.3f %5.1f%%", sorted[i].name, shape,
+              (unsigned long long)(sorted[i].calls / n_units), ms,
               100.0 * sorted[i].seconds / total);
       if (sorted[i].bytes != 0)
         printf (" %8.1f", sorted[i].bytes / sorted[i].seconds / 1e9);
       printf ("\n");
     }
-  printf ("%-14s %13s %10s %9.3f\n", "total", "", "",
-          total * 1e3 / n_generate);
+  printf ("%-18s %13s %10s %9.3f\n", "total", "", "", total * 1e3 / n_units);
   free (sorted);
+}
+
+/* Prefill N_PROMPT tokens of MODEL on METAL in one batched call, then
+   decode N_GENERATE tokens, with profiling on for both, and print each
+   kernel's GPU time for the prefill and per decoded token.  The KV
+   cache holds half precision when KV_HALF is nonzero.  PROMPT holds the
+   N_PROMPT tokens, and LOGITS holds the model's vocabulary size in
+   floats.  */
+static void
+profile_run (const struct gip_lfm2_model *model, struct gip_metal *metal,
+             const int32_t *prompt, unsigned n_prompt, unsigned n_generate,
+             int kv_half, float *logits)
+{
+  struct gip_lfm2_metal gpu;
+  char err[512] = "";
+
+  if (gip_lfm2_metal_init (model, metal, n_prompt + n_generate, kv_half, &gpu,
+                           err, sizeof err)
+      != GIP_OK)
+    {
+      fprintf (stderr, "gip_bench: %s\n", err);
+      exit (EXIT_FAILURE);
+    }
+
+  gip_metal_set_profiling (metal, 1);
+  gip_lfm2_metal_prefill (&gpu, prompt, n_prompt, logits, NULL);
+  gip_metal_set_profiling (metal, 0);
+  print_profile (metal, "prefill", 1);
+
+  gip_metal_set_profiling (metal, 1);
+  for (unsigned t = 0; t < n_generate; t++)
+    gip_lfm2_metal_step (&gpu, argmax (logits, model->n_vocab), logits, NULL);
+  gip_metal_set_profiling (metal, 0);
+  gip_lfm2_metal_free (&gpu);
+  print_profile (metal, "decode", n_generate);
 }
 
 /* Parse the options in ARGC and ARGV, load the model, and time REPS
@@ -324,7 +334,7 @@ main (int argc, char **argv)
           total_encode_seconds * per_token);
 
   if (profile)
-    profile_decode (&model, metal, n_prompt, n_generate, kv_half, logits);
+    profile_run (&model, metal, prompt, n_prompt, n_generate, kv_half, logits);
 
   free (logits);
   free (generated);

@@ -12,9 +12,14 @@ constant uint rows_per_threadgroup [[function_constant (0)]];
    by NORM_WEIGHT before multiplying.  */
 constant bool fuse_norm [[function_constant (1)]];
 
-/* Whether a matrix-vector kernel adds its product to Y instead of
-   overwriting Y.  */
+/* Whether a matrix kernel adds its product to Y instead of overwriting
+   Y.  */
 constant bool accumulate [[function_constant (2)]];
+
+/* Whether the matrix-matrix kernel stores SiLU of what Y holds times its
+   product, which turns the up projection into the SwiGLU of the gate
+   projection already in Y.  */
+constant bool swiglu_store [[function_constant (3)]];
 
 enum
 {
@@ -40,9 +45,10 @@ enum
   ATTENTION_CHUNK = 64,
   ATTENTION_MAX_GROUP = 4,
   ATTENTION_MAX_HEAD_DIM = 128,
-  /* A matmul threadgroup computes MATMUL_TILE rows by MATMUL_TILE tokens
-     with four simdgroups, each owning a 16 by 16 quarter.  */
-  MATMUL_TILE = 32,
+  /* A matmul threadgroup computes MATMUL_ROWS rows by MATMUL_TOKENS
+     tokens with four simdgroups, each owning 32 rows by 16 tokens.  */
+  MATMUL_ROWS = 64,
+  MATMUL_TOKENS = 32,
   MATMUL_SIMDGROUPS = 4
 };
 
@@ -594,17 +600,77 @@ short_conv (device const float *bcx [[buffer (0)]],
     }
 }
 
-/* Replace each of the N floats at GATE with its SiLU times the matching
-   float at UP.  */
+/* Run the gated short convolution over N_TOKENS tokens at once, as the
+   first of two passes.  Each token's 3 * N_EMBD floats at BCX hold the
+   gates B and C and the input X, and its N_EMBD results go to OUT.
+   HISTORY holds B times X for the KERNEL - 1 tokens before the batch,
+   oldest first.  Each output depends only on inputs, so one thread
+   handles one channel of one token.  */
 kernel void
-swiglu (device float *gate [[buffer (0)]],
-        device const float *up [[buffer (1)]], constant uint &n [[buffer (2)]],
-        uint i [[thread_position_in_grid]])
+short_conv_batch (device const float *bcx [[buffer (0)]],
+                  device const float *taps [[buffer (1)]],
+                  device const float *history [[buffer (2)]],
+                  device float *out [[buffer (3)]],
+                  constant uint &n_embd [[buffer (4)]],
+                  constant uint &kernel_size [[buffer (5)]],
+                  constant uint &n_tokens [[buffer (6)]],
+                  uint2 position [[thread_position_in_grid]])
 {
-  if (i >= n)
+  uint ch = position.x;
+  uint t = position.y;
+  if (ch >= n_embd || t >= n_tokens)
     return;
-  float g = gate[i];
-  gate[i] = g / (1.0f + precise::exp (-g)) * up[i];
+
+  device const float *channel_taps = taps + ch * kernel_size;
+  float sum = 0.0f;
+  for (uint k = 0; k < kernel_size; k++)
+    {
+      /* Tap K multiplies the input from KERNEL - 1 - K tokens ago, which
+         comes from the history when it predates the batch.  */
+      int source = int (t) - int (kernel_size - 1 - k);
+      float bx;
+      if (source >= 0)
+        {
+          device const float *row = bcx + uint (source) * 3 * n_embd;
+          bx = row[ch] * row[2 * n_embd + ch];
+        }
+      else
+        bx = history[uint (source + int (kernel_size - 1)) * n_embd + ch];
+      sum += channel_taps[k] * bx;
+    }
+  out[t * n_embd + ch] = bcx[t * 3 * n_embd + n_embd + ch] * sum;
+}
+
+/* Move HISTORY forward past the N_TOKENS tokens at BCX, as the second
+   pass of short_conv_batch.  One thread handles one channel.  */
+kernel void
+short_conv_history (device const float *bcx [[buffer (0)]],
+                    device float *history [[buffer (1)]],
+                    constant uint &n_embd [[buffer (2)]],
+                    constant uint &kernel_size [[buffer (3)]],
+                    constant uint &n_tokens [[buffer (4)]],
+                    uint ch [[thread_position_in_grid]])
+{
+  if (ch >= n_embd)
+    return;
+
+  uint n_history = kernel_size - 1;
+  float next[8];
+  for (uint k = 0; k < n_history; k++)
+    {
+      /* Slot K of the new history holds the input from N_HISTORY - K
+         tokens before the end of the batch.  */
+      int source = int (n_tokens) - int (n_history - k);
+      if (source >= 0)
+        {
+          device const float *row = bcx + uint (source) * 3 * n_embd;
+          next[k] = row[ch] * row[2 * n_embd + ch];
+        }
+      else
+        next[k] = history[uint (source + int (n_history)) * n_embd + ch];
+    }
+  for (uint k = 0; k < n_history; k++)
+    history[k * n_embd + ch] = next[k];
 }
 
 /* Multiply the Q8_0 matrix WEIGHTS, which has N_ROWS rows of N_COLS
@@ -612,11 +678,16 @@ swiglu (device float *gate [[buffer (0)]],
    T's N_ROWS results go to row T of Y.  With accumulate, the results add
    to Y.
 
-   One threadgroup of MATMUL_SIMDGROUPS simdgroups computes a tile of
-   MATMUL_TILE rows by MATMUL_TILE tokens.  For each Q8_0 block along
-   the columns, the threadgroup dequantizes the tile's weights and loads
-   its inputs into threadgroup memory, then each simdgroup multiplies a
-   quarter of the tile with 8 by 8 matrix instructions.  */
+   The layout follows llama.cpp's matrix-matrix kernel.  One threadgroup
+   of MATMUL_SIMDGROUPS simdgroups computes a tile of MATMUL_ROWS rows by
+   MATMUL_TOKENS tokens.  For each Q8_0 block along the columns, the
+   threadgroup dequantizes the tile's weights to half precision and
+   copies its inputs as floats into threadgroup memory, stored as 8 by 8
+   blocks so each matrix load reads 64 neighboring values.  Each
+   simdgroup then multiplies 32 rows by 16 tokens of the tile,
+   accumulating in float, and holds its result as eight 8 by 8 matrices
+   of tokens by rows.  Half-precision inputs ran no faster and raised
+   the error of LFM2.5-350M's last layer from 1.5e-3 to 6.6e-3.  */
 kernel void
 matmul_q8_0 (device const uchar *weights [[buffer (0)]],
              device const float *x [[buffer (1)]],
@@ -628,100 +699,158 @@ matmul_q8_0 (device const uchar *weights [[buffer (0)]],
              uint2 thread_position [[thread_position_in_threadgroup]],
              uint simdgroup_index [[simdgroup_index_in_threadgroup]])
 {
-  threadgroup float weight_tile[MATMUL_TILE * QK8_0];
-  threadgroup float input_tile[QK8_0 * MATMUL_TILE];
-  threadgroup float out_tile[MATMUL_TILE * MATMUL_TILE];
+  /* WEIGHT_TILE holds 8 by 8 blocks of the tile's weights, each with
+     rows of 8 columns and 8 matrix rows across.  Block K * 8 + R covers
+     columns 8K through 8K + 7 of rows 8R through 8R + 7.  INPUT_TILE
+     holds 8 by 8 blocks of tokens by columns, with block K * 4 + T
+     covering columns 8K through 8K + 7 of tokens 8T through 8T + 7.  */
+  threadgroup half weight_tile[MATMUL_ROWS * QK8_0];
+  threadgroup float input_tile[MATMUL_TOKENS * QK8_0];
+  threadgroup float out_tile[MATMUL_ROWS * MATMUL_TOKENS];
 
   uint tid = thread_position.x;
-  uint first_row = position.x * MATMUL_TILE;
-  uint first_token = position.y * MATMUL_TILE;
+  /* Token tiles vary fastest across the grid, so neighboring threadgroups
+     read the same weights while they are still in cache.  */
+  uint first_token = position.x * MATMUL_TOKENS;
+  uint first_row = position.y * MATMUL_ROWS;
   uint n_blocks = n_cols / QK8_0;
   ulong row_bytes = ulong (n_blocks) * Q8_0_BLOCK_BYTES;
 
-  /* Each simdgroup owns a quarter of the tile, as a 2 by 2 grid of 8 by 8
-     results.  */
-  uint row_base = (simdgroup_index / 2) * (MATMUL_TILE / 2);
-  uint token_base = (simdgroup_index % 2) * (MATMUL_TILE / 2);
-  simdgroup_float8x8 acc[2][2];
-  for (uint i = 0; i < 2; i++)
-    for (uint j = 0; j < 2; j++)
-      acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8> (0.0f);
+  /* Two threads dequantize the 32 weights of each row's block, 16 each.
+     Four threads convert the 32 inputs of each token's block, 8 each.  */
+  ushort weight_row = tid / 2;
+  ushort weight_half = tid % 2;
+  ushort input_token = tid / LANES_PER_BLOCK;
+  ushort input_part = tid % LANES_PER_BLOCK;
 
-  /* Each thread loads 8 of the tile's 32 weights or inputs per row, so
-     four threads cover a row of one block.  */
-  uint load_row = tid / LANES_PER_BLOCK;
-  uint part = tid % LANES_PER_BLOCK;
-  uint row = first_row + load_row;
-  uint token = first_token + load_row;
+  /* Threads past the matrix edge load the last valid row or token
+     instead of branching.  Their results fall outside the tile's valid
+     part, and the stores skip them.  */
+  uint row = min (first_row + weight_row, n_rows - 1);
+  uint token = min (first_token + input_token, n_tokens - 1);
+
+  /* Where this thread's weights and inputs land in the blocked tiles.
+     Weight K of a block goes to block K / 8, row K % 8.  */
+  ushort weight_base = 64 * (weight_row / 8) + weight_row % 8
+                       + 64 * 8 * (2 * weight_half);
+  threadgroup float4 *input_slot
+      = (threadgroup float4 *)(input_tile
+                              + 64 * (4 * input_part + input_token / 8)
+                              + 8 * (input_token % 8));
+  device const q8_0_block *row_blocks
+      = (device const q8_0_block *)(weights + row * row_bytes);
+  device const float4 *token_inputs
+      = (device const float4 *)(x + ulong (token) * n_cols
+                                + input_part * QUANTS_PER_LANE);
+
+  /* Simdgroup S owns rows 32 * (S % 2) onward and tokens 16 * (S / 2)
+     onward: four blocks of rows and two of tokens.  */
+  uint row_block_base = 4 * (simdgroup_index % 2);
+  uint token_block_base = 2 * (simdgroup_index / 2);
+  simdgroup_float8x8 acc[8];
+  for (uint i = 0; i < 8; i++)
+    acc[i] = make_filled_simdgroup_matrix<float, 8, 8> (0.0f);
 
   for (uint b = 0; b < n_blocks; b++)
     {
-      threadgroup float *w = weight_tile + load_row * QK8_0
-                             + part * QUANTS_PER_LANE;
-      if (row < n_rows)
-        {
-          device const q8_0_block *block
-              = (device const q8_0_block *)(weights + row * row_bytes) + b;
-          float block_scale = float (block->scale);
-          for (uint i = 0; i < QUANTS_PER_LANE; i++)
-            w[i] = block_scale
-                   * float (block->quants[part * QUANTS_PER_LANE + i]);
-        }
-      else
-        for (uint i = 0; i < QUANTS_PER_LANE; i++)
-          w[i] = 0.0f;
-
-      /* The input tile is stored column by column, so a simdgroup loads
-         8 columns of 8 tokens with one stride.  */
-      device const float *xs
-          = x + ulong (token) * n_cols + b * QK8_0 + part * QUANTS_PER_LANE;
-      for (uint i = 0; i < QUANTS_PER_LANE; i++)
-        input_tile[(part * QUANTS_PER_LANE + i) * MATMUL_TILE + load_row]
-            = token < n_tokens ? xs[i] : 0.0f;
+      /* Load this block from device memory into registers first, then
+         wait for every simdgroup to finish multiplying the previous
+         block.  The loads overlap that work.  */
+      device const q8_0_block *block = row_blocks + b;
+      device const packed_char4 *quants
+          = (device const packed_char4 *)(block->quants + 16 * weight_half);
+      half block_scale = block->scale;
+      half4 w[4];
+      for (ushort v = 0; v < 4; v++)
+        w[v] = block_scale * half4 (char4 (quants[v]));
+      device const float4 *xs = token_inputs + b * (QK8_0 / 4);
+      float4 in0 = xs[0];
+      float4 in1 = xs[1];
       threadgroup_barrier (mem_flags::mem_threadgroup);
 
-      for (uint k = 0; k < QK8_0; k += 8)
+      for (ushort v = 0; v < 4; v++)
+        for (ushort c = 0; c < 4; c++)
+          {
+            ushort kk = 4 * v + c;
+            weight_tile[weight_base + 64 * 8 * (kk / 8) + 8 * (kk % 8)]
+                = w[v][c];
+          }
+      input_slot[0] = in0;
+      input_slot[1] = in1;
+      threadgroup_barrier (mem_flags::mem_threadgroup);
+
+      /* The simdgroup barriers order nothing.  They split the loads from
+         the multiplies, which lets the compiler schedule each group
+         together, as in llama.cpp.  */
+      for (ushort k = 0; k < QK8_0 / 8; k++)
         {
-          simdgroup_float8x8 a[2];
+          simdgroup_half8x8 a[4];
           simdgroup_float8x8 bm[2];
-          for (uint i = 0; i < 2; i++)
+          simdgroup_barrier (mem_flags::mem_none);
+          for (ushort i = 0; i < 4; i++)
             simdgroup_load (a[i],
-                            weight_tile + (row_base + 8 * i) * QK8_0 + k,
-                            QK8_0);
-          for (uint j = 0; j < 2; j++)
+                            weight_tile + 64 * (8 * k + row_block_base + i), 8);
+          simdgroup_barrier (mem_flags::mem_none);
+          for (ushort j = 0; j < 2; j++)
             simdgroup_load (bm[j],
-                            input_tile + k * MATMUL_TILE + token_base + 8 * j,
-                            MATMUL_TILE);
-          for (uint i = 0; i < 2; i++)
-            for (uint j = 0; j < 2; j++)
-              simdgroup_multiply_accumulate (acc[i][j], a[i], bm[j],
-                                             acc[i][j]);
+                            input_tile + 64 * (4 * k + token_block_base + j),
+                            8);
+          simdgroup_barrier (mem_flags::mem_none);
+          for (ushort j = 0; j < 2; j++)
+            for (ushort i = 0; i < 4; i++)
+              simdgroup_multiply_accumulate (acc[4 * j + i], bm[j], a[i],
+                                             acc[4 * j + i]);
         }
-      threadgroup_barrier (mem_flags::mem_threadgroup);
+    }
+  threadgroup_barrier (mem_flags::mem_threadgroup);
+
+  /* A full tile that overwrites Y stores straight to device memory.  A
+     tile that combines with Y, or a partial tile, goes through
+     threadgroup memory, so the threads can read Y and skip rows and
+     tokens past the edges.  */
+  uint row_offset = 8 * row_block_base;
+  uint token_offset = 8 * token_block_base;
+  bool full = first_row + MATMUL_ROWS <= n_rows
+              && first_token + MATMUL_TOKENS <= n_tokens;
+  if (full && !accumulate && !swiglu_store)
+    {
+      device float *out = y + ulong (first_token + token_offset) * n_rows
+                          + first_row + row_offset;
+      for (uint j = 0; j < 2; j++)
+        for (uint i = 0; i < 4; i++)
+          simdgroup_store (acc[4 * j + i],
+                           out + ulong (8 * j) * n_rows + 8 * i, n_rows);
+      return;
     }
 
-  for (uint i = 0; i < 2; i++)
-    for (uint j = 0; j < 2; j++)
-      simdgroup_store (acc[i][j],
-                       out_tile + (row_base + 8 * i) * MATMUL_TILE
-                           + token_base + 8 * j,
-                       MATMUL_TILE);
+  for (uint j = 0; j < 2; j++)
+    for (uint i = 0; i < 4; i++)
+      simdgroup_store (acc[4 * j + i],
+                       out_tile + (token_offset + 8 * j) * MATMUL_ROWS
+                           + row_offset + 8 * i,
+                       MATMUL_ROWS);
   threadgroup_barrier (mem_flags::mem_threadgroup);
 
   /* Neighboring threads write neighboring rows of one token, so the
      stores coalesce.  */
-  for (uint e = tid; e < MATMUL_TILE * MATMUL_TILE;
+  for (uint e = tid; e < MATMUL_ROWS * MATMUL_TOKENS;
        e += MATMUL_SIMDGROUPS * SIMD_WIDTH)
     {
-      uint r = e % MATMUL_TILE;
-      uint t = e / MATMUL_TILE;
+      uint r = e % MATMUL_ROWS;
+      uint t = e / MATMUL_ROWS;
       uint out_row = first_row + r;
       uint out_token = first_token + t;
       if (out_row < n_rows && out_token < n_tokens)
         {
           device float *dst = y + ulong (out_token) * n_rows + out_row;
-          float value = out_tile[r * MATMUL_TILE + t];
-          *dst = accumulate ? *dst + value : value;
+          float value = out_tile[t * MATMUL_ROWS + r];
+          if (swiglu_store)
+            {
+              float g = *dst;
+              *dst = g / (1.0f + precise::exp (-g)) * value;
+            }
+          else
+            *dst = accumulate ? *dst + value : value;
         }
     }
 }

@@ -149,19 +149,33 @@ void gip_metal_short_conv (struct gip_metal *metal, struct gip_metal_view bcx,
                            struct gip_metal_view out, uint32_t n_embd,
                            uint32_t kernel_size, uint32_t n_tokens);
 
+/* Record the gated short convolution of N_TOKENS tokens at once, with
+   the same arguments and results as gip_metal_short_conv.  */
+void gip_metal_short_conv_batch (struct gip_metal *metal,
+                                 struct gip_metal_view bcx,
+                                 struct gip_metal_view taps,
+                                 struct gip_metal_view history,
+                                 struct gip_metal_view out, uint32_t n_embd,
+                                 uint32_t kernel_size, uint32_t n_tokens);
+
+/* How a matrix-matrix launch combines its results with Y.  */
+enum gip_metal_store
+{
+  GIP_METAL_OVERWRITE,
+  GIP_METAL_ACCUMULATE,
+  /* Y holds gate projections, and the launch computes the matching up
+     projections.  Y receives SiLU of each gate times its up.  */
+  GIP_METAL_SWIGLU
+};
+
 /* Record a multiply of the Q8_0 matrix at WEIGHTS, which has N_ROWS rows
    of N_COLS elements, by each of the N_TOKENS rows of N_COLS floats at X.
-   Each token's N_ROWS results go to its row of Y, added to what Y holds
-   when ACCUMULATE is nonzero.  */
+   Each token's N_ROWS results combine with its row of Y as STORE says.  */
 void gip_metal_matmul_q8_0 (struct gip_metal *metal,
                             struct gip_metal_view weights, uint32_t n_rows,
                             uint32_t n_cols, struct gip_metal_view x,
                             struct gip_metal_view y, uint32_t n_tokens,
-                            int accumulate);
-
-/* Record GATE = SiLU (GATE) * UP over N floats.  */
-void gip_metal_swiglu (struct gip_metal *metal, struct gip_metal_view gate,
-                       struct gip_metal_view up, uint32_t n);
+                            enum gip_metal_store store);
 
 /* Record a copy of N floats from SRC to DST.  */
 void gip_metal_copy (struct gip_metal *metal, struct gip_metal_view src,

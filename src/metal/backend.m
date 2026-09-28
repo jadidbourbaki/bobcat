@@ -31,8 +31,10 @@ enum
   ELEMENTWISE_THREADS = 256,
   /* Must match ATTENTION_CHUNK in kernels.metal.  */
   ATTENTION_CHUNK = 64,
-  /* Must match MATMUL_TILE and MATMUL_SIMDGROUPS in kernels.metal.  */
-  MATMUL_TILE = 32,
+  /* Must match MATMUL_ROWS, MATMUL_TOKENS, and MATMUL_SIMDGROUPS in
+     kernels.metal.  */
+  MATMUL_ROWS = 64,
+  MATMUL_TOKENS = 32,
   MATMUL_SIMDGROUPS = 4,
   /* One threadgroup of the largest size scans a vocabulary in a few
      hundred loads per thread.  */
@@ -62,8 +64,8 @@ struct profile_table
   /* The first attention pass, indexed by whether the caches hold half
      precision.  */
   id<MTLComputePipelineState> attention_chunk[2];
-  /* The matrix-matrix pipelines, indexed by whether they accumulate.  */
-  id<MTLComputePipelineState> matmul_q8_0[2];
+  /* The matrix-matrix pipelines, indexed by enum gip_metal_store.  */
+  id<MTLComputePipelineState> matmul_q8_0[3];
 }
 @property (nonatomic, strong) id<MTLDevice> device;
 @property (nonatomic, strong) id<MTLCommandQueue> queue;
@@ -76,7 +78,8 @@ struct profile_table
    object, so the copy pipeline takes a different name.  */
 @property (nonatomic, strong) id<MTLComputePipelineState> float_copy;
 @property (nonatomic, strong) id<MTLComputePipelineState> embed_q8_0;
-@property (nonatomic, strong) id<MTLComputePipelineState> swiglu;
+@property (nonatomic, strong) id<MTLComputePipelineState> short_conv_batch;
+@property (nonatomic, strong) id<MTLComputePipelineState> short_conv_history;
 @property (nonatomic, strong) id<MTLComputePipelineState> argmax;
 @property (nonatomic, strong) id<MTLCommandBuffer> command_buffer;
 @property (nonatomic, strong) id<MTLComputeCommandEncoder> encoder;
@@ -112,18 +115,21 @@ metal_buffer (struct gip_metal_buffer *buffer)
   return (__bridge id<MTLBuffer>)(void *)buffer;
 }
 
-/* Return a pipeline for the matrix-vector kernel NAME in LIBRARY on
-   DEVICE, or nil.  The function constants take the values ROWS for
-   rows_per_threadgroup, FUSE_NORM for fuse_norm, and ACCUMULATE for
-   accumulate.  Store any error in ERROR.  */
+/* Return a pipeline for the matrix kernel NAME in LIBRARY on DEVICE, or
+   nil.  The function constants take the values ROWS for
+   rows_per_threadgroup, FUSE_NORM for fuse_norm, ACCUMULATE for
+   accumulate, and SWIGLU for swiglu_store.  Store any error in
+   ERROR.  */
 static id<MTLComputePipelineState>
 make_pipeline (id<MTLDevice> device, id<MTLLibrary> library, NSString *name,
-               uint32_t rows, bool fuse_norm, bool accumulate, NSError **error)
+               uint32_t rows, bool fuse_norm, bool accumulate, bool swiglu,
+               NSError **error)
 {
   MTLFunctionConstantValues *constants = [MTLFunctionConstantValues new];
   [constants setConstantValue:&rows type:MTLDataTypeUInt atIndex:0];
   [constants setConstantValue:&fuse_norm type:MTLDataTypeBool atIndex:1];
   [constants setConstantValue:&accumulate type:MTLDataTypeBool atIndex:2];
+  [constants setConstantValue:&swiglu type:MTLDataTypeBool atIndex:3];
 
   id<MTLFunction> function = [library newFunctionWithName:name
                                            constantValues:constants
@@ -180,9 +186,10 @@ gip_metal_open (struct gip_metal **out, char *err, size_t err_size)
     for (int norm = 0; norm < 2; norm++)
       for (int acc = 0; acc < 2; acc++)
         metal->matvec_q8_0[norm][acc] = make_pipeline (
-            device, library, @"matvec_q8_0", rows, norm, acc, &error);
-    metal.matvec_q8_0_swiglu = make_pipeline (
-        device, library, @"matvec_q8_0_swiglu", rows, true, false, &error);
+            device, library, @"matvec_q8_0", rows, norm, acc, false, &error);
+    metal.matvec_q8_0_swiglu
+        = make_pipeline (device, library, @"matvec_q8_0_swiglu", rows, true,
+                         false, false, &error);
     metal.rms_norm = plain_pipeline (device, library, @"rms_norm", &error);
     metal->norm_rope[0]
         = plain_pipeline (device, library, @"norm_rope_f32", &error);
@@ -194,10 +201,14 @@ gip_metal_open (struct gip_metal **out, char *err, size_t err_size)
         = plain_pipeline (device, library, @"attention_chunk_f32", &error);
     metal->attention_chunk[1]
         = plain_pipeline (device, library, @"attention_chunk_f16", &error);
-    for (int acc = 0; acc < 2; acc++)
-      metal->matmul_q8_0[acc] = make_pipeline (device, library, @"matmul_q8_0",
-                                               0, false, acc, &error);
-    metal.swiglu = plain_pipeline (device, library, @"swiglu", &error);
+    for (int store = 0; store < 3; store++)
+      metal->matmul_q8_0[store] = make_pipeline (
+          device, library, @"matmul_q8_0", 0, false,
+          store == GIP_METAL_ACCUMULATE, store == GIP_METAL_SWIGLU, &error);
+    metal.short_conv_batch
+        = plain_pipeline (device, library, @"short_conv_batch", &error);
+    metal.short_conv_history
+        = plain_pipeline (device, library, @"short_conv_history", &error);
     metal.attention_combine
         = plain_pipeline (device, library, @"attention_combine", &error);
     metal.short_conv = plain_pipeline (device, library, @"short_conv", &error);
@@ -212,13 +223,15 @@ gip_metal_open (struct gip_metal **out, char *err, size_t err_size)
         have_all &= metal->matvec_q8_0[norm][acc] != nil;
     for (int two = 0; two < 2; two++)
       have_all &= metal->norm_rope[two] != nil
-                  && metal->attention_chunk[two] != nil
-                  && metal->matmul_q8_0[two] != nil;
+                  && metal->attention_chunk[two] != nil;
+    for (int store = 0; store < 3; store++)
+      have_all &= metal->matmul_q8_0[store] != nil;
     if (metal.queue == nil || !have_all || metal.matvec_q8_0_swiglu == nil
         || metal.rms_norm == nil || metal.convert_half == nil
         || metal.attention_combine == nil || metal.short_conv == nil
         || metal.float_copy == nil || metal.embed_q8_0 == nil
-        || metal.argmax == nil || metal.swiglu == nil)
+        || metal.argmax == nil || metal.short_conv_batch == nil
+        || metal.short_conv_history == nil)
       {
         gip_format_error (err, err_size, "cannot create Metal pipelines: %s",
                           error != nil ? error.localizedDescription.UTF8String
@@ -659,21 +672,21 @@ void
 gip_metal_matmul_q8_0 (struct gip_metal *metal, struct gip_metal_view weights,
                        uint32_t n_rows, uint32_t n_cols,
                        struct gip_metal_view x, struct gip_metal_view y,
-                       uint32_t n_tokens, int accumulate)
+                       uint32_t n_tokens, enum gip_metal_store store)
 {
   GipMetal *m = backend (metal);
   id<MTLComputeCommandEncoder> encoder = op_encoder (m);
-  NSUInteger row_tiles = (n_rows + MATMUL_TILE - 1) / MATMUL_TILE;
-  NSUInteger token_tiles = (n_tokens + MATMUL_TILE - 1) / MATMUL_TILE;
+  NSUInteger row_tiles = (n_rows + MATMUL_ROWS - 1) / MATMUL_ROWS;
+  NSUInteger token_tiles = (n_tokens + MATMUL_TOKENS - 1) / MATMUL_TOKENS;
 
-  [encoder setComputePipelineState:m->matmul_q8_0[accumulate != 0]];
+  [encoder setComputePipelineState:m->matmul_q8_0[store]];
   bind (encoder, weights, 0);
   bind (encoder, x, 1);
   bind (encoder, y, 2);
   bind_bytes (encoder, &n_rows, sizeof n_rows, 3);
   bind_bytes (encoder, &n_cols, sizeof n_cols, 4);
   bind_bytes (encoder, &n_tokens, sizeof n_tokens, 5);
-  [encoder dispatchThreadgroups:MTLSizeMake (row_tiles, token_tiles, 1)
+  [encoder dispatchThreadgroups:MTLSizeMake (token_tiles, row_tiles, 1)
           threadsPerThreadgroup:MTLSizeMake (SIMD_WIDTH * MATMUL_SIMDGROUPS, 1,
                                              1)];
   op_done (m, "matmul_q8_0", n_rows, n_cols,
@@ -681,18 +694,38 @@ gip_metal_matmul_q8_0 (struct gip_metal *metal, struct gip_metal_view weights,
 }
 
 void
-gip_metal_swiglu (struct gip_metal *metal, struct gip_metal_view gate,
-                  struct gip_metal_view up, uint32_t n)
+gip_metal_short_conv_batch (struct gip_metal *metal, struct gip_metal_view bcx,
+                            struct gip_metal_view taps,
+                            struct gip_metal_view history,
+                            struct gip_metal_view out, uint32_t n_embd,
+                            uint32_t kernel_size, uint32_t n_tokens)
 {
   GipMetal *m = backend (metal);
   id<MTLComputeCommandEncoder> encoder = op_encoder (m);
 
-  [encoder setComputePipelineState:m.swiglu];
-  bind (encoder, gate, 0);
-  bind (encoder, up, 1);
-  bind_bytes (encoder, &n, sizeof n, 2);
-  dispatch_elements (encoder, n);
-  op_done (m, "swiglu", 0, 0, 0);
+  [encoder setComputePipelineState:m.short_conv_batch];
+  bind (encoder, bcx, 0);
+  bind (encoder, taps, 1);
+  bind (encoder, history, 2);
+  bind (encoder, out, 3);
+  bind_bytes (encoder, &n_embd, sizeof n_embd, 4);
+  bind_bytes (encoder, &kernel_size, sizeof kernel_size, 5);
+  bind_bytes (encoder, &n_tokens, sizeof n_tokens, 6);
+  [encoder dispatchThreads:MTLSizeMake (n_embd, n_tokens, 1)
+      threadsPerThreadgroup:MTLSizeMake (ELEMENTWISE_THREADS, 1, 1)];
+  op_done (m, "short_conv_batch", 0, 0, 0);
+
+  /* The history update overwrites what the first pass reads.  */
+  gip_metal_barrier (metal);
+  encoder = op_encoder (m);
+  [encoder setComputePipelineState:m.short_conv_history];
+  bind (encoder, bcx, 0);
+  bind (encoder, history, 1);
+  bind_bytes (encoder, &n_embd, sizeof n_embd, 2);
+  bind_bytes (encoder, &kernel_size, sizeof kernel_size, 3);
+  bind_bytes (encoder, &n_tokens, sizeof n_tokens, 4);
+  dispatch_elements (encoder, n_embd);
+  op_done (m, "short_conv_history", 0, 0, 0);
 }
 
 void

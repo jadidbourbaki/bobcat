@@ -38,7 +38,6 @@ struct gip_lfm2_metal
   struct gip_metal_buffer *attn;
   struct gip_metal_buffer *scores;
   struct gip_metal_buffer *ffn;
-  struct gip_metal_buffer *up;
   struct gip_metal_buffer *logits;
   struct gip_metal_buffer *tokens;
   struct gip_metal_buffer *trace_embedding;
