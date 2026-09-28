@@ -7,11 +7,12 @@
   <a href="CONTRIBUTING.md"><img src="https://img.shields.io/badge/contributions-welcome-brightgreen.svg" alt="Contributions welcome"></a>
 </p>
 
-**gip runs language models on your Mac's GPU.**
+**gip** (the *g*eneral *i*nference *p*rogram) is an inference engine for
+Apple silicon. It runs language models on your Mac's GPU with its own
+Metal kernels.
 
-It reads the GGUF files on Hugging Face and runs them with its own
-Metal kernels, built to be the fastest way to run a model locally on
-Apple silicon.
+It reads the GGUF files on Hugging Face and aims to be the fastest way
+to run a model locally on a Mac.
 
 ```console
 $ gip chat -m lfm2.5:1.2b
