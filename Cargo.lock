@@ -397,6 +397,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "gip",
+ "gip-gguf",
  "minijinja",
  "minijinja-contrib",
  "rustyline",

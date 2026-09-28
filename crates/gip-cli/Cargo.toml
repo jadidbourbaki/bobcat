@@ -17,6 +17,7 @@ doc = false
 [dependencies]
 clap = { workspace = true }
 gip = { workspace = true }
+gip-gguf = { workspace = true }
 minijinja = { workspace = true }
 minijinja-contrib = { workspace = true }
 rustyline = { workspace = true }

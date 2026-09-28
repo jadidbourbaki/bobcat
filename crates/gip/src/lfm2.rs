@@ -172,20 +172,9 @@ impl Model {
             .map(|layer| matches!(layer.mixer, Mixer::Attention(_)))
     }
 
-    /// Return the Jinja chat template the model file carries, if any.
-    pub fn chat_template(&self) -> Option<&str> {
-        let template = self.gguf.string("tokenizer.chat_template")?;
-        std::str::from_utf8(template).ok()
-    }
-
-    /// Return the id of the token that begins a sequence, if the file names one.
-    pub fn bos_token(&self) -> Option<u32> {
-        self.gguf.u32("tokenizer.ggml.bos_token_id")
-    }
-
-    /// Return the id of the token that ends a turn, if the file names one.
-    pub fn eos_token(&self) -> Option<u32> {
-        self.gguf.u32("tokenizer.ggml.eos_token_id")
+    /// Return the parsed model file, whose metadata holds the tokenizer and the chat template.
+    pub fn gguf(&self) -> &Gguf<impl AsRef<[u8]>> {
+        &self.gguf
     }
 
     /// Return the data bytes of `tensor`, which comes from this model's file.

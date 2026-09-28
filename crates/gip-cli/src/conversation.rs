@@ -51,14 +51,16 @@ impl<'a> Conversation<'a> {
         system: Option<&str>,
         limits: Limits,
     ) -> Result<Self, Error> {
-        let source = model
-            .chat_template()
+        let gguf = model.gguf();
+        let source = gguf
+            .string("tokenizer.chat_template")
             .ok_or("the model file holds no chat template")?;
-        let stop_token = model
-            .eos_token()
+        let source = std::str::from_utf8(source)?;
+        let stop_token = gguf
+            .u32("tokenizer.ggml.eos_token_id")
             .ok_or("the model file names no end-of-turn token")?;
-        let bos_token = model
-            .bos_token()
+        let bos_token = gguf
+            .u32("tokenizer.ggml.bos_token_id")
             .and_then(|id| tokenizer.id_to_token(id))
             .unwrap_or_default();
 

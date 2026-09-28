@@ -364,6 +364,27 @@ impl<B: AsRef<[u8]>> Gguf<B> {
         }
     }
 
+    /// Return the elements of the string array metadata value `key` when it exists.
+    pub fn string_array(&self, key: &str) -> Option<impl Iterator<Item = &[u8]>> {
+        let Value::Array {
+            element: ValueType::String,
+            count,
+            data,
+        } = self.metadata.get(key)?
+        else {
+            return None;
+        };
+        // The parser checked that every string lies inside the array's data.
+        let mut reader = Reader::new(self.bytes().get(..data.end)?);
+        reader.pos = data.start;
+        let bytes = reader.bytes;
+        let mut remaining = *count;
+        Some(std::iter::from_fn(move || {
+            remaining = remaining.checked_sub(1)?;
+            bytes.get(reader.string()?)
+        }))
+    }
+
     /// Return the element count of the array metadata value `key` when it exists.
     pub fn array_len(&self, key: &str) -> Option<u64> {
         match self.metadata.get(key)? {

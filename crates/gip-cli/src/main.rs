@@ -11,6 +11,8 @@ use clap::{Args, Parser, Subcommand};
 
 #[cfg(target_os = "macos")]
 mod conversation;
+#[cfg(target_os = "macos")]
+mod tokenizer;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -50,7 +52,7 @@ struct ModelOptions {
     /// The GGUF model file.
     #[arg(short, long)]
     model: PathBuf,
-    /// The model's Hugging Face `tokenizer.json`. Defaults to `tokenizer.json` beside the model.
+    /// A Hugging Face `tokenizer.json` to use in place of the tokenizer inside the model file.
     #[arg(short, long)]
     tokenizer: Option<PathBuf>,
     /// The system message that opens the conversation.
@@ -62,25 +64,6 @@ struct ModelOptions {
     /// The most tokens in the whole conversation.
     #[arg(short, long, default_value_t = 8192)]
     context: u32,
-}
-
-impl ModelOptions {
-    /// Return the tokenizer file to load.
-    fn tokenizer_path(&self) -> Result<PathBuf, Error> {
-        if let Some(path) = &self.tokenizer {
-            return Ok(path.clone());
-        }
-        let beside = self.model.with_file_name("tokenizer.json");
-        if beside.exists() {
-            Ok(beside)
-        } else {
-            Err(format!(
-                "no tokenizer.json beside {}, so pass one with --tokenizer",
-                self.model.display()
-            )
-            .into())
-        }
-    }
 }
 
 fn main() -> ExitCode {
@@ -135,8 +118,12 @@ fn full_prompt(prompt: &str) -> Result<String, Error> {
 /// Load the model and tokenizer that `options` name.
 #[cfg(target_os = "macos")]
 fn load(options: &ModelOptions) -> Result<(gip::Model, tokenizers::Tokenizer), Error> {
-    let tokenizer = tokenizers::Tokenizer::from_file(options.tokenizer_path()?)?;
-    Ok((gip::Model::load(&options.model)?, tokenizer))
+    let model = gip::Model::load(&options.model)?;
+    let tokenizer = match &options.tokenizer {
+        Some(path) => tokenizers::Tokenizer::from_file(path)?,
+        None => tokenizer::from_gguf(model.gguf())?,
+    };
+    Ok((model, tokenizer))
 }
 
 #[cfg(target_os = "macos")]
