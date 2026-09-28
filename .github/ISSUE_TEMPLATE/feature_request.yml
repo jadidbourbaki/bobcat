@@ -1,0 +1,21 @@
+name: Feature request
+description: Suggest a feature, a model family, or a quantization format.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you want to do
+      description: The task you want gip to help with, and what stops you today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would help
+      description: The feature you have in mind. For a model, link its Hugging Face repository.
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: Other engines that do this well, benchmarks, or links.

@@ -1,0 +1,45 @@
+name: Bug report
+description: Something in gip does not work as it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for taking the time to report a bug. Please report
+        security vulnerabilities privately, as SECURITY.md describes.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, and what happened instead.
+      placeholder: |
+        I ran `gip chat -m LiquidAI/LFM2.5-2.6B-GGUF:Q4_K_M` and expected ...
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: The full output, including any `gip:` error line.
+      render: text
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: The model name or GGUF file.
+      placeholder: LiquidAI/LFM2.5-2.6B-GGUF:Q4_K_M
+  - type: input
+    id: mac
+    attributes:
+      label: Mac and macOS version
+      description: The chip, such as M4 Pro, and the macOS version from `sw_vers`.
+      placeholder: M4 Pro, macOS 26.5
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: gip version
+      description: The output of `gip --version`, or the commit you built.
+    validations:
+      required: true
