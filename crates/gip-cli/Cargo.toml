@@ -16,6 +16,7 @@ doc = false
 
 [dependencies]
 clap = { workspace = true }
+fastrand = { workspace = true }
 gip = { workspace = true }
 gip-gguf = { workspace = true }
 hf-hub = { workspace = true }

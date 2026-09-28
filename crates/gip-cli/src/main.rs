@@ -14,6 +14,8 @@ use clap::{Args, Parser, Subcommand};
 mod conversation;
 mod models;
 #[cfg(target_os = "macos")]
+mod sampler;
+#[cfg(target_os = "macos")]
 mod tokenizer;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -79,6 +81,33 @@ struct ModelOptions {
     /// The most tokens in the whole conversation.
     #[arg(short, long, default_value_t = 8192)]
     context: u32,
+    #[command(flatten)]
+    sampling: SamplingOptions,
+}
+
+/// Overrides of the sampling settings the model file recommends. Settings the file leaves out
+/// take llama.cpp's defaults.
+#[derive(Debug, Args)]
+#[command(next_help_heading = "Sampling")]
+struct SamplingOptions {
+    /// The softmax temperature. Zero always picks the most likely token.
+    #[arg(long)]
+    temperature: Option<f32>,
+    /// Keep only this many most likely tokens. Zero keeps every token.
+    #[arg(long)]
+    top_k: Option<usize>,
+    /// Keep the fewest tokens whose probabilities sum to this much.
+    #[arg(long)]
+    top_p: Option<f32>,
+    /// Drop tokens less likely than this fraction of the most likely token.
+    #[arg(long)]
+    min_p: Option<f32>,
+    /// Divide the logits of recently used tokens by this much. One turns the penalty off.
+    #[arg(long)]
+    repeat_penalty: Option<f32>,
+    /// The seed of the random draws, for repeatable replies.
+    #[arg(long)]
+    seed: Option<u64>,
 }
 
 fn main() -> ExitCode {
@@ -158,29 +187,47 @@ fn load(options: &ModelOptions) -> Result<(gip::Model, tokenizers::Tokenizer), E
     Ok((model, tokenizer))
 }
 
+/// Start the conversation with `model` that `options` describe.
 #[cfg(target_os = "macos")]
-fn limits(options: &ModelOptions) -> conversation::Limits {
-    conversation::Limits {
+fn start<'a>(
+    options: &ModelOptions,
+    model: &'a gip::Model,
+    tokenizer: &'a tokenizers::Tokenizer,
+) -> Result<conversation::Conversation<'a>, Error> {
+    let recommended = sampler::Settings::recommended(model.gguf());
+    let flags = &options.sampling;
+    let settings = sampler::Settings {
+        temperature: flags.temperature.unwrap_or(recommended.temperature),
+        top_k: flags.top_k.unwrap_or(recommended.top_k),
+        top_p: flags.top_p.unwrap_or(recommended.top_p),
+        min_p: flags.min_p.unwrap_or(recommended.min_p),
+        repeat_penalty: flags.repeat_penalty.unwrap_or(recommended.repeat_penalty),
+        repeat_last_n: recommended.repeat_last_n,
+    };
+    let seed = flags.seed.unwrap_or_else(|| fastrand::u64(..));
+    let limits = conversation::Limits {
         max_tokens: options.max_tokens,
         context: options.context,
-    }
+    };
+    conversation::Conversation::new(
+        model,
+        tokenizer,
+        options.system.as_deref(),
+        limits,
+        sampler::Sampler::new(settings, seed),
+    )
 }
 
 /// Answer `prompt` and stdin's text, writing the answer to stdout and, when `think` is true, the
 /// thinking to stderr.
 #[cfg(target_os = "macos")]
 fn respond(options: &ModelOptions, think: bool, prompt: &str) -> Result<(), Error> {
-    use conversation::{Conversation, Part};
+    use conversation::Part;
 
     let text = full_prompt(prompt)?;
     let (model, tokenizer) = load(options)?;
     let mut metal = gip::metal::Metal::open()?;
-    let mut conversation = Conversation::new(
-        &model,
-        &tokenizer,
-        options.system.as_deref(),
-        limits(options),
-    )?;
+    let mut conversation = start(options, &model, &tokenizer)?;
 
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();
@@ -212,17 +259,12 @@ fn respond(options: &ModelOptions, think: bool, prompt: &str) -> Result<(), Erro
 /// Hold an interactive conversation until the user ends the input.
 #[cfg(target_os = "macos")]
 fn chat(options: &ModelOptions) -> Result<(), Error> {
-    use conversation::{Conversation, Part};
+    use conversation::Part;
     use rustyline::error::ReadlineError;
 
     let (model, tokenizer) = load(options)?;
     let mut metal = gip::metal::Metal::open()?;
-    let mut conversation = Conversation::new(
-        &model,
-        &tokenizer,
-        options.system.as_deref(),
-        limits(options),
-    )?;
+    let mut conversation = start(options, &model, &tokenizer)?;
     let mut editor = rustyline::DefaultEditor::new()?;
     let mut stdout = io::stdout().lock();
     // Dim text marks the thinking, unless the output goes elsewhere or the user asks for no

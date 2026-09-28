@@ -12,6 +12,7 @@ repository = "https://github.com/jadidbourbaki/gip"
 [workspace.dependencies]
 block2 = { version = "0.6.2", default-features = false, features = ["std"] }
 clap = { version = "4.6.7", features = ["derive"] }
+fastrand = { version = "2.5.0" }
 gip = { path = "crates/gip" }
 gip-gguf = { path = "crates/gip-gguf" }
 gip-metal = { path = "crates/gip-metal" }

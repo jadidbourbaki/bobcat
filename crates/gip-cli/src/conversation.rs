@@ -6,6 +6,7 @@ use minijinja::{Environment, Value, context};
 use tokenizers::Tokenizer;
 
 use crate::Error;
+use crate::sampler::Sampler;
 
 /// Decode this many tokens per GPU call. Each call pipelines its steps, and text streams out
 /// after each call, so the count trades pipelining against output latency.
@@ -41,15 +42,18 @@ pub(crate) struct Conversation<'a> {
     /// Every message so far.
     messages: Vec<Value>,
     limits: Limits,
+    sampler: Sampler,
 }
 
 impl<'a> Conversation<'a> {
-    /// Start a conversation with `model`, opened by the system message `system` when given.
+    /// Start a conversation with `model`, opened by the system message `system` when given, whose
+    /// replies `sampler` chooses.
     pub(crate) fn new(
         model: &'a Model,
         tokenizer: &'a Tokenizer,
         system: Option<&str>,
         limits: Limits,
+        sampler: Sampler,
     ) -> Result<Self, Error> {
         let gguf = model.gguf();
         let source = gguf
@@ -94,6 +98,7 @@ impl<'a> Conversation<'a> {
                 .into_iter()
                 .collect(),
             limits,
+            sampler,
         })
     }
 
@@ -131,9 +136,6 @@ impl<'a> Conversation<'a> {
             .into());
         }
 
-        let mut gpu = gip::Lfm2Metal::new(self.model, metal, self.limits.context, true)?;
-        gpu.prefill(&tokens, None, None)?;
-
         // Some templates open the reply's thinking in the prompt itself.
         let mut part = if prompt.ends_with("<think>") {
             Part::Thinking
@@ -143,42 +145,71 @@ impl<'a> Conversation<'a> {
         let mut thinking = String::new();
         let mut answer = String::new();
         let mut decoder = self.tokenizer.decode_stream(false);
+        let (stop_token, think_open, think_close) =
+            (self.stop_token, self.think_open, self.think_close);
+        // Take one decoded token into the reply and report whether the reply has ended.
+        let mut accept = |token: u32| -> Result<bool, Error> {
+            if token == stop_token {
+                return Ok(true);
+            }
+            if Some(token) == think_open {
+                part = Part::Thinking;
+                return Ok(false);
+            }
+            if Some(token) == think_close {
+                part = Part::Answer;
+                return Ok(false);
+            }
+            let Some(piece) = decoder.step(token)? else {
+                return Ok(false);
+            };
+            let text = match part {
+                Part::Thinking => &mut thinking,
+                Part::Answer => &mut answer,
+            };
+            // The model separates its thinking from its answer with blank lines.
+            let piece = if text.is_empty() {
+                piece.trim_start()
+            } else {
+                &piece
+            };
+            if !piece.is_empty() {
+                text.push_str(piece);
+                emit(part, piece)?;
+            }
+            Ok(false)
+        };
+
+        let mut gpu = gip::Lfm2Metal::new(self.model, metal, self.limits.context, true)?;
         let room = (self.limits.context - prompt_len) as usize;
         let mut remaining = self.limits.max_tokens.min(room);
-        let mut chunk = [0; DECODE_CHUNK];
-        'decode: while remaining > 0 {
-            let count = DECODE_CHUNK.min(remaining);
-            gpu.generate(&mut chunk[..count])?;
-            remaining -= count;
-            for &token in &chunk[..count] {
-                if token == self.stop_token {
-                    break 'decode;
+        if self.sampler.is_greedy() {
+            // The GPU picks each most likely token itself, several steps ahead of the CPU.
+            gpu.prefill(&tokens, None, None)?;
+            let mut chunk = [0; DECODE_CHUNK];
+            'decode: while remaining > 0 {
+                let count = DECODE_CHUNK.min(remaining);
+                gpu.generate(&mut chunk[..count])?;
+                remaining -= count;
+                for &token in &chunk[..count] {
+                    if accept(token)? {
+                        break 'decode;
+                    }
                 }
-                if Some(token) == self.think_open {
-                    part = Part::Thinking;
-                    continue;
+            }
+        } else {
+            // Sampling reads each step's logits on the CPU before the next step can start.
+            let mut logits = vec![0.0; self.model.hyperparameters().n_vocab as usize];
+            gpu.prefill(&tokens, Some(&mut logits), None)?;
+            let mut recent = tokens;
+            while remaining > 0 {
+                let token = self.sampler.sample(&mut logits, &recent);
+                recent.push(token);
+                remaining -= 1;
+                if accept(token)? || remaining == 0 {
+                    break;
                 }
-                if Some(token) == self.think_close {
-                    part = Part::Answer;
-                    continue;
-                }
-                let Some(piece) = decoder.step(token)? else {
-                    continue;
-                };
-                let text = match part {
-                    Part::Thinking => &mut thinking,
-                    Part::Answer => &mut answer,
-                };
-                // The model separates its thinking from its answer with blank lines.
-                let piece = if text.is_empty() {
-                    piece.trim_start()
-                } else {
-                    &piece
-                };
-                if !piece.is_empty() {
-                    text.push_str(piece);
-                    emit(part, piece)?;
-                }
+                gpu.step(token, Some(&mut logits), None)?;
             }
         }
 
