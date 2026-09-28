@@ -471,6 +471,22 @@ protocol:
   Spotlight indexing and video calls distort the numbers, so exclude
   `models/` from Spotlight and close other applications first.
 
+The baselines live in gitignored checkouts under `bench/`:
+
+| Engine | Build |
+|---|---|
+| llama.cpp | `cmake -B build-metal && cmake --build build-metal --target llama-bench` |
+| mistral.rs | `MISTRALRS_METAL_PRECOMPILE=0 cargo build --release -p mistralrs-cli --features metal` |
+| candle | `cargo build --release --example quantized-lfm2 --features metal` |
+
+`MISTRALRS_METAL_PRECOMPILE=0` makes mistral.rs compile its kernels at
+load time, as gip does, since the Command Line Tools lack the `metal`
+compiler. mistral.rs measures decode at a context depth of 512, the
+same depth gip decodes at. candle's example runs one prompt per
+process, so `tools/candle_bench.py` repeats it and reports the mean and
+standard deviation. Its prompt counts upward, so greedy decoding
+reaches all 128 tokens without an end-of-sequence token.
+
 CPU benchmarks follow the same protocol against llama.cpp's CPU build
 and sweep 1, 4, 8, and 10 threads on performance cores. `cpu-bw` gives
 the CPU decode ceiling.
