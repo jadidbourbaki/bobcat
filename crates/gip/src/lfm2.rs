@@ -44,6 +44,21 @@ pub struct Hyperparameters {
     pub norm_eps: f32,
 }
 
+/// How to choose each next token from a model's logits.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sampling {
+    /// The softmax temperature. Zero picks the most likely token.
+    pub temperature: f32,
+    /// The number of most likely tokens kept. Zero keeps every token.
+    pub top_k: u32,
+    /// The smallest set of tokens whose probabilities sum to at least this much is kept.
+    pub top_p: f32,
+    /// Tokens less likely than this fraction of the most likely token are dropped.
+    pub min_p: f32,
+    /// The logit divisor for recently used tokens. One turns the penalty off.
+    pub repeat_penalty: f32,
+}
+
 /// A 2D tensor with its shape as 32-bit counts.
 #[derive(Debug, Clone)]
 pub(crate) struct Matrix {
@@ -175,6 +190,21 @@ impl Model {
     /// Return the parsed model file, whose metadata holds the tokenizer and the chat template.
     pub fn gguf(&self) -> &Gguf<impl AsRef<[u8]>> {
         &self.gguf
+    }
+
+    /// Return the sampling settings for this model: the values the file stores under
+    /// `general.sampling`, then the values Liquid AI's LFM2.5 model cards recommend.
+    pub fn recommended_sampling(&self) -> Sampling {
+        // Liquid's cards give 1.1 as the penalty for LFM2.5-2.6B and 1.05 for the smaller
+        // models, and leave top-p and min-p off.
+        let gguf = &self.gguf;
+        Sampling {
+            temperature: gguf.f32("general.sampling.temp").unwrap_or(0.1),
+            top_k: gguf.u32("general.sampling.top_k").unwrap_or(50),
+            top_p: gguf.f32("general.sampling.top_p").unwrap_or(1.0),
+            min_p: gguf.f32("general.sampling.min_p").unwrap_or(0.0),
+            repeat_penalty: gguf.f32("general.sampling.penalty_repeat").unwrap_or(1.05),
+        }
     }
 
     /// Return the data bytes of `tensor`, which comes from this model's file.

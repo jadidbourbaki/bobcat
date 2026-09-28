@@ -3,100 +3,56 @@
 //! The steps run in llama.cpp's order: the repetition penalty, top-k, top-p, min-p, the
 //! temperature, then a random draw. A temperature of zero picks the most likely token.
 
-use gip_gguf::Gguf;
+use gip::Sampling;
 
-/// How the sampler chooses tokens.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Settings {
-    /// The softmax temperature. Zero picks the most likely token.
-    pub(crate) temperature: f32,
-    /// The number of most likely tokens kept. Zero keeps every token.
-    pub(crate) top_k: usize,
-    /// The smallest set of tokens whose probabilities sum to at least this much is kept.
-    pub(crate) top_p: f32,
-    /// Tokens less likely than this fraction of the most likely token are dropped.
-    pub(crate) min_p: f32,
-    /// The logit divisor for tokens among the last `repeat_last_n`. One turns the penalty off.
-    pub(crate) repeat_penalty: f32,
-    /// The number of recent tokens the repetition penalty covers.
-    pub(crate) repeat_last_n: usize,
-}
+/// The number of recent tokens the repetition penalty covers, as in llama.cpp.
+const REPEAT_LAST_N: usize = 64;
 
-impl Settings {
-    /// llama.cpp's defaults, for settings the model file leaves out.
-    const FALLBACK: Self = Self {
-        temperature: 0.8,
-        top_k: 40,
-        top_p: 0.95,
-        min_p: 0.05,
-        repeat_penalty: 1.0,
-        repeat_last_n: 64,
-    };
-
-    /// Return the sampling settings the metadata of `gguf` recommends, with llama.cpp's defaults
-    /// for the rest.
-    pub(crate) fn recommended(gguf: &Gguf<impl AsRef<[u8]>>) -> Self {
-        let fallback = Self::FALLBACK;
-        Self {
-            temperature: gguf
-                .f32("general.sampling.temp")
-                .unwrap_or(fallback.temperature),
-            top_k: gguf
-                .u32("general.sampling.top_k")
-                .map_or(fallback.top_k, |k| k as usize),
-            top_p: gguf.f32("general.sampling.top_p").unwrap_or(fallback.top_p),
-            min_p: gguf.f32("general.sampling.min_p").unwrap_or(fallback.min_p),
-            repeat_penalty: gguf
-                .f32("general.sampling.penalty_repeat")
-                .unwrap_or(fallback.repeat_penalty),
-            repeat_last_n: gguf
-                .u32("general.sampling.penalty_last_n")
-                .map_or(fallback.repeat_last_n, |n| n as usize),
-        }
-    }
-
-    /// Report whether the settings always pick the most likely token, which the GPU can do
-    /// itself.
-    pub(crate) fn is_greedy(&self) -> bool {
-        self.temperature <= 0.0 && !self.penalizes()
-    }
-
-    /// Report whether the repetition penalty changes any logit.
-    fn penalizes(&self) -> bool {
-        (self.repeat_penalty - 1.0).abs() > f32::EPSILON
-    }
+/// Report whether the repetition penalty of `settings` changes any logit.
+fn penalizes(settings: &Sampling) -> bool {
+    (settings.repeat_penalty - 1.0).abs() > f32::EPSILON
 }
 
 /// Chooses tokens from logits.
 pub(crate) struct Sampler {
-    settings: Settings,
+    settings: Sampling,
     rng: fastrand::Rng,
     /// Candidate token ids and their logits, then probabilities, reused across tokens.
     candidates: Vec<(u32, f32)>,
+    /// The distinct tokens the repetition penalty covers, reused across tokens.
+    penalized: Vec<u32>,
 }
 
 impl Sampler {
     /// Return a sampler with `settings` whose random draws start from `seed`.
-    pub(crate) fn new(settings: Settings, seed: u64) -> Self {
+    pub(crate) fn new(settings: Sampling, seed: u64) -> Self {
         Self {
             settings,
             rng: fastrand::Rng::with_seed(seed),
             candidates: Vec::new(),
+            penalized: Vec::new(),
         }
     }
 
-    /// Report whether the sampler always picks the most likely token.
+    /// Report whether the sampler always picks the most likely token, which the GPU can do
+    /// itself.
     pub(crate) fn is_greedy(&self) -> bool {
-        self.settings.is_greedy()
+        self.settings.temperature <= 0.0 && !penalizes(&self.settings)
     }
 
     /// Choose the next token from `logits`, which the penalty for the tokens in `recent` changes
     /// in place.
     pub(crate) fn sample(&mut self, logits: &mut [f32], recent: &[u32]) -> u32 {
         let settings = self.settings;
-        if settings.penalizes() {
-            let start = recent.len().saturating_sub(settings.repeat_last_n);
-            for &token in &recent[start..] {
+        if penalizes(&settings) {
+            // Each distinct recent token takes the penalty once, however often it repeats, as in
+            // llama.cpp and transformers.
+            let start = recent.len().saturating_sub(REPEAT_LAST_N);
+            self.penalized.clear();
+            self.penalized.extend_from_slice(&recent[start..]);
+            self.penalized.sort_unstable();
+            self.penalized.dedup();
+            for &token in &self.penalized {
                 if let Some(logit) = logits.get_mut(token as usize) {
                     *logit = if *logit > 0.0 {
                         *logit / settings.repeat_penalty
@@ -119,9 +75,10 @@ impl Sampler {
                 .map_or(0, |c| c.0);
         }
 
-        if settings.top_k > 0 && settings.top_k < candidates.len() {
-            candidates.select_nth_unstable_by(settings.top_k, by_logit);
-            candidates.truncate(settings.top_k);
+        let top_k = settings.top_k as usize;
+        if top_k > 0 && top_k < candidates.len() {
+            candidates.select_nth_unstable_by(top_k, by_logit);
+            candidates.truncate(top_k);
         }
         candidates.sort_unstable_by(by_logit);
 
@@ -175,14 +132,13 @@ fn softmax(candidates: &mut [(u32, f32)], temperature: f32) {
 mod tests {
     use super::*;
 
-    fn settings(temperature: f32) -> Settings {
-        Settings {
+    fn settings(temperature: f32) -> Sampling {
+        Sampling {
             temperature,
             top_k: 0,
             top_p: 1.0,
             min_p: 0.0,
             repeat_penalty: 1.0,
-            repeat_last_n: 64,
         }
     }
 
@@ -198,6 +154,8 @@ mod tests {
         penalized.repeat_penalty = 2.0;
         let mut sampler = Sampler::new(penalized, 1);
         assert_eq!(sampler.sample(&mut [0.1, 3.0, 2.0], &[1]), 2);
+        // A token that repeats takes the penalty once, so 3.0 falls to 1.5 and still leads.
+        assert_eq!(sampler.sample(&mut [0.1, 3.0, 1.0], &[1, 1]), 1);
     }
 
     #[test]

@@ -15,6 +15,6 @@ pub use error::Error;
 pub use gip_gguf::TensorType;
 #[cfg(target_os = "macos")]
 pub use gip_metal as metal;
-pub use lfm2::{Hyperparameters, Model, State, Trace};
+pub use lfm2::{Hyperparameters, Model, Sampling, State, Trace};
 #[cfg(target_os = "macos")]
 pub use lfm2_metal::Lfm2Metal;

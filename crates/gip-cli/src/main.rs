@@ -85,8 +85,8 @@ struct ModelOptions {
     sampling: SamplingOptions,
 }
 
-/// Overrides of the sampling settings the model file recommends. Settings the file leaves out
-/// take llama.cpp's defaults.
+/// Overrides of the sampling settings the model recommends, which come from the model file and
+/// then from the model's authors.
 #[derive(Debug, Args)]
 #[command(next_help_heading = "Sampling")]
 struct SamplingOptions {
@@ -95,7 +95,7 @@ struct SamplingOptions {
     temperature: Option<f32>,
     /// Keep only this many most likely tokens. Zero keeps every token.
     #[arg(long)]
-    top_k: Option<usize>,
+    top_k: Option<u32>,
     /// Keep the fewest tokens whose probabilities sum to this much.
     #[arg(long)]
     top_p: Option<f32>,
@@ -194,15 +194,14 @@ fn start<'a>(
     model: &'a gip::Model,
     tokenizer: &'a tokenizers::Tokenizer,
 ) -> Result<conversation::Conversation<'a>, Error> {
-    let recommended = sampler::Settings::recommended(model.gguf());
+    let recommended = model.recommended_sampling();
     let flags = &options.sampling;
-    let settings = sampler::Settings {
+    let settings = gip::Sampling {
         temperature: flags.temperature.unwrap_or(recommended.temperature),
         top_k: flags.top_k.unwrap_or(recommended.top_k),
         top_p: flags.top_p.unwrap_or(recommended.top_p),
         min_p: flags.min_p.unwrap_or(recommended.min_p),
         repeat_penalty: flags.repeat_penalty.unwrap_or(recommended.repeat_penalty),
-        repeat_last_n: recommended.repeat_last_n,
     };
     let seed = flags.seed.unwrap_or_else(|| fastrand::u64(..));
     let limits = conversation::Limits {
