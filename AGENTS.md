@@ -100,6 +100,7 @@ crates/
     tests/                 reference and kernel tests
   gip-cli/                 the gip command: respond, chat, pull, list, and rm
   gip-bench/               gip-bench, gip-matmul-bench, gpu-bw, and cpu-bw programs
+docs/                      design notes, starting at docs/README.md
 tools/                     Python reference dumps and benchmark scripts
 bench/                     baseline engine checkouts, gitignored
 models/                    downloaded GGUF files, gitignored
