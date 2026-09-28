@@ -16,6 +16,8 @@ use clap::{Parser, ValueEnum};
 /// holds.
 #[cfg(target_os = "macos")]
 const PROMPT_TOKEN: u32 = 1000;
+#[cfg(target_os = "macos")]
+const DECODE_CHUNK: usize = 8;
 
 /// The element type of the KV cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -42,6 +44,9 @@ struct Options {
     /// Break prefill and decode GPU time down by kernel.
     #[arg(short = 'P', long)]
     profile: bool,
+    /// Measure warmed greedy streaming latency with eight-token output chunks.
+    #[arg(long)]
+    latency: bool,
     /// KV cache type.
     #[arg(short, long, value_enum, default_value_t = KvType::F16)]
     kv: KvType,
@@ -73,6 +78,14 @@ fn run(options: &Options) -> Result<(), gip::Error> {
 
     use gip::metal::Metal;
     use gip::{Lfm2Metal, Model};
+
+    if options.latency
+        && options.generate <= u32::try_from(DECODE_CHUNK).expect("chunk size fits u32")
+    {
+        return Err(gip::Error::Argument(
+            "latency needs more than eight generated tokens",
+        ));
+    }
 
     let model = Model::load(&options.model)?;
     let mut metal = Metal::open()?;
@@ -142,7 +155,49 @@ fn run(options: &Options) -> Result<(), gip::Error> {
         gpu.metal().set_profiling(false);
         print_profile(gpu.metal(), "decode", options.generate);
     }
+    if options.latency {
+        let mut first = Vec::new();
+        let mut per_output = Vec::new();
+        let mut end_to_end = Vec::new();
+        let mut inter_chunk = Vec::new();
+        for rep in 0..=options.reps {
+            let mut gpu = Lfm2Metal::new(&model, &mut metal, n_ctx, kv_half)?;
+            let start = Instant::now();
+            gpu.prefill(&prompt, None, None)?;
+            let mut emissions = Vec::new();
+            for chunk in generated.chunks_mut(DECODE_CHUNK) {
+                gpu.generate(chunk)?;
+                emissions.push(start.elapsed().as_secs_f64() * 1e3);
+            }
+            if rep > 0 {
+                let ttft = emissions[0];
+                let total = *emissions.last().expect("generation has output chunks");
+                first.push(ttft);
+                end_to_end.push(total);
+                per_output.push((total - ttft) / f64::from(options.generate - 1));
+                inter_chunk.extend(emissions.windows(2).map(|pair| pair[1] - pair[0]));
+            }
+        }
+        println!(
+            "\nstreaming latency, warmed model, pre-tokenized prompt, greedy chunks of eight:"
+        );
+        print_milliseconds("TTFT", &first);
+        print_milliseconds("TPOT", &per_output);
+        print_milliseconds("end to end", &end_to_end);
+        print_milliseconds("inter-chunk", &inter_chunk);
+    }
     Ok(())
+}
+
+/// Print the mean and nearest-rank median and 95th percentile in milliseconds.
+#[cfg(target_os = "macos")]
+fn print_milliseconds(label: &str, values: &[f64]) {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let mean = sorted.iter().sum::<f64>() / sorted.len() as f64;
+    let p50 = sorted[sorted.len().div_ceil(2) - 1];
+    let p95 = sorted[(sorted.len() * 95).div_ceil(100) - 1];
+    println!("{label:<12} mean {mean:8.3} ms, p50 {p50:8.3} ms, p95 {p95:8.3} ms");
 }
 
 /// Print the mean and sample standard deviation of `rates` under `label`.

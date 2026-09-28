@@ -40,7 +40,8 @@ bench:
     @echo "gip $(git rev-parse --short HEAD), Metal"
     for model in {{gguf_models}}; do target/release/gip-bench "$model"; done
     @echo "llama.cpp $(git -C bench/llama.cpp rev-parse --short HEAD), Metal"
-    {{llama_bench_metal}} $(printf -- '-m %s ' {{gguf_models}}) -p 512 -n 128 -r 5 -o md
+    {{llama_bench_metal}} $(printf -- '-m %s ' {{gguf_models}}) -p 512 -n 0 -r 5 -o md
+    {{llama_bench_metal}} $(printf -- '-m %s ' {{gguf_models}}) -p 0 -n 128 -d 512 -r 5 -o md
     @cd tools && uv run python -c "import mlx.core, mlx_lm; print('mlx', mlx.core.__version__, 'mlx-lm', mlx_lm.__version__)"
     for model in {{mlx_models}}; do echo "$model"; (cd tools && uv run python -m mlx_lm.benchmark --model "../$model" -p 512 -g 128 -n 5); done
     @echo "mistral.rs $(git -C bench/mistral.rs rev-parse --short HEAD), Metal"
@@ -53,7 +54,13 @@ bench-cpu:
     cargo build --release --locked -p gip-bench
     target/release/cpu-bw
     @echo "llama.cpp $(git -C bench/llama.cpp rev-parse --short HEAD), CPU"
-    {{llama_bench_cpu}} $(printf -- '-m %s ' {{gguf_models}}) -t 1,4,8,10 -p 512 -n 128 -r 5 -o md
+    {{llama_bench_cpu}} $(printf -- '-m %s ' {{gguf_models}}) -t 1,4,8,10 -p 512 -n 0 -r 5 -o md
+    {{llama_bench_cpu}} $(printf -- '-m %s ' {{gguf_models}}) -t 1,4,8,10 -p 0 -n 128 -d 512 -r 5 -o md
+
+# Measure warmed engine latency for greedy streaming output.
+bench-latency model="models/LFM2.5-2.6B-Q4_K_M.gguf":
+    cargo build --release --locked -p gip-bench
+    target/release/gip-bench --latency --reps 20 {{model}}
 
 # Remove the build output.
 clean:
