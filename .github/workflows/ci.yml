@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# CI runs `just check`, the same gate contributors run locally. Change
+# the checks in the justfile, not here.
+
+jobs:
+  check:
+    name: Check
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install the check tools
+        run: |
+          brew install just clang-format
+          cargo install --locked cargo-sort
+      # The tests that need a model file or a Metal device print `skip:`
+      # and pass when the runner lacks them.
+      - name: Check
+        run: just check

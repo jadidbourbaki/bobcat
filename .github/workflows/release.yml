@@ -1,0 +1,32 @@
+name: Release
+
+# Pushing a tag such as v0.1.0 builds gip for Apple silicon and
+# publishes it as a GitHub release, which install.sh downloads.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Release
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build
+        run: cargo build --release --locked -p gip-cli
+      - name: Package
+        run: |
+          asset=gip-aarch64-apple-darwin.tar.gz
+          tar -czf "$asset" -C target/release gip
+          shasum -a 256 "$asset" > "$asset.sha256"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --generate-notes \
+            gip-aarch64-apple-darwin.tar.gz \
+            gip-aarch64-apple-darwin.tar.gz.sha256
