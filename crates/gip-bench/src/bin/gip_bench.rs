@@ -44,7 +44,7 @@ struct Options {
     /// Break prefill and decode GPU time down by kernel.
     #[arg(short = 'P', long)]
     profile: bool,
-    /// Measure warmed greedy streaming latency with eight-token output chunks.
+    /// Measure warmed greedy streaming latency, then emit in eight-token chunks.
     #[arg(long)]
     latency: bool,
     /// KV cache type.
@@ -165,7 +165,10 @@ fn run(options: &Options) -> Result<(), gip::Error> {
             let start = Instant::now();
             gpu.prefill(&prompt, None, None)?;
             let mut emissions = Vec::new();
-            for chunk in generated.chunks_mut(DECODE_CHUNK) {
+            // A caller can observe the first token only after the first generate call returns.
+            gpu.generate(&mut generated[..1])?;
+            emissions.push(start.elapsed().as_secs_f64() * 1e3);
+            for chunk in generated[1..].chunks_mut(DECODE_CHUNK) {
                 gpu.generate(chunk)?;
                 emissions.push(start.elapsed().as_secs_f64() * 1e3);
             }
@@ -179,7 +182,7 @@ fn run(options: &Options) -> Result<(), gip::Error> {
             }
         }
         println!(
-            "\nstreaming latency, warmed model, pre-tokenized prompt, greedy chunks of eight:"
+            "\nstreaming latency, warmed model, pre-tokenized prompt, first token then greedy chunks of up to eight:"
         );
         print_milliseconds("TTFT", &first);
         print_milliseconds("TPOT", &per_output);
