@@ -196,10 +196,6 @@ matvec_q (device const uchar *weights [[buffer (0)]],
 
 template [[host_name ("matvec_q4_0")]] kernel decltype (matvec_q<q4_0_format>)
     matvec_q<q4_0_format>;
-template [[host_name ("matvec_q4k")]] kernel decltype (matvec_q<q4k_format>)
-    matvec_q<q4k_format>;
-template [[host_name ("matvec_q6k")]] kernel decltype (matvec_q<q6k_format>)
-    matvec_q<q6k_format>;
 
 /* Multiply the matrices GATE and UP of format F, which each have N_ROWS
    rows of N_COLS weights, by the N_COLS floats at X, and store SiLU of
@@ -277,12 +273,319 @@ matvec_q_swiglu (device const uchar *gate [[buffer (0)]],
 template [[host_name (
     "matvec_q4_0_swiglu")]] kernel decltype (matvec_q_swiglu<q4_0_format>)
     matvec_q_swiglu<q4_0_format>;
+
+/* The K-quant matrix-vector kernels follow llama.cpp's
+   kernel_mul_mv_q4_K_f32 and kernel_mul_mv_q6_K_f32.  Each simdgroup
+   computes K_ROWS_PER_SIMDGROUP whole rows, so its lanes read every
+   input exactly once and a simd_sum finishes each row with no
+   threadgroup reduction.  A lane covers a fixed set of weights in each
+   super-block it visits, unpacks the super-block's group scales once,
+   and folds each group's scale in after summing the group's quants.
+
+   The format structs below hold one lane's preloaded inputs and its
+   partial dot product for one super-block.  */
+
+/* Each lane's input loads serve every row of its simdgroup, and with
+   the norm fused a lane loads 64 floats per super-block.  Four rows
+   spread those loads over enough weights to keep the kernel near the
+   memory bound.  backend.rs gives the measurements, and its
+   K_QUANT_ROWS_PER_SIMDGROUP must match.  */
+enum
+{
+  K_ROWS_PER_SIMDGROUP = 4
+};
+
+/* Q4_K lanes: lane L covers super-blocks L / 8, L / 8 + 4, and so on.
+   Within a super-block it covers the 8 weights at 64 IQ + 8 IR, the 8
+   at 32 past those, and the two sets 128 further, where IQ is
+   (L % 8) / 4 and IR is L % 4.  */
+struct q4k_lanes
+{
+  static constant constexpr uint blocks_per_pass = 4;
+  static constant constexpr uint block_bytes = 144;
+
+  struct inputs
+  {
+    float low[16];
+    float high[16];
+    /* The sums of the inputs of each of the lane's four groups, which
+       multiply the groups' minimums.  */
+    float4 sums;
+  };
+
+  static uint
+  first_block (uint lane)
+  {
+    return lane / 8;
+  }
+
+  /* Load the lane's 32 inputs of super-block BLOCK from X.  With
+     fuse_norm, add their squares to SUM_SQUARES and scale each by its
+     entry of NORM_WEIGHT.  */
+  static void
+  load (device const float *x, device const float *norm_weight, uint block,
+        uint lane, thread inputs &in, thread float &sum_squares)
+  {
+    uint iq = (lane % 8) / 4;
+    uint ir = lane % 4;
+    uint base = block * 256 + 64 * iq + 8 * ir;
+    in.sums = 0.0f;
+    for (uint i = 0; i < 8; i++)
+      {
+        uint at[4]
+            = { base + i, base + i + 32, base + i + 128, base + i + 160 };
+        float4 v = float4 (x[at[0]], x[at[1]], x[at[2]], x[at[3]]);
+        if (fuse_norm)
+          {
+            sum_squares += dot (v, v);
+            v *= float4 (norm_weight[at[0]], norm_weight[at[1]],
+                         norm_weight[at[2]], norm_weight[at[3]]);
+          }
+        in.low[i] = v[0];
+        in.low[i + 8] = v[1];
+        in.high[i] = v[2];
+        in.high[i + 8] = v[3];
+        in.sums += v;
+      }
+  }
+
+  /* Return the lane's part of the dot product of super-block BLOCK of
+     ROW with its loaded inputs IN.  Each 16-bit load holds two quant
+     bytes.  The masks keep one nibble in place, and the scale factors
+     1/256 and 1/16 undo its position.  */
+  static float
+  dot_part (device const uchar *row, uint block, uint lane,
+            thread const inputs &in)
+  {
+    uint iq = (lane % 8) / 4;
+    uint ir = lane % 4;
+    device const uchar *b = row + block * block_bytes;
+    float d = float (*(device const half *)b);
+    float dmin = float (*(device const half *)(b + 2));
+    device const ushort *sc = (device const ushort *)(b + 4) + iq;
+    device const ushort *q1
+        = (device const ushort *)(b + 16) + 16 * iq + 4 * ir;
+    device const ushort *q2 = q1 + 32;
+
+    /* Unpack the 6-bit scales and minimums of the lane's four groups:
+       bytes 0, 1, 4, and 5 hold scales and bytes 2, 3, 6, and 7 hold
+       minimums.  */
+    ushort packed[4];
+    packed[0] = sc[0] & 0x3f3f;
+    packed[1] = sc[2] & 0x3f3f;
+    packed[2] = ((sc[4] >> 0) & 0x0f0f) | ((sc[0] & 0xc0c0) >> 2);
+    packed[3] = ((sc[4] >> 4) & 0x0f0f) | ((sc[2] & 0xc0c0) >> 2);
+    thread const uchar *s = (thread const uchar *)packed;
+
+    float4 acc1 = 0.0f;
+    float4 acc2 = 0.0f;
+    for (uint i = 0; i < 4; i++)
+      {
+        acc1[0] += in.low[2 * i + 0] * float (q1[i] & 0x000f);
+        acc1[1] += in.low[2 * i + 1] * float (q1[i] & 0x0f00);
+        acc1[2] += in.low[2 * i + 8] * float (q1[i] & 0x00f0);
+        acc1[3] += in.low[2 * i + 9] * float (q1[i] & 0xf000);
+        acc2[0] += in.high[2 * i + 0] * float (q2[i] & 0x000f);
+        acc2[1] += in.high[2 * i + 1] * float (q2[i] & 0x0f00);
+        acc2[2] += in.high[2 * i + 8] * float (q2[i] & 0x00f0);
+        acc2[3] += in.high[2 * i + 9] * float (q2[i] & 0xf000);
+      }
+    return d
+               * ((acc1[0] + acc1[1] / 256.0f) * float (s[0])
+                  + (acc1[2] + acc1[3] / 256.0f) * float (s[1]) / 16.0f
+                  + (acc2[0] + acc2[1] / 256.0f) * float (s[4])
+                  + (acc2[2] + acc2[3] / 256.0f) * float (s[5]) / 16.0f)
+           - dmin
+                 * (in.sums[0] * float (s[2]) + in.sums[1] * float (s[3])
+                    + in.sums[2] * float (s[6]) + in.sums[3] * float (s[7]));
+  }
+};
+
+/* Q6_K lanes: lane L covers super-blocks L % 2, L % 2 + 2, and so on.
+   Within a super-block it covers 4 weights in each quarter of one
+   128-weight half: the half IP is (L / 2) / 8, and the weights start at
+   L0 = 4 ((L / 2) % 8) within each quarter.  */
+struct q6k_lanes
+{
+  static constant constexpr uint blocks_per_pass = 2;
+  static constant constexpr uint block_bytes = 210;
+
+  struct inputs
+  {
+    float values[16];
+  };
+
+  static uint
+  first_block (uint lane)
+  {
+    return lane % 2;
+  }
+
+  static void
+  load (device const float *x, device const float *norm_weight, uint block,
+        uint lane, thread inputs &in, thread float &sum_squares)
+  {
+    uint ip = (lane / 2) / 8;
+    uint l0 = 4 * ((lane / 2) % 8);
+    uint base = block * 256 + 128 * ip + l0;
+    for (uint l = 0; l < 4; l++)
+      {
+        uint at[4] = { base + l, base + l + 32, base + l + 64, base + l + 96 };
+        float4 v = float4 (x[at[0]], x[at[1]], x[at[2]], x[at[3]]);
+        if (fuse_norm)
+          {
+            sum_squares += dot (v, v);
+            v *= float4 (norm_weight[at[0]], norm_weight[at[1]],
+                         norm_weight[at[2]], norm_weight[at[3]]);
+          }
+        for (uint q = 0; q < 4; q++)
+          in.values[4 * l + q] = v[q];
+      }
+  }
+
+  static float
+  dot_part (device const uchar *row, uint block, uint lane,
+            thread const inputs &in)
+  {
+    uint ip = (lane / 2) / 8;
+    uint l0 = 4 * ((lane / 2) % 8);
+    device const uchar *b = row + block * block_bytes;
+    device const uchar *q1 = b + 64 * ip + l0;
+    device const uchar *q2 = q1 + 32;
+    device const uchar *qh = b + 128 + 32 * ip + l0;
+    device const char *sc = (device const char *)(b + 192) + 8 * ip + l0 / 16;
+    float d = float (*(device const half *)(b + 208));
+
+    float4 sums = 0.0f;
+    for (uint l = 0; l < 4; l++)
+      {
+        sums[0] += in.values[4 * l + 0]
+                   * float (int ((q1[l] & 0xf) | ((qh[l] & 0x03) << 4)) - 32);
+        sums[1] += in.values[4 * l + 1]
+                   * float (int ((q2[l] & 0xf) | ((qh[l] & 0x0c) << 2)) - 32);
+        sums[2] += in.values[4 * l + 2]
+                   * float (int ((q1[l] >> 4) | ((qh[l] & 0x30) << 0)) - 32);
+        sums[3] += in.values[4 * l + 3]
+                   * float (int ((q2[l] >> 4) | ((qh[l] & 0xc0) >> 2)) - 32);
+      }
+    return d
+           * (sums[0] * float (sc[0]) + sums[1] * float (sc[2])
+              + sums[2] * float (sc[4]) + sums[3] * float (sc[6]));
+  }
+};
+
+/* Multiply the matrix WEIGHTS of K-quant format K, which has N_ROWS rows
+   of N_COLS weights, by the N_COLS floats at X and store the N_ROWS
+   results at Y, with the function constants of matvec_q8_0.  */
+template <typename K>
+kernel void
+matvec_k (device const uchar *weights [[buffer (0)]],
+          device const float *x [[buffer (1)]], device float *y [[buffer (2)]],
+          constant uint &n_rows [[buffer (3)]],
+          constant uint &n_cols [[buffer (4)]],
+          device const float *norm_weight
+          [[buffer (5), function_constant (fuse_norm)]],
+          constant float &eps [[buffer (6), function_constant (fuse_norm)]],
+          uint threadgroup_index [[threadgroup_position_in_grid]],
+          uint simdgroup_index [[simdgroup_index_in_threadgroup]],
+          uint simdgroups [[simdgroups_per_threadgroup]],
+          uint lane [[thread_index_in_simdgroup]])
+{
+  uint first_row = (threadgroup_index * simdgroups + simdgroup_index)
+                   * K_ROWS_PER_SIMDGROUP;
+  uint n_blocks = n_cols / 256;
+  ulong row_bytes = ulong (n_blocks) * K::block_bytes;
+  float sums[K_ROWS_PER_SIMDGROUP] = { 0.0f };
+  float sum_squares = 0.0f;
+
+  for (uint block = K::first_block (lane); block < n_blocks;
+       block += K::blocks_per_pass)
+    {
+      typename K::inputs in;
+      K::load (x, norm_weight, block, lane, in, sum_squares);
+      for (uint r = 0; r < K_ROWS_PER_SIMDGROUP; r++)
+        if (first_row + r < n_rows)
+          sums[r] += K::dot_part (weights + (first_row + r) * row_bytes, block,
+                                  lane, in);
+    }
+
+  float scale = 1.0f;
+  if (fuse_norm)
+    scale = precise::rsqrt (simd_sum (sum_squares) / float (n_cols) + eps);
+  for (uint r = 0; r < K_ROWS_PER_SIMDGROUP; r++)
+    {
+      uint row = first_row + r;
+      float total = simd_sum (sums[r]) * scale;
+      if (lane == 0 && row < n_rows)
+        y[row] = accumulate ? y[row] + total : total;
+    }
+}
+
 template [[host_name (
-    "matvec_q4k_swiglu")]] kernel decltype (matvec_q_swiglu<q4k_format>)
-    matvec_q_swiglu<q4k_format>;
+    "matvec_q4k")]] kernel decltype (matvec_k<q4k_lanes>) matvec_k<q4k_lanes>;
 template [[host_name (
-    "matvec_q6k_swiglu")]] kernel decltype (matvec_q_swiglu<q6k_format>)
-    matvec_q_swiglu<q6k_format>;
+    "matvec_q6k")]] kernel decltype (matvec_k<q6k_lanes>) matvec_k<q6k_lanes>;
+
+/* The SwiGLU pair of matvec_k, as matvec_q8_0_swiglu is of
+   matvec_q8_0.  */
+template <typename K>
+kernel void
+matvec_k_swiglu (device const uchar *gate [[buffer (0)]],
+                 device const uchar *up [[buffer (1)]],
+                 device const float *x [[buffer (2)]],
+                 device float *y [[buffer (3)]],
+                 constant uint &n_rows [[buffer (4)]],
+                 constant uint &n_cols [[buffer (5)]],
+                 device const float *norm_weight
+                 [[buffer (6), function_constant (fuse_norm)]],
+                 constant float &eps
+                 [[buffer (7), function_constant (fuse_norm)]],
+                 uint threadgroup_index [[threadgroup_position_in_grid]],
+                 uint simdgroup_index [[simdgroup_index_in_threadgroup]],
+                 uint simdgroups [[simdgroups_per_threadgroup]],
+                 uint lane [[thread_index_in_simdgroup]])
+{
+  uint first_row = (threadgroup_index * simdgroups + simdgroup_index)
+                   * K_ROWS_PER_SIMDGROUP;
+  uint n_blocks = n_cols / 256;
+  ulong row_bytes = ulong (n_blocks) * K::block_bytes;
+  float gate_sums[K_ROWS_PER_SIMDGROUP] = { 0.0f };
+  float up_sums[K_ROWS_PER_SIMDGROUP] = { 0.0f };
+  float sum_squares = 0.0f;
+
+  for (uint block = K::first_block (lane); block < n_blocks;
+       block += K::blocks_per_pass)
+    {
+      typename K::inputs in;
+      K::load (x, norm_weight, block, lane, in, sum_squares);
+      for (uint r = 0; r < K_ROWS_PER_SIMDGROUP; r++)
+        if (first_row + r < n_rows)
+          {
+            ulong offset = (first_row + r) * row_bytes;
+            gate_sums[r] += K::dot_part (gate + offset, block, lane, in);
+            up_sums[r] += K::dot_part (up + offset, block, lane, in);
+          }
+    }
+
+  float scale = 1.0f;
+  if (fuse_norm)
+    scale = precise::rsqrt (simd_sum (sum_squares) / float (n_cols) + eps);
+  for (uint r = 0; r < K_ROWS_PER_SIMDGROUP; r++)
+    {
+      uint row = first_row + r;
+      float g = simd_sum (gate_sums[r]) * scale;
+      float u = simd_sum (up_sums[r]) * scale;
+      if (lane == 0 && row < n_rows)
+        y[row] = g / (1.0f + precise::exp (-g)) * u;
+    }
+}
+
+template [[host_name (
+    "matvec_q4k_swiglu")]] kernel decltype (matvec_k_swiglu<q4k_lanes>)
+    matvec_k_swiglu<q4k_lanes>;
+template [[host_name (
+    "matvec_q6k_swiglu")]] kernel decltype (matvec_k_swiglu<q6k_lanes>)
+    matvec_k_swiglu<q6k_lanes>;
 
 /* Multiply the matrix WEIGHTS of format F, which has N_ROWS rows of
    N_COLS weights, by each of the N_TOKENS rows of N_COLS floats at X,

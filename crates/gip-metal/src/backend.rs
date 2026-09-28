@@ -45,6 +45,14 @@ const MATVEC_Q8_0_NARROW_SIMDGROUPS: usize = 2;
 const MATVEC_Q8_0_WIDE_SIMDGROUPS: usize = 4;
 const MATVEC_Q8_0_WIDE_COLS: u32 = 2048;
 
+/// The K-quant matrix-vector kernels run two simdgroups of four rows each. On an M4 Pro, four rows
+/// per simdgroup in place of llama.cpp's two lifted LFM2.5-2.6B Q4_K_M decode from 106 to 116
+/// tokens per second and left LFM2.5-350M at 598. Eight rows fell to 114 and 538. Four
+/// simdgroups measured within noise of two. `K_QUANT_ROWS_PER_SIMDGROUP` must match
+/// `K_ROWS_PER_SIMDGROUP` in `kernels_q4.metal`.
+const K_QUANT_SIMDGROUPS: u32 = 2;
+const K_QUANT_ROWS_PER_SIMDGROUP: u32 = 4;
+
 /// Threads per threadgroup for the reduction and elementwise kernels.
 const REDUCE_THREADS: usize = 256;
 const ELEMENTWISE_THREADS: usize = 256;
@@ -951,7 +959,7 @@ impl Metal {
                 accumulate: options.accumulate,
             },
             args: &args,
-            dispatch: matvec_dispatch(n_rows, n_cols),
+            dispatch: matvec_dispatch(format, n_rows, n_cols),
             n_rows,
             n_cols,
             weight_bytes: to_u64(matrix_bytes),
@@ -988,7 +996,7 @@ impl Metal {
         self.launch(&Launch {
             kernel: Kernel::MatvecSwiglu(format),
             args: &args,
-            dispatch: matvec_dispatch(n_rows, n_cols),
+            dispatch: matvec_dispatch(format, n_rows, n_cols),
             n_rows,
             n_cols,
             weight_bytes: to_u64(matrix_bytes).saturating_mul(2),
@@ -1482,9 +1490,19 @@ fn bind_value<T: Copy>(
     unsafe { encoder.setBytes_length_atIndex(NonNull::from(value).cast(), size_of::<T>(), index) };
 }
 
-/// Return the dispatch of a matrix-vector launch over `n_rows` rows of `n_cols` columns. Wider
-/// rows get more simdgroups to split them.
-fn matvec_dispatch(n_rows: u32, n_cols: u32) -> Dispatch {
+/// Return the dispatch of a matrix-vector launch over `n_rows` rows of `n_cols` weights of
+/// `format`.
+///
+/// The Q8_0 and Q4_0 kernels split the columns of each threadgroup's rows among its simdgroups,
+/// and wider rows get more simdgroups. The K-quant kernels give each simdgroup whole rows.
+fn matvec_dispatch(format: Format, n_rows: u32, n_cols: u32) -> Dispatch {
+    if matches!(format, Format::Q4K | Format::Q6K) {
+        let rows_per_threadgroup = K_QUANT_SIMDGROUPS * K_QUANT_ROWS_PER_SIMDGROUP;
+        return Dispatch::Threadgroups(
+            [to_usize(n_rows.div_ceil(rows_per_threadgroup)), 1, 1],
+            [SIMD_WIDTH * to_usize(K_QUANT_SIMDGROUPS), 1, 1],
+        );
+    }
     let threadgroups = n_rows.div_ceil(MATVEC_Q8_0_ROWS_PER_THREADGROUP);
     let simdgroups = if n_cols >= MATVEC_Q8_0_WIDE_COLS {
         MATVEC_Q8_0_WIDE_SIMDGROUPS
