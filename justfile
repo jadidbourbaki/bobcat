@@ -4,7 +4,7 @@ mistralrs := "bench/mistral.rs/target/release/mistralrs"
 candle_lfm2 := "bench/candle/target/release/examples/quantized-lfm2"
 gguf_models := "models/LFM2.5-350M-Q8_0.gguf models/LFM2.5-1.2B-Instruct-Q8_0.gguf models/LFM2.5-2.6B-Q8_0.gguf"
 mlx_models := "models/LFM2.5-350M-MLX-8bit models/LFM2.5-1.2B-Instruct-MLX-8bit models/LFM2.5-2.6B-MLX-8bit"
-kernels := "crates/gip-metal/src/kernels.metal"
+kernels := "crates/gip-metal/src/kernels.metal crates/gip-metal/src/kernels_q4.metal"
 
 # List the recipes.
 default:

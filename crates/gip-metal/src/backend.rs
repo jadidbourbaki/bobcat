@@ -27,8 +27,12 @@ use objc2_metal::{
     MTLFunctionConstantValues, MTLLibrary, MTLMathMode, MTLResourceOptions, MTLSize,
 };
 
-/// The kernel source, embedded at build time.
-const SOURCE: &str = include_str!("kernels.metal");
+/// The kernel source, embedded at build time. `kernels_q4.metal` uses the helpers that
+/// `kernels.metal` defines, so it comes second.
+const SOURCE: &str = concat!(
+    include_str!("kernels.metal"),
+    include_str!("kernels_q4.metal")
+);
 
 const SIMD_WIDTH: usize = 32;
 
@@ -58,8 +62,6 @@ const ARGMAX_THREADS: usize = 1024;
 
 const FLOAT_BYTES: usize = 4;
 const HALF_BYTES: usize = 2;
-const Q8_0_BLOCK_ELEMENTS: usize = 32;
-const Q8_0_BLOCK_BYTES: usize = 34;
 
 /// Identifies each [`Metal`] so launches can reject buffers from another backend.
 static NEXT_BACKEND_ID: AtomicU64 = AtomicU64::new(1);
@@ -230,22 +232,93 @@ mod sealed {
     impl Sealed for f32 {}
 }
 
+/// A weight format the matrix and embedding kernels read. The block layouts match ggml's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    /// Blocks of 32 weights: an fp16 scale and 32 int8 quants.
+    Q8_0,
+    /// Blocks of 32 weights: an fp16 scale and 32 4-bit quants.
+    Q4_0,
+    /// Super-blocks of 256 weights with 4-bit quants and 6-bit group scales and minimums.
+    Q4K,
+    /// Super-blocks of 256 weights with 6-bit quants and int8 group scales.
+    Q6K,
+}
+
+impl Format {
+    const ALL: [Self; 4] = [Self::Q8_0, Self::Q4_0, Self::Q4K, Self::Q6K];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Q8_0 => 0,
+            Self::Q4_0 => 1,
+            Self::Q4K => 2,
+            Self::Q6K => 3,
+        }
+    }
+
+    /// Return the weights and bytes of one block.
+    fn block(self) -> (usize, usize) {
+        match self {
+            Self::Q8_0 => (32, 34),
+            Self::Q4_0 => (32, 18),
+            Self::Q4K => (256, 144),
+            Self::Q6K => (256, 210),
+        }
+    }
+
+    /// Return the bytes of a matrix of `n_rows` rows of `n_cols` weights.
+    fn matrix_bytes(self, n_rows: usize, n_cols: usize) -> usize {
+        let (weights, bytes) = self.block();
+        product(&[n_rows, n_cols / weights, bytes])
+    }
+
+    /// Return the kernel names of the format: the matrix-vector product, its SwiGLU pair, the
+    /// matrix-matrix product, and the embedding lookup.
+    fn kernel_names(self) -> [&'static str; 4] {
+        match self {
+            Self::Q8_0 => [
+                "matvec_q8_0",
+                "matvec_q8_0_swiglu",
+                "matmul_q8_0",
+                "embed_q8_0",
+            ],
+            Self::Q4_0 => [
+                "matvec_q4_0",
+                "matvec_q4_0_swiglu",
+                "matmul_q4_0",
+                "embed_q4_0",
+            ],
+            Self::Q4K => ["matvec_q4k", "matvec_q4k_swiglu", "matmul_q4k", "embed_q4k"],
+            Self::Q6K => ["matvec_q6k", "matvec_q6k_swiglu", "matmul_q6k", "embed_q6k"],
+        }
+    }
+}
+
 /// The kernels and their specializations.
 #[derive(Debug, Clone, Copy)]
 enum Kernel {
-    MatvecQ8_0 { norm: bool, accumulate: bool },
-    MatvecQ8_0Swiglu,
+    Matvec {
+        format: Format,
+        norm: bool,
+        accumulate: bool,
+    },
+    MatvecSwiglu(Format),
     RmsNorm,
-    NormRope { half: bool },
+    NormRope {
+        half: bool,
+    },
     ConvertHalf,
-    AttentionChunk { half: bool },
+    AttentionChunk {
+        half: bool,
+    },
     AttentionCombine,
     ShortConv,
     ShortConvBatch,
     ShortConvHistory,
-    MatmulQ8_0(Store),
+    Matmul(Format, Store),
     Copy,
-    EmbedQ8_0,
+    Embed(Format),
     Argmax,
 }
 
@@ -253,8 +326,8 @@ impl Kernel {
     /// Return the name the profile shows for the kernel.
     fn name(self) -> &'static str {
         match self {
-            Self::MatvecQ8_0 { .. } => "matvec_q8_0",
-            Self::MatvecQ8_0Swiglu => "matvec_q8_0_swiglu",
+            Self::Matvec { format, .. } => format.kernel_names()[0],
+            Self::MatvecSwiglu(format) => format.kernel_names()[1],
             Self::RmsNorm => "rms_norm",
             Self::NormRope { .. } => "norm_rope",
             Self::ConvertHalf => "convert_half",
@@ -263,11 +336,13 @@ impl Kernel {
             Self::ShortConv => "short_conv",
             Self::ShortConvBatch => "short_conv_batch",
             Self::ShortConvHistory => "short_conv_history",
-            Self::MatmulQ8_0(Store::Overwrite) => "matmul_q8_0",
-            Self::MatmulQ8_0(Store::Accumulate) => "matmul_q8_0_accumulate",
-            Self::MatmulQ8_0(Store::Swiglu) => "matmul_q8_0_swiglu",
+            Self::Matmul(Format::Q8_0, Store::Accumulate) => "matmul_q8_0_accumulate",
+            Self::Matmul(Format::Q8_0, Store::Swiglu) => "matmul_q8_0_swiglu",
+            Self::Matmul(format, Store::Overwrite | Store::Accumulate | Store::Swiglu) => {
+                format.kernel_names()[2]
+            }
             Self::Copy => "copy",
-            Self::EmbedQ8_0 => "embed_q8_0",
+            Self::Embed(format) => format.kernel_names()[3],
             Self::Argmax => "argmax",
         }
     }
@@ -282,12 +357,69 @@ struct Constants {
     swiglu_store: bool,
 }
 
+/// The pipelines of the kernels that read one weight format.
+#[derive(Debug)]
+struct FormatPipelines {
+    /// Indexed by whether the launch fuses the norm and whether it accumulates.
+    matvec: [[Pipeline; 2]; 2],
+    matvec_swiglu: Pipeline,
+    /// Indexed by [`Store`].
+    matmul: [Pipeline; 3],
+    embed: Pipeline,
+}
+
+impl FormatPipelines {
+    fn new(
+        device: &ProtocolObject<dyn MTLDevice>,
+        library: &ProtocolObject<dyn MTLLibrary>,
+        format: Format,
+    ) -> Result<Self, Error> {
+        let [matvec_name, swiglu_name, matmul_name, embed_name] = format.kernel_names();
+        let matvec = |fuse_norm, accumulate| {
+            let constants = Constants {
+                rows_per_threadgroup: MATVEC_Q8_0_ROWS_PER_THREADGROUP,
+                fuse_norm,
+                accumulate,
+                swiglu_store: false,
+            };
+            make_pipeline(device, library, matvec_name, Some(constants))
+        };
+        let matmul = |accumulate, swiglu_store| {
+            let constants = Constants {
+                rows_per_threadgroup: 0,
+                fuse_norm: false,
+                accumulate,
+                swiglu_store,
+            };
+            make_pipeline(device, library, matmul_name, Some(constants))
+        };
+        let swiglu = Constants {
+            rows_per_threadgroup: MATVEC_Q8_0_ROWS_PER_THREADGROUP,
+            fuse_norm: true,
+            accumulate: false,
+            swiglu_store: false,
+        };
+        Ok(Self {
+            matvec: [
+                [matvec(false, false)?, matvec(false, true)?],
+                [matvec(true, false)?, matvec(true, true)?],
+            ],
+            matvec_swiglu: make_pipeline(device, library, swiglu_name, Some(swiglu))?,
+            matmul: [
+                matmul(false, false)?,
+                matmul(true, false)?,
+                matmul(false, true)?,
+            ],
+            embed: make_pipeline(device, library, embed_name, None)?,
+        })
+    }
+}
+
 /// Every compute pipeline, created when the backend opens.
 #[derive(Debug)]
 struct Pipelines {
-    /// Indexed by whether the launch fuses the norm and whether it accumulates.
-    matvec_q8_0: [[Pipeline; 2]; 2],
-    matvec_q8_0_swiglu: Pipeline,
+    /// Indexed by [`Format::index`].
+    formats: Vec<FormatPipelines>,
     rms_norm: Pipeline,
     /// Indexed by whether the output is half precision.
     norm_rope: [Pipeline; 2],
@@ -298,10 +430,7 @@ struct Pipelines {
     short_conv: Pipeline,
     short_conv_batch: Pipeline,
     short_conv_history: Pipeline,
-    /// Indexed by [`Store`].
-    matmul_q8_0: [Pipeline; 3],
     copy: Pipeline,
-    embed_q8_0: Pipeline,
     argmax: Pipeline,
 }
 
@@ -311,37 +440,11 @@ impl Pipelines {
         library: &ProtocolObject<dyn MTLLibrary>,
     ) -> Result<Self, Error> {
         let plain = |name| make_pipeline(device, library, name, None);
-        let matvec = |fuse_norm, accumulate| {
-            let constants = Constants {
-                rows_per_threadgroup: MATVEC_Q8_0_ROWS_PER_THREADGROUP,
-                fuse_norm,
-                accumulate,
-                swiglu_store: false,
-            };
-            make_pipeline(device, library, "matvec_q8_0", Some(constants))
-        };
-        let matmul = |accumulate, swiglu_store| {
-            let constants = Constants {
-                rows_per_threadgroup: 0,
-                fuse_norm: false,
-                accumulate,
-                swiglu_store,
-            };
-            make_pipeline(device, library, "matmul_q8_0", Some(constants))
-        };
-        let swiglu = Constants {
-            rows_per_threadgroup: MATVEC_Q8_0_ROWS_PER_THREADGROUP,
-            fuse_norm: true,
-            accumulate: false,
-            swiglu_store: false,
-        };
-
         Ok(Self {
-            matvec_q8_0: [
-                [matvec(false, false)?, matvec(false, true)?],
-                [matvec(true, false)?, matvec(true, true)?],
-            ],
-            matvec_q8_0_swiglu: make_pipeline(device, library, "matvec_q8_0_swiglu", Some(swiglu))?,
+            formats: Format::ALL
+                .into_iter()
+                .map(|format| FormatPipelines::new(device, library, format))
+                .collect::<Result<_, _>>()?,
             rms_norm: plain("rms_norm")?,
             norm_rope: [plain("norm_rope_f32")?, plain("norm_rope_f16")?],
             convert_half: plain("convert_half")?,
@@ -350,23 +453,19 @@ impl Pipelines {
             short_conv: plain("short_conv")?,
             short_conv_batch: plain("short_conv_batch")?,
             short_conv_history: plain("short_conv_history")?,
-            matmul_q8_0: [
-                matmul(false, false)?,
-                matmul(true, false)?,
-                matmul(false, true)?,
-            ],
             copy: plain("copy_floats")?,
-            embed_q8_0: plain("embed_q8_0")?,
             argmax: plain("argmax")?,
         })
     }
 
     fn get(&self, kernel: Kernel) -> &ProtocolObject<dyn MTLComputePipelineState> {
         match kernel {
-            Kernel::MatvecQ8_0 { norm, accumulate } => {
-                &self.matvec_q8_0[usize::from(norm)][usize::from(accumulate)]
-            }
-            Kernel::MatvecQ8_0Swiglu => &self.matvec_q8_0_swiglu,
+            Kernel::Matvec {
+                format,
+                norm,
+                accumulate,
+            } => &self.formats[format.index()].matvec[usize::from(norm)][usize::from(accumulate)],
+            Kernel::MatvecSwiglu(format) => &self.formats[format.index()].matvec_swiglu,
             Kernel::RmsNorm => &self.rms_norm,
             Kernel::NormRope { half } => &self.norm_rope[usize::from(half)],
             Kernel::ConvertHalf => &self.convert_half,
@@ -375,11 +474,16 @@ impl Pipelines {
             Kernel::ShortConv => &self.short_conv,
             Kernel::ShortConvBatch => &self.short_conv_batch,
             Kernel::ShortConvHistory => &self.short_conv_history,
-            Kernel::MatmulQ8_0(Store::Overwrite) => &self.matmul_q8_0[0],
-            Kernel::MatmulQ8_0(Store::Accumulate) => &self.matmul_q8_0[1],
-            Kernel::MatmulQ8_0(Store::Swiglu) => &self.matmul_q8_0[2],
+            Kernel::Matmul(format, store) => {
+                let index = match store {
+                    Store::Overwrite => 0,
+                    Store::Accumulate => 1,
+                    Store::Swiglu => 2,
+                };
+                &self.formats[format.index()].matmul[index]
+            }
             Kernel::Copy => &self.copy,
-            Kernel::EmbedQ8_0 => &self.embed_q8_0,
+            Kernel::Embed(format) => &self.formats[format.index()].embed,
             Kernel::Argmax => &self.argmax,
         }
     }
@@ -814,10 +918,11 @@ impl Metal {
         entry.bytes += launch.weight_bytes;
     }
 
-    /// Record a multiply of the Q8_0 matrix at `weights`, which has `n_rows` rows of `n_cols`
-    /// elements, by the `n_cols` floats at `x`. The `n_rows` results go to `y`.
-    pub fn matvec_q8_0(
+    /// Record a multiply of the matrix at `weights`, which has `n_rows` rows of `n_cols` weights of
+    /// `format`, by the `n_cols` floats at `x`. The `n_rows` results go to `y`.
+    pub fn matvec(
         &mut self,
+        format: Format,
         weights: View<'_>,
         n_rows: u32,
         n_cols: u32,
@@ -827,8 +932,9 @@ impl Metal {
     ) -> Result<(), Error> {
         let rows = to_usize(n_rows);
         let cols = to_usize(n_cols);
+        let matrix_bytes = format.matrix_bytes(rows, cols);
         let mut args = vec![
-            buffer(weights, q8_0_bytes(rows, cols)),
+            buffer(weights, matrix_bytes),
             buffer(x, product(&[cols, FLOAT_BYTES])),
             buffer(y, product(&[rows, FLOAT_BYTES])),
             Arg::U32(n_rows),
@@ -839,7 +945,8 @@ impl Metal {
             args.push(Arg::F32(norm.eps));
         }
         self.launch(&Launch {
-            kernel: Kernel::MatvecQ8_0 {
+            kernel: Kernel::Matvec {
+                format,
                 norm: options.norm.is_some(),
                 accumulate: options.accumulate,
             },
@@ -847,15 +954,16 @@ impl Metal {
             dispatch: matvec_dispatch(n_rows, n_cols),
             n_rows,
             n_cols,
-            weight_bytes: to_u64(q8_0_bytes(rows, cols)),
+            weight_bytes: to_u64(matrix_bytes),
         })
     }
 
-    /// Record the multiply of the Q8_0 matrices at `gate` and `up`, which each have `n_rows` rows
-    /// of `n_cols` elements, by the `n_cols` floats at `x` after `norm`. `y` receives SiLU of each
-    /// gate result times the matching up result.
-    pub fn matvec_q8_0_swiglu(
+    /// Record the multiply of the matrices at `gate` and `up`, which each have `n_rows` rows of
+    /// `n_cols` weights of `format`, by the `n_cols` floats at `x` after `norm`. `y` receives SiLU
+    /// of each gate result times the matching up result.
+    pub fn matvec_swiglu(
         &mut self,
+        format: Format,
         gate: View<'_>,
         up: View<'_>,
         n_rows: u32,
@@ -866,9 +974,10 @@ impl Metal {
     ) -> Result<(), Error> {
         let rows = to_usize(n_rows);
         let cols = to_usize(n_cols);
+        let matrix_bytes = format.matrix_bytes(rows, cols);
         let args = [
-            buffer(gate, q8_0_bytes(rows, cols)),
-            buffer(up, q8_0_bytes(rows, cols)),
+            buffer(gate, matrix_bytes),
+            buffer(up, matrix_bytes),
             buffer(x, product(&[cols, FLOAT_BYTES])),
             buffer(y, product(&[rows, FLOAT_BYTES])),
             Arg::U32(n_rows),
@@ -877,12 +986,12 @@ impl Metal {
             Arg::F32(norm.eps),
         ];
         self.launch(&Launch {
-            kernel: Kernel::MatvecQ8_0Swiglu,
+            kernel: Kernel::MatvecSwiglu(format),
             args: &args,
             dispatch: matvec_dispatch(n_rows, n_cols),
             n_rows,
             n_cols,
-            weight_bytes: to_u64(q8_0_bytes(rows, cols)).saturating_mul(2),
+            weight_bytes: to_u64(matrix_bytes).saturating_mul(2),
         })
     }
 
@@ -1167,11 +1276,12 @@ impl Metal {
         })
     }
 
-    /// Record a multiply of the Q8_0 matrix at `weights`, which has `n_rows` rows of `n_cols`
-    /// elements, by each of the `n_tokens` rows of `n_cols` floats at `x`. Each token's `n_rows`
+    /// Record a multiply of the matrix at `weights`, which has `n_rows` rows of `n_cols` weights of
+    /// `format`, by each of the `n_tokens` rows of `n_cols` floats at `x`. Each token's `n_rows`
     /// results combine with its row of `y` as `store` says.
-    pub fn matmul_q8_0(
+    pub fn matmul(
         &mut self,
+        format: Format,
         weights: View<'_>,
         n_rows: u32,
         n_cols: u32,
@@ -1185,8 +1295,9 @@ impl Metal {
         let tokens = to_usize(n_tokens);
         let row_tiles = n_rows.div_ceil(MATMUL_ROWS);
         let token_tiles = n_tokens.div_ceil(MATMUL_TOKENS);
+        let matrix_bytes = format.matrix_bytes(rows, cols);
         let args = [
-            buffer(weights, q8_0_bytes(rows, cols)),
+            buffer(weights, matrix_bytes),
             buffer(x, product(&[tokens, cols, FLOAT_BYTES])),
             buffer(y, product(&[tokens, rows, FLOAT_BYTES])),
             Arg::U32(n_rows),
@@ -1194,7 +1305,7 @@ impl Metal {
             Arg::U32(n_tokens),
         ];
         self.launch(&Launch {
-            kernel: Kernel::MatmulQ8_0(store),
+            kernel: Kernel::Matmul(format, store),
             args: &args,
             dispatch: Dispatch::Threadgroups(
                 [to_usize(token_tiles), to_usize(row_tiles), 1],
@@ -1202,7 +1313,7 @@ impl Metal {
             ),
             n_rows,
             n_cols,
-            weight_bytes: to_u64(q8_0_bytes(rows, cols)).saturating_mul(u64::from(token_tiles)),
+            weight_bytes: to_u64(matrix_bytes).saturating_mul(u64::from(token_tiles)),
         })
     }
 
@@ -1220,13 +1331,14 @@ impl Metal {
         })
     }
 
-    /// Record a dequantization of the Q8_0 rows named by the `n_tokens` token ids at `tokens`
-    /// into `n_tokens` rows of `n_embd` floats at `out`.
+    /// Record a dequantization of the rows named by the `n_tokens` token ids at `tokens` into
+    /// `n_tokens` rows of `n_embd` floats at `out`.
     ///
-    /// `weights` holds `n_vocab` rows of `n_embd` elements. Every token id must be below
+    /// `weights` holds `n_vocab` rows of `n_embd` weights of `format`. Every token id must be below
     /// `n_vocab`.
-    pub fn embed_q8_0(
+    pub fn embed(
         &mut self,
+        format: Format,
         weights: View<'_>,
         n_vocab: u32,
         tokens: View<'_>,
@@ -1234,8 +1346,16 @@ impl Metal {
         n_embd: u32,
         n_tokens: u32,
     ) -> Result<(), Error> {
+        // The Q8_0 kernel dequantizes one weight per thread, and the others 8.
+        let per_thread = match format {
+            Format::Q8_0 => 1,
+            Format::Q4_0 | Format::Q4K | Format::Q6K => 8,
+        };
         let args = [
-            buffer(weights, q8_0_bytes(to_usize(n_vocab), to_usize(n_embd))),
+            buffer(
+                weights,
+                format.matrix_bytes(to_usize(n_vocab), to_usize(n_embd)),
+            ),
             buffer(tokens, product(&[to_usize(n_tokens), size_of::<u32>()])),
             buffer(
                 out,
@@ -1244,10 +1364,10 @@ impl Metal {
             Arg::U32(n_embd),
         ];
         self.launch(&Launch {
-            kernel: Kernel::EmbedQ8_0,
+            kernel: Kernel::Embed(format),
             args: &args,
             dispatch: Dispatch::Threads(
-                [to_usize(n_embd), to_usize(n_tokens), 1],
+                [to_usize(n_embd) / per_thread, to_usize(n_tokens), 1],
                 [ELEMENTWISE_THREADS, 1, 1],
             ),
             n_rows: 0,
@@ -1388,11 +1508,6 @@ fn size([width, height, depth]: [usize; 3]) -> MTLSize {
         height,
         depth,
     }
-}
-
-/// Return the bytes of a Q8_0 matrix of `n_rows` rows of `n_cols` elements.
-fn q8_0_bytes(n_rows: usize, n_cols: usize) -> usize {
-    product(&[n_rows, n_cols / Q8_0_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES])
 }
 
 /// Return the product of `factors`, or `usize::MAX` on overflow, which no buffer can hold.

@@ -50,19 +50,43 @@ fn q4_k_m_scalar() -> TestResult {
 #[cfg(target_os = "macos")]
 #[test]
 fn q8_0_metal() -> TestResult {
-    check_metal(true, false)
+    check_metal("LFM2.5-350M-Q8_0", true, false)
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn q4_0_metal() -> TestResult {
+    check_metal("LFM2.5-350M-Q4_0", true, false)
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn q4_0_metal_batch() -> TestResult {
+    check_metal("LFM2.5-350M-Q4_0", true, true)
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn q4_k_m_metal() -> TestResult {
+    check_metal("LFM2.5-350M-Q4_K_M", true, false)
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn q4_k_m_metal_batch() -> TestResult {
+    check_metal("LFM2.5-350M-Q4_K_M", true, true)
 }
 
 #[cfg(target_os = "macos")]
 #[test]
 fn q8_0_metal_f32_kv() -> TestResult {
-    check_metal(false, false)
+    check_metal("LFM2.5-350M-Q8_0", false, false)
 }
 
 #[cfg(target_os = "macos")]
 #[test]
 fn q8_0_metal_batch() -> TestResult {
-    check_metal(true, true)
+    check_metal("LFM2.5-350M-Q8_0", true, true)
 }
 
 /// Compare the scalar pass on the model in `model_file` against the dump in `ref_name`.
@@ -77,11 +101,12 @@ fn check_scalar(model_file: &str, ref_name: &str) -> TestResult {
     compare(&model, &reference, &mut pass, false, TOLERANCE)
 }
 
-/// Compare the Metal pass on LFM2.5-350M at Q8_0 against its dump. The KV cache holds half
-/// precision when `kv_half` is true. The prompt runs in one prefill call when `batched` is true.
+/// Compare the Metal pass on `models/NAME.gguf` against the dump in `models/ref/NAME`. The KV
+/// cache holds half precision when `kv_half` is true. The prompt runs in one prefill call when
+/// `batched` is true.
 #[cfg(target_os = "macos")]
-fn check_metal(kv_half: bool, batched: bool) -> TestResult {
-    let Some((model, reference)) = load("LFM2.5-350M-Q8_0.gguf", "LFM2.5-350M-Q8_0")? else {
+fn check_metal(name: &str, kv_half: bool, batched: bool) -> TestResult {
+    let Some((model, reference)) = load(&format!("{name}.gguf"), name)? else {
         return Ok(());
     };
     let mut metal = match gip::metal::Metal::open() {

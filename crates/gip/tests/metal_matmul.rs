@@ -5,7 +5,7 @@
 use std::error::Error;
 
 use gip::TensorType;
-use gip::metal::{Metal, Store};
+use gip::metal::{Format, Metal, Store};
 use gip::scalar;
 
 fn check_shape(
@@ -51,7 +51,8 @@ fn check_shape(
     metal.write(input_buffer.at(0), &input)?;
     metal.write(output_buffer.at(0), &prior)?;
     metal.begin()?;
-    metal.matmul_q8_0(
+    metal.matmul(
+        Format::Q8_0,
         weight_buffer.at(0),
         n_rows,
         n_cols,

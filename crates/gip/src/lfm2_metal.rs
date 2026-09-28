@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use gip_gguf::{Tensor, TensorType};
 use gip_metal::{
-    Buffer, MatvecOptions, Metal, Norm, Store, Ticket, View, attention_scratch_floats,
+    Buffer, Format, MatvecOptions, Metal, Norm, Store, Ticket, View, attention_scratch_floats,
 };
 
 use crate::error::Error;
@@ -91,8 +91,8 @@ pub struct Lfm2Metal<'a> {
 impl<'a> Lfm2Metal<'a> {
     /// Prepare to decode sequences of up to `n_ctx` tokens of `model` on `metal`.
     ///
-    /// Every matrix of `model` must be Q8_0. The KV cache holds half precision when `kv_half` is
-    /// true and floats otherwise.
+    /// Every matrix of `model` must be Q8_0, Q4_0, Q4_K, or Q6_K. The KV cache holds half precision
+    /// when `kv_half` is true and floats otherwise.
     pub fn new(
         model: &'a Model,
         metal: &'a mut Metal,
@@ -460,10 +460,21 @@ impl<'a> Lfm2Metal<'a> {
 /// Check that the Metal kernels can run `model`.
 fn check_supported(model: &Model) -> Result<(), Error> {
     let hp = model.hyperparameters();
-    let matrices_q8_0 =
-        model.layers.iter().all(layer_q8_0) && is_q8_0(&model.token_embd) && is_q8_0(&model.output);
-    if !matrices_q8_0 {
-        return Err(Error::MetalUnsupported("every matrix in Q8_0".to_owned()));
+    for matrix in [&model.token_embd, &model.output]
+        .into_iter()
+        .chain(model.layers.iter().flat_map(layer_matrices))
+    {
+        format(matrix)?;
+    }
+    // The fused SwiGLU launch reads the gate and up matrices with one kernel.
+    for layer in &model.layers {
+        if format(&layer.ffn_gate)? != format(&layer.ffn_up)? {
+            return Err(Error::MetalUnsupported(format!(
+                "gate and up matrices of one type, got {:?} and {:?}",
+                layer.ffn_gate.tensor.data_type(),
+                layer.ffn_up.tensor.data_type()
+            )));
+        }
     }
     let group = hp.n_heads / hp.n_kv_heads.max(1);
     if !hp.head_dim.is_multiple_of(SIMD_WIDTH)
@@ -485,21 +496,31 @@ fn check_supported(model: &Model) -> Result<(), Error> {
     Ok(())
 }
 
-fn is_q8_0(matrix: &Matrix) -> bool {
-    matrix.tensor.data_type() == TensorType::Q8_0
+/// Return the kernel format of `matrix`.
+fn format(matrix: &Matrix) -> Result<Format, Error> {
+    match matrix.tensor.data_type() {
+        TensorType::Q8_0 => Ok(Format::Q8_0),
+        TensorType::Q4_0 => Ok(Format::Q4_0),
+        TensorType::Q4K => Ok(Format::Q4K),
+        TensorType::Q6K => Ok(Format::Q6K),
+        other @ (TensorType::F32 | TensorType::F16 | TensorType::Bf16) => {
+            Err(Error::MetalUnsupported(format!(
+                "matrices in Q8_0, Q4_0, Q4_K, or Q6_K, got {other:?}"
+            )))
+        }
+    }
 }
 
-/// Report whether every matrix of `layer` is Q8_0.
-fn layer_q8_0(layer: &Layer) -> bool {
-    let mixer = match &layer.mixer {
+/// Return every matrix of `layer`.
+fn layer_matrices(layer: &Layer) -> Vec<&Matrix> {
+    let mut matrices = match &layer.mixer {
         Mixer::Attention(attention) => {
-            [&attention.q, &attention.k, &attention.v, &attention.output]
-                .into_iter()
-                .all(is_q8_0)
+            vec![&attention.q, &attention.k, &attention.v, &attention.output]
         }
-        Mixer::Conv(conv) => is_q8_0(&conv.in_proj) && is_q8_0(&conv.out_proj),
+        Mixer::Conv(conv) => vec![&conv.in_proj, &conv.out_proj],
     };
-    mixer && is_q8_0(&layer.ffn_gate) && is_q8_0(&layer.ffn_up) && is_q8_0(&layer.ffn_down)
+    matrices.extend([&layer.ffn_gate, &layer.ffn_up, &layer.ffn_down]);
+    matrices
 }
 
 /// Records the launches of forward passes.
@@ -532,8 +553,15 @@ impl<'r> Recorder<'r> {
         options: MatvecOptions<'_>,
     ) -> Result<(), Error> {
         let weights = self.buffers.weights(&matrix.tensor);
-        self.metal
-            .matvec_q8_0(weights, matrix.n_rows, matrix.n_cols, x, y, options)?;
+        self.metal.matvec(
+            format(matrix)?,
+            weights,
+            matrix.n_rows,
+            matrix.n_cols,
+            x,
+            y,
+            options,
+        )?;
         Ok(())
     }
 
@@ -548,8 +576,16 @@ impl<'r> Recorder<'r> {
         store: Store,
     ) -> Result<(), Error> {
         let weights = self.buffers.weights(&matrix.tensor);
-        self.metal
-            .matmul_q8_0(weights, matrix.n_rows, matrix.n_cols, x, y, n, store)?;
+        self.metal.matmul(
+            format(matrix)?,
+            weights,
+            matrix.n_rows,
+            matrix.n_cols,
+            x,
+            y,
+            n,
+            store,
+        )?;
         Ok(())
     }
 
@@ -713,7 +749,8 @@ impl<'r> Recorder<'r> {
         let h = b.hidden.floats(0);
         let ffn = b.ffn.floats(0);
 
-        self.metal.embed_q8_0(
+        self.metal.embed(
+            format(&model.token_embd)?,
             b.weights(&model.token_embd.tensor),
             hp.n_vocab,
             b.token(pos),
@@ -737,7 +774,8 @@ impl<'r> Recorder<'r> {
                 Mixer::Conv(conv) => self.conv(conv, layer.cache_index, &layer.attn_norm)?,
             }
 
-            self.metal.matvec_q8_0_swiglu(
+            self.metal.matvec_swiglu(
+                format(&layer.ffn_gate)?,
                 b.weights(&layer.ffn_gate.tensor),
                 b.weights(&layer.ffn_up.tensor),
                 layer.ffn_gate.n_rows,
@@ -880,7 +918,8 @@ impl<'r> Recorder<'r> {
         let normed = b.normed.floats(0);
         let ffn = b.ffn.floats(0);
 
-        self.metal.embed_q8_0(
+        self.metal.embed(
+            format(&model.token_embd)?,
             b.weights(&model.token_embd.tensor),
             hp.n_vocab,
             b.token(pos),

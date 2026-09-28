@@ -11,7 +11,7 @@ mod bandwidth;
 
 #[cfg(target_os = "macos")]
 pub use backend::{
-    Buffer, Element, Error, MatvecOptions, Metal, Norm, ProfileEntry, Store, Ticket, View,
+    Buffer, Element, Error, Format, MatvecOptions, Metal, Norm, ProfileEntry, Store, Ticket, View,
     attention_scratch_floats,
 };
 #[cfg(target_os = "macos")]
