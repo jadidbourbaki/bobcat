@@ -119,6 +119,20 @@ pub(crate) struct Layer {
     pub(crate) ffn_down: Matrix,
 }
 
+impl Layer {
+    /// Return the layer's matrices.
+    pub(crate) fn matrices(&self) -> Vec<&Matrix> {
+        let mut matrices = match &self.mixer {
+            Mixer::Attention(attention) => {
+                vec![&attention.q, &attention.k, &attention.v, &attention.output]
+            }
+            Mixer::Conv(conv) => vec![&conv.in_proj, &conv.out_proj],
+        };
+        matrices.extend([&self.ffn_gate, &self.ffn_up, &self.ffn_down]);
+        matrices
+    }
+}
+
 /// An LFM2 model loaded from a GGUF file.
 #[derive(Debug)]
 pub struct Model {
@@ -195,15 +209,26 @@ impl Model {
     /// Return the sampling settings for this model: the values the file stores under
     /// `general.sampling`, then the values Liquid AI's LFM2.5 model cards recommend.
     pub fn recommended_sampling(&self) -> Sampling {
-        // Liquid's cards give 1.1 as the penalty for LFM2.5-2.6B and 1.05 for the smaller
-        // models, and leave top-p and min-p off.
+        // Liquid's cards give 1.1 as the penalty for LFM2.5-2.6B and 1.05 for LFM2.5-1.2B and
+        // LFM2.5-350M, and leave top-p and min-p off. The files name their models
+        // inconsistently, so the weight count tells the 2.6B model from the smaller ones.
+        let n_weights: u64 = self
+            .layers
+            .iter()
+            .flat_map(Layer::matrices)
+            .chain([&self.token_embd])
+            .map(|matrix| u64::from(matrix.n_rows) * u64::from(matrix.n_cols))
+            .sum();
+        let repeat_penalty = if n_weights > 2_000_000_000 { 1.1 } else { 1.05 };
         let gguf = &self.gguf;
         Sampling {
             temperature: gguf.f32("general.sampling.temp").unwrap_or(0.1),
             top_k: gguf.u32("general.sampling.top_k").unwrap_or(50),
             top_p: gguf.f32("general.sampling.top_p").unwrap_or(1.0),
             min_p: gguf.f32("general.sampling.min_p").unwrap_or(0.0),
-            repeat_penalty: gguf.f32("general.sampling.penalty_repeat").unwrap_or(1.05),
+            repeat_penalty: gguf
+                .f32("general.sampling.penalty_repeat")
+                .unwrap_or(repeat_penalty),
         }
     }
 

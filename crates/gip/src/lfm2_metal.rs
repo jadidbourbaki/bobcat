@@ -129,7 +129,7 @@ impl<'a> Lfm2Metal<'a> {
         let expanded_bytes = model
             .layers
             .iter()
-            .flat_map(layer_matrices)
+            .flat_map(Layer::matrices)
             .filter(|matrix| {
                 batch >= K_EXPAND_MIN_TOKENS
                     && matches!(matrix.tensor.data_type(), TensorType::Q4K | TensorType::Q6K)
@@ -200,6 +200,19 @@ impl<'a> Lfm2Metal<'a> {
     /// Return the Metal backend, for profiling.
     pub fn metal(&mut self) -> &mut Metal {
         self.metal
+    }
+
+    /// Forget every token, so the next call starts a new sequence.
+    pub fn reset(&mut self) -> Result<(), Error> {
+        // A new sequence starts from zero convolution history. The KV cache needs no clearing,
+        // because attention reads only the positions a sequence has written.
+        let hp = self.model.hyperparameters();
+        let conv_floats =
+            to_usize(hp.n_conv_layers) * to_usize(hp.conv_kernel - 1) * to_usize(hp.n_embd);
+        self.metal
+            .write(self.buffers.conv_state.at(0), &vec![0.0_f32; conv_floats])?;
+        self.n_past = 0;
+        Ok(())
     }
 
     /// Return a recorder of work on the buffers.
@@ -482,7 +495,7 @@ fn check_supported(model: &Model) -> Result<(), Error> {
     let hp = model.hyperparameters();
     for matrix in [&model.token_embd, &model.output]
         .into_iter()
-        .chain(model.layers.iter().flat_map(layer_matrices))
+        .chain(model.layers.iter().flat_map(Layer::matrices))
     {
         format(matrix)?;
     }
@@ -529,18 +542,6 @@ fn format(matrix: &Matrix) -> Result<Format, Error> {
             )))
         }
     }
-}
-
-/// Return every matrix of `layer`.
-fn layer_matrices(layer: &Layer) -> Vec<&Matrix> {
-    let mut matrices = match &layer.mixer {
-        Mixer::Attention(attention) => {
-            vec![&attention.q, &attention.k, &attention.v, &attention.output]
-        }
-        Mixer::Conv(conv) => vec![&conv.in_proj, &conv.out_proj],
-    };
-    matrices.extend([&layer.ffn_gate, &layer.ffn_up, &layer.ffn_down]);
-    matrices
 }
 
 /// Records the launches of forward passes.

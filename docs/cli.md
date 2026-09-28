@@ -102,11 +102,22 @@ Jinja2 programs written for Python. gip renders them with MiniJinja.
 minijinja-contrib's `pycompat` adds the Python string and dictionary
 methods that templates call, such as `.strip()` and `.items()`.
 
-Each reply renders the whole conversation and prefills it into a fresh
-model state. The template can render earlier turns differently once a
+Each reply renders the whole conversation and encodes it. The GPU state
+keeps every token it has run. When the new prompt starts with those
+tokens, the reply runs only the tokens that follow, so a long chat
+stays fast. The template can render earlier turns differently once a
 new turn follows. LFM2's template drops an earlier answer's thinking,
 for example. LFM2's convolution state cannot rewind to a shared prefix,
-so the reply starts over.
+so such a prompt runs from a fresh state.
+
+Greedy decoding runs the tokens it picks in chunks of 8, after a first
+chunk of one token that starts the reply at once. The GPU also runs the
+tokens after the stop token in the last chunk, so the next greedy
+prompt usually runs from a fresh state. Sampled decoding runs one token
+at a time and keeps its state.
+
+A failed reply in `gip chat`, such as one that overflows the context,
+prints the error and leaves the conversation open.
 
 LFM2.5 models can think before they answer. The model writes its
 thinking between the single tokens `<think>` and `</think>`. The
@@ -137,7 +148,7 @@ then from Liquid's model cards.
 | Top-k | 50 |
 | Top-p | 1.0 |
 | Min-p | 0.0 |
-| Repetition penalty | 1.05 |
+| Repetition penalty | 1.1 for models over 2 billion weights, such as LFM2.5-2.6B, and 1.05 for smaller ones |
 
 A temperature of zero with no repetition penalty is greedy decoding.
 Greedy decoding lets the GPU pick each token itself and run several

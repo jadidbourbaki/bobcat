@@ -194,11 +194,12 @@ fn load(options: &ModelOptions) -> Result<(gip::Model, tokenizers::Tokenizer), E
     Ok((model, tokenizer))
 }
 
-/// Start the conversation with `model` that `options` describe.
+/// Start the conversation with `model` on `metal` that `options` describe.
 #[cfg(target_os = "macos")]
 fn start<'a>(
     options: &ModelOptions,
     model: &'a gip::Model,
+    metal: &'a mut gip::metal::Metal,
     tokenizer: &'a tokenizers::Tokenizer,
 ) -> Result<conversation::Conversation<'a>, Error> {
     let recommended = model.recommended_sampling();
@@ -217,6 +218,7 @@ fn start<'a>(
     };
     conversation::Conversation::new(
         model,
+        metal,
         tokenizer,
         options.system.as_deref(),
         limits,
@@ -233,12 +235,12 @@ fn respond(options: &ModelOptions, think: bool, prompt: &str) -> Result<(), Erro
     let text = full_prompt(prompt)?;
     let (model, tokenizer) = load(options)?;
     let mut metal = gip::metal::Metal::open()?;
-    let mut conversation = start(options, &model, &tokenizer)?;
+    let mut conversation = start(options, &model, &mut metal, &tokenizer)?;
 
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();
     let mut thought = false;
-    conversation.reply(&mut metal, &text, |part, piece| {
+    conversation.reply(&text, |part, piece| {
         match part {
             Part::Thinking if think => {
                 stderr.write_all(piece.as_bytes())?;
@@ -270,7 +272,7 @@ fn chat(options: &ModelOptions) -> Result<(), Error> {
 
     let (model, tokenizer) = load(options)?;
     let mut metal = gip::metal::Metal::open()?;
-    let mut conversation = start(options, &model, &tokenizer)?;
+    let mut conversation = start(options, &model, &mut metal, &tokenizer)?;
     let mut editor = rustyline::DefaultEditor::new()?;
     let mut stdout = io::stdout().lock();
     // Dim text marks the thinking, unless the output goes elsewhere or the user asks for no
@@ -294,7 +296,7 @@ fn chat(options: &ModelOptions) -> Result<(), Error> {
         editor.add_history_entry(line.as_str())?;
 
         let mut last = None;
-        conversation.reply(&mut metal, &line, |part, piece| {
+        let reply = conversation.reply(&line, |part, piece| {
             if last.is_none() && part == Part::Thinking {
                 write!(stdout, "{dim}")?;
             }
@@ -305,7 +307,18 @@ fn chat(options: &ModelOptions) -> Result<(), Error> {
             stdout.write_all(piece.as_bytes())?;
             stdout.flush()?;
             Ok(())
-        })?;
-        write!(stdout, "{reset}\n\n")?;
+        });
+        if last.is_some() {
+            write!(stdout, "{reset}\n\n")?;
+        }
+        // A failed reply, such as one that overflows the context, leaves the chat open for the
+        // next message.
+        if let Err(error) = reply {
+            stdout.flush()?;
+            #[expect(clippy::print_stderr, reason = "gip reports errors on stderr")]
+            {
+                eprintln!("gip: {error}\n");
+            }
+        }
     }
 }

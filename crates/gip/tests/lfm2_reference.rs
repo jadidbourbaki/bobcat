@@ -111,6 +111,40 @@ fn q4_k_m_long_prefill_matches_steps() -> TestResult {
     Ok(())
 }
 
+/// A reset state must forget the convolution history, or the next sequence starts from the
+/// previous one's last tokens.
+#[cfg(target_os = "macos")]
+#[test]
+fn reset_matches_a_fresh_state() -> TestResult {
+    let path = models_dir().join("LFM2.5-350M-Q8_0.gguf");
+    if !path.exists() {
+        eprintln!("skip: {} is missing", path.display());
+        return Ok(());
+    }
+    let model = Model::load(path)?;
+    let mut metal = match gip::metal::Metal::open() {
+        Ok(metal) => metal,
+        Err(error) => {
+            eprintln!("skip: {error}");
+            return Ok(());
+        }
+    };
+    let prompt = [1_u32, 2000, 3000, 4000];
+    let mut fresh_logits = vec![0.0; model.hyperparameters().n_vocab as usize];
+    let mut reset_logits = fresh_logits.clone();
+    {
+        let mut gpu = gip::Lfm2Metal::new(&model, &mut metal, 64, true)?;
+        gpu.prefill(&prompt, Some(&mut fresh_logits), None)?;
+    }
+    let mut gpu = gip::Lfm2Metal::new(&model, &mut metal, 64, true)?;
+    gpu.prefill(&[1, 500, 600, 700, 800], None, None)?;
+    gpu.reset()?;
+    gpu.prefill(&prompt, Some(&mut reset_logits), None)?;
+    let error = relative_error(&reset_logits, &fresh_logits);
+    assert!(error < TOLERANCE, "reset state error {error}");
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn q8_0_metal_f32_kv() -> TestResult {

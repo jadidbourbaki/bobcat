@@ -1,15 +1,16 @@
 //! A conversation with a model: the chat template, the tokenizer, and the messages so far.
 
-use gip::Model;
 use gip::metal::Metal;
+use gip::{Lfm2Metal, Model};
 use minijinja::{Environment, Value, context};
 use tokenizers::Tokenizer;
 
 use crate::Error;
 use crate::sampler::Sampler;
 
-/// Decode this many tokens per GPU call. Each call pipelines its steps, and text streams out
-/// after each call, so the count trades pipelining against output latency.
+/// Decode this many tokens per GPU call after the first token, which decodes alone so the reply
+/// starts to show at once. Each call pipelines its steps, and text streams out after each call,
+/// so the count trades pipelining against output latency.
 const DECODE_CHUNK: usize = 8;
 
 /// The part of a reply a piece of text belongs to.
@@ -33,6 +34,9 @@ pub(crate) struct Limits {
 /// A conversation with a model on the Metal GPU.
 pub(crate) struct Conversation<'a> {
     model: &'a Model,
+    gpu: Lfm2Metal<'a>,
+    /// The tokens the GPU state has run, in order.
+    consumed: Vec<u32>,
     tokenizer: &'a Tokenizer,
     template: Environment<'static>,
     bos_token: String,
@@ -46,10 +50,11 @@ pub(crate) struct Conversation<'a> {
 }
 
 impl<'a> Conversation<'a> {
-    /// Start a conversation with `model`, opened by the system message `system` when given, whose
-    /// replies `sampler` chooses.
+    /// Start a conversation with `model` on `metal`, opened by the system message `system` when
+    /// given, whose replies `sampler` chooses.
     pub(crate) fn new(
         model: &'a Model,
+        metal: &'a mut Metal,
         tokenizer: &'a Tokenizer,
         system: Option<&str>,
         limits: Limits,
@@ -87,6 +92,8 @@ impl<'a> Conversation<'a> {
 
         Ok(Self {
             model,
+            gpu: Lfm2Metal::new(model, metal, limits.context, true)?,
+            consumed: Vec::new(),
             tokenizer,
             template,
             bos_token,
@@ -104,17 +111,34 @@ impl<'a> Conversation<'a> {
 
     /// Reply to the user message `text`, passing each piece of the reply to `emit` as it decodes.
     ///
-    /// The template may render earlier turns differently once a new turn follows, for example by
-    /// dropping an earlier answer's thinking. LFM2's convolution state cannot rewind to a shared
-    /// prefix, so each reply prefills the whole conversation from a fresh state.
+    /// A failed reply leaves the messages as they were before `text`.
     pub(crate) fn reply(
         &mut self,
-        metal: &mut Metal,
         text: &str,
-        mut emit: impl FnMut(Part, &str) -> Result<(), Error>,
+        emit: impl FnMut(Part, &str) -> Result<(), Error>,
     ) -> Result<(), Error> {
         self.messages
             .push(context! { role => "user", content => text });
+        let result = self.answer(emit);
+        if result.is_err() {
+            self.messages.pop();
+            // The GPU state may hold part of the failed reply, so the next reply starts over.
+            self.consumed.clear();
+        }
+        result
+    }
+
+    /// Answer the last message, passing each piece of the answer to `emit` as it decodes.
+    ///
+    /// The GPU state keeps the tokens of earlier turns, and a prompt that starts with those
+    /// tokens runs only the tokens that follow them. The template may render earlier turns
+    /// differently once a new turn follows, for example by dropping an earlier answer's thinking.
+    /// LFM2's convolution state cannot rewind to a shared prefix, so such a prompt runs from a
+    /// fresh state.
+    fn answer(
+        &mut self,
+        mut emit: impl FnMut(Part, &str) -> Result<(), Error>,
+    ) -> Result<(), Error> {
         let prompt = self.template.get_template("chat")?.render(context! {
             messages => &self.messages,
             bos_token => &self.bos_token,
@@ -144,7 +168,8 @@ impl<'a> Conversation<'a> {
         };
         let mut thinking = String::new();
         let mut answer = String::new();
-        let mut decoder = self.tokenizer.decode_stream(false);
+        let tokenizer = self.tokenizer;
+        let mut decoder = tokenizer.decode_stream(false);
         let (stop_token, think_open, think_close) =
             (self.stop_token, self.think_open, self.think_close);
         // Take one decoded token into the reply and report whether the reply has ended.
@@ -180,36 +205,48 @@ impl<'a> Conversation<'a> {
             Ok(false)
         };
 
-        let mut gpu = gip::Lfm2Metal::new(self.model, metal, self.limits.context, true)?;
+        let start = if !self.consumed.is_empty() && tokens.starts_with(&self.consumed) {
+            self.consumed.len()
+        } else {
+            self.gpu.reset()?;
+            0
+        };
         let room = (self.limits.context - prompt_len) as usize;
         let mut remaining = self.limits.max_tokens.min(room);
         if self.sampler.is_greedy() {
-            // The GPU picks each most likely token itself, several steps ahead of the CPU.
-            gpu.prefill(&tokens, None, None)?;
+            // The GPU picks each most likely token itself, several steps ahead of the CPU. The
+            // GPU also runs each token it picks, including tokens after the stop token in the
+            // same chunk.
+            self.gpu.prefill(&tokens[start..], None, None)?;
+            self.consumed = tokens;
             let mut chunk = [0; DECODE_CHUNK];
+            let mut count = 1;
             'decode: while remaining > 0 {
-                let count = DECODE_CHUNK.min(remaining);
-                gpu.generate(&mut chunk[..count])?;
+                count = count.min(remaining);
+                self.gpu.generate(&mut chunk[..count])?;
+                self.consumed.extend_from_slice(&chunk[..count]);
                 remaining -= count;
                 for &token in &chunk[..count] {
                     if accept(token)? {
                         break 'decode;
                     }
                 }
+                count = DECODE_CHUNK;
             }
         } else {
             // Sampling reads each step's logits on the CPU before the next step can start.
             let mut logits = vec![0.0; self.model.hyperparameters().n_vocab as usize];
-            gpu.prefill(&tokens, Some(&mut logits), None)?;
-            let mut recent = tokens;
+            self.gpu
+                .prefill(&tokens[start..], Some(&mut logits), None)?;
+            self.consumed = tokens;
             while remaining > 0 {
-                let token = self.sampler.sample(&mut logits, &recent);
-                recent.push(token);
+                let token = self.sampler.sample(&mut logits, &self.consumed);
                 remaining -= 1;
                 if accept(token)? || remaining == 0 {
                     break;
                 }
-                gpu.step(token, Some(&mut logits), None)?;
+                self.gpu.step(token, Some(&mut logits), None)?;
+                self.consumed.push(token);
             }
         }
 
