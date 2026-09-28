@@ -6,9 +6,13 @@
 use gip_gguf::TensorType;
 use half::{bf16, f16};
 
-/// Must match [`gip_gguf::Q8_0_BLOCK_ELEMENTS`] and [`gip_gguf::Q8_0_BLOCK_BYTES`].
-const Q8_0_ELEMENTS: usize = 32;
+/// Block sizes in bytes and elements, which must match [`TensorType::block`].
+const Q4_0_BYTES: usize = 18;
 const Q8_0_BYTES: usize = 34;
+const Q4K_BYTES: usize = 144;
+const Q6K_BYTES: usize = 210;
+const BLOCK_ELEMENTS: usize = 32;
+const SUPER_BLOCK_ELEMENTS: usize = 256;
 
 /// Return the float value of the IEEE half-precision bits `bits`.
 pub fn f16_to_f32(bits: u16) -> f32 {
@@ -22,11 +26,8 @@ pub fn bf16_to_f32(bits: u16) -> f32 {
 
 /// Return the bytes of one row of `n_cols` elements of `data_type`.
 pub fn row_bytes(data_type: TensorType, n_cols: usize) -> usize {
-    match data_type {
-        TensorType::F32 => n_cols * 4,
-        TensorType::F16 | TensorType::Bf16 => n_cols * 2,
-        TensorType::Q8_0 => n_cols / Q8_0_ELEMENTS * Q8_0_BYTES,
-    }
+    let (elements, bytes) = data_type.block();
+    n_cols / elements * bytes
 }
 
 /// Return the little-endian 16-bit numbers in `bytes`.
@@ -47,94 +48,147 @@ pub fn f32s(bytes: &[u8]) -> impl Iterator<Item = f32> {
         .map(|&quad| f32::from_le_bytes(quad))
 }
 
-/// Return the scale of a Q8_0 block and its quants.
-fn q8_0_block(block: &[u8; Q8_0_BYTES]) -> (f32, &[u8]) {
-    let (scale, quants) = block.split_at(2);
-    (f16_to_f32(u16::from_le_bytes([scale[0], scale[1]])), quants)
+/// Return the half-precision number at byte `at` of `bytes` as a float.
+fn f16_at(bytes: &[u8], at: usize) -> f32 {
+    f16_to_f32(u16::from_le_bytes([bytes[at], bytes[at + 1]]))
 }
 
-/// Return the dot product of the elements of `data_type` in `row` with the floats in `x`.
-fn dot_row(data_type: TensorType, row: &[u8], x: &[f32]) -> f64 {
+/// Dequantize the elements of `data_type` in `bytes` into `out`, which holds as many elements as
+/// `bytes` encodes. The arithmetic follows ggml's reference dequantization in
+/// `ggml/src/ggml-quants.c`.
+pub fn dequantize(data_type: TensorType, bytes: &[u8], out: &mut [f32]) {
     match data_type {
-        TensorType::F32 => f32s(row)
-            .zip(x)
-            .map(|(w, &x)| f64::from(w) * f64::from(x))
-            .sum(),
-        TensorType::F16 => u16s(row)
-            .zip(x)
-            .map(|(w, &x)| f64::from(f16_to_f32(w)) * f64::from(x))
-            .sum(),
-        TensorType::Bf16 => u16s(row)
-            .zip(x)
-            .map(|(w, &x)| f64::from(bf16_to_f32(w)) * f64::from(x))
-            .sum(),
-        TensorType::Q8_0 => row
-            .as_chunks::<Q8_0_BYTES>()
-            .0
-            .iter()
-            .zip(x.as_chunks::<Q8_0_ELEMENTS>().0)
-            .map(|(block, xs)| {
-                let (scale, quants) = q8_0_block(block);
-                let sum: f64 = quants
-                    .iter()
-                    .zip(xs)
-                    .map(|(&q, &x)| f64::from(q.cast_signed()) * f64::from(x))
-                    .sum();
-                f64::from(scale) * sum
-            })
-            .sum(),
+        TensorType::F32 => {
+            for (out, value) in out.iter_mut().zip(f32s(bytes)) {
+                *out = value;
+            }
+        }
+        TensorType::F16 => {
+            for (out, bits) in out.iter_mut().zip(u16s(bytes)) {
+                *out = f16_to_f32(bits);
+            }
+        }
+        TensorType::Bf16 => {
+            for (out, bits) in out.iter_mut().zip(u16s(bytes)) {
+                *out = bf16_to_f32(bits);
+            }
+        }
+        TensorType::Q4_0 => blocks(bytes, out, dequantize_q4_0),
+        TensorType::Q8_0 => blocks(bytes, out, dequantize_q8_0),
+        TensorType::Q4K => blocks(bytes, out, dequantize_q4k),
+        TensorType::Q6K => blocks(bytes, out, dequantize_q6k),
+    }
+}
+
+/// Dequantize each block of `B` bytes in `bytes` with `block` into the next `E` floats of `out`.
+fn blocks<const B: usize, const E: usize>(
+    bytes: &[u8],
+    out: &mut [f32],
+    block: fn(&[u8; B], &mut [f32; E]),
+) {
+    let blocks = bytes.as_chunks::<B>().0.iter();
+    for (bytes, out) in blocks.zip(out.as_chunks_mut::<E>().0) {
+        block(bytes, out);
+    }
+}
+
+/// Dequantize a Q4_0 block: an fp16 scale, then 16 bytes whose low nibbles hold elements 0 to 15
+/// and whose high nibbles hold elements 16 to 31, each offset by 8.
+fn dequantize_q4_0(block: &[u8; Q4_0_BYTES], out: &mut [f32; BLOCK_ELEMENTS]) {
+    let d = f16_at(block, 0);
+    let (low, high) = out.split_at_mut(BLOCK_ELEMENTS / 2);
+    for ((&q, low), high) in block[2..].iter().zip(low).zip(high) {
+        *low = f32::from(i16::from(q & 0xf) - 8) * d;
+        *high = f32::from(i16::from(q >> 4) - 8) * d;
+    }
+}
+
+/// Dequantize a Q8_0 block: an fp16 scale, then 32 int8 quants.
+fn dequantize_q8_0(block: &[u8; Q8_0_BYTES], out: &mut [f32; BLOCK_ELEMENTS]) {
+    let d = f16_at(block, 0);
+    for (&q, out) in block[2..].iter().zip(out) {
+        *out = f32::from(q.cast_signed()) * d;
+    }
+}
+
+/// Return the 6-bit scale and minimum of block `j` of a Q4_K super-block's packed `scales`.
+fn q4k_scale_min(j: usize, scales: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (scales[j] & 63, scales[j + 4] & 63)
+    } else {
+        (
+            (scales[j + 4] & 0xf) | ((scales[j - 4] >> 6) << 4),
+            (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4),
+        )
+    }
+}
+
+/// Dequantize a Q4_K super-block: fp16 `d` and `dmin`, 12 bytes of packed 6-bit scales and
+/// minimums, then 128 bytes of 4-bit quants. Each 32 bytes of quants hold two 32-element blocks,
+/// the first in the low nibbles.
+fn dequantize_q4k(block: &[u8; Q4K_BYTES], out: &mut [f32; SUPER_BLOCK_ELEMENTS]) {
+    let d = f16_at(block, 0);
+    let dmin = f16_at(block, 2);
+    let scales = &block[4..16];
+    let quants = &block[16..];
+    for (pair, out) in out
+        .as_chunks_mut::<{ 2 * BLOCK_ELEMENTS }>()
+        .0
+        .iter_mut()
+        .enumerate()
+    {
+        let (scale_low, min_low) = q4k_scale_min(2 * pair, scales);
+        let (scale_high, min_high) = q4k_scale_min(2 * pair + 1, scales);
+        let (d_low, m_low) = (d * f32::from(scale_low), dmin * f32::from(min_low));
+        let (d_high, m_high) = (d * f32::from(scale_high), dmin * f32::from(min_high));
+        let (low, high) = out.split_at_mut(BLOCK_ELEMENTS);
+        let quants = &quants[pair * BLOCK_ELEMENTS..(pair + 1) * BLOCK_ELEMENTS];
+        for ((&q, low), high) in quants.iter().zip(low).zip(high) {
+            *low = d_low * f32::from(q & 0xf) - m_low;
+            *high = d_high * f32::from(q >> 4) - m_high;
+        }
+    }
+}
+
+/// Dequantize a Q6_K super-block: 128 bytes of low 4-bit halves, 64 bytes of high 2-bit pairs,
+/// 16 int8 scales of 16-element blocks, then an fp16 `d`. Each half of the super-block spreads
+/// 128 elements over 64 low bytes and 32 high bytes.
+fn dequantize_q6k(block: &[u8; Q6K_BYTES], out: &mut [f32; SUPER_BLOCK_ELEMENTS]) {
+    let d = f16_at(block, 208);
+    for (half, out) in out.as_chunks_mut::<128>().0.iter_mut().enumerate() {
+        let low = &block[half * 64..half * 64 + 64];
+        let high = &block[128 + half * 32..128 + half * 32 + 32];
+        let scales = &block[192 + half * 8..192 + half * 8 + 8];
+        for l in 0..32 {
+            let is = l / 16;
+            let quant = |low: u8, shift: u8| {
+                let high = (high[l] >> shift) & 3;
+                f32::from(i16::from(low | (high << 4)) - 32)
+            };
+            let scale = |index: usize| d * f32::from(scales[index].cast_signed());
+            out[l] = scale(is) * quant(low[l] & 0xf, 0);
+            out[l + 32] = scale(is + 2) * quant(low[l + 32] & 0xf, 2);
+            out[l + 64] = scale(is + 4) * quant(low[l] >> 4, 4);
+            out[l + 96] = scale(is + 6) * quant(low[l + 32] >> 4, 6);
+        }
     }
 }
 
 /// Dequantize row `row` of the matrix in `weights`, whose rows hold `out.len()` elements of
 /// `data_type`, into `out`.
 pub fn get_row(data_type: TensorType, weights: &[u8], row: usize, out: &mut [f32]) {
-    let n_cols = out.len();
-    let bytes = row_bytes(data_type, n_cols);
-    let source = &weights[row * bytes..(row + 1) * bytes];
-    match data_type {
-        TensorType::F32 => {
-            for (out, value) in out.iter_mut().zip(f32s(source)) {
-                *out = value;
-            }
-        }
-        TensorType::F16 => {
-            for (out, bits) in out.iter_mut().zip(u16s(source)) {
-                *out = f16_to_f32(bits);
-            }
-        }
-        TensorType::Bf16 => {
-            for (out, bits) in out.iter_mut().zip(u16s(source)) {
-                *out = bf16_to_f32(bits);
-            }
-        }
-        TensorType::Q8_0 => {
-            for (outs, block) in out
-                .as_chunks_mut::<Q8_0_ELEMENTS>()
-                .0
-                .iter_mut()
-                .zip(source.as_chunks::<Q8_0_BYTES>().0)
-            {
-                let (scale, quants) = q8_0_block(block);
-                for (out, &q) in outs.iter_mut().zip(quants) {
-                    *out = scale * f32::from(q.cast_signed());
-                }
-            }
-        }
-    }
+    let bytes = row_bytes(data_type, out.len());
+    dequantize(data_type, &weights[row * bytes..(row + 1) * bytes], out);
 }
 
 /// Multiply the matrix in `weights`, which has `y.len()` rows of `x.len()` elements of
 /// `data_type`, by `x`, and store the results in `y`.
 pub fn matvec(data_type: TensorType, weights: &[u8], x: &[f32], y: &mut [f32]) {
     let bytes = row_bytes(data_type, x.len());
-    for (y, row) in y.iter_mut().zip(weights.chunks_exact(bytes)) {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "the double sum rounds to the float result"
-        )]
-        let value = dot_row(data_type, row, x) as f32;
-        *y = value;
+    let mut row = vec![0.0; x.len()];
+    for (y, row_bytes) in y.iter_mut().zip(weights.chunks_exact(bytes)) {
+        dequantize(data_type, row_bytes, &mut row);
+        *y = dot(&row, x);
     }
 }
 

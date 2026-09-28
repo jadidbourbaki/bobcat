@@ -35,6 +35,18 @@ fn q8_0_scalar() -> TestResult {
     check_scalar("LFM2.5-350M-Q8_0.gguf", "LFM2.5-350M-Q8_0")
 }
 
+/// The Q4_0 file keeps its token embedding, which is also the output matrix, in Q6_K.
+#[test]
+fn q4_0_scalar() -> TestResult {
+    check_scalar("LFM2.5-350M-Q4_0.gguf", "LFM2.5-350M-Q4_0")
+}
+
+/// The Q4_K_M file mixes Q4_K matrices with Q6_K ones.
+#[test]
+fn q4_k_m_scalar() -> TestResult {
+    check_scalar("LFM2.5-350M-Q4_K_M.gguf", "LFM2.5-350M-Q4_K_M")
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn q8_0_metal() -> TestResult {

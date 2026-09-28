@@ -1,7 +1,10 @@
 //! Checks that the parser accepts a small valid file and rejects every truncation of it and a set
 //! of corrupted headers.
 
-use gip_gguf::{Gguf, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS, TensorType};
+use gip_gguf::{Gguf, TensorType};
+
+/// The elements and bytes of one Q8_0 block.
+const Q8_0_BLOCK: (u64, u64) = (32, 34);
 
 const ALIGNMENT: u32 = 32;
 const ROWS: u64 = 2;
@@ -43,7 +46,7 @@ impl Builder {
         let n_dims_at = bytes.len();
         put_u32(&mut bytes, 2);
         let ne0_at = bytes.len();
-        put_u64(&mut bytes, Q8_0_BLOCK_ELEMENTS);
+        put_u64(&mut bytes, Q8_0_BLOCK.0);
         let ne1_at = bytes.len();
         put_u64(&mut bytes, ROWS);
         let type_at = bytes.len();
@@ -83,7 +86,7 @@ impl Builder {
 
 /// Return the bytes of the weight tensor's data.
 fn data_bytes() -> usize {
-    usize::try_from(ROWS * Q8_0_BLOCK_BYTES).expect("the tensor holds 68 bytes")
+    usize::try_from(ROWS * Q8_0_BLOCK.1).expect("the tensor holds 68 bytes")
 }
 
 fn put_u32(bytes: &mut Vec<u8>, value: u32) {

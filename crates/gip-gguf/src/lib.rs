@@ -12,12 +12,6 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::ops::Range;
 
-/// The number of elements in one Q8_0 block.
-pub const Q8_0_BLOCK_ELEMENTS: u64 = 32;
-
-/// The number of bytes in one Q8_0 block: an fp16 scale and 32 int8 quants.
-pub const Q8_0_BLOCK_BYTES: u64 = 34;
-
 /// The most dimensions a GGUF tensor has.
 pub const MAX_DIMS: usize = 4;
 
@@ -71,13 +65,15 @@ pub enum Error {
     /// A tensor has a dimension of zero or more elements than 64 bits count.
     #[error("tensor {0} has an invalid shape")]
     Shape(String),
-    /// A Q8_0 tensor's rows hold a number of elements that 32 does not divide.
-    #[error("tensor {name} has rows of {ne0} elements, which Q8_0 blocks of 32 cannot divide")]
-    Q8_0Row {
+    /// A quantized tensor's rows hold a number of elements that its block size does not divide.
+    #[error("tensor {name} has rows of {ne0} elements, which blocks of {block} cannot divide")]
+    BlockRow {
         /// The tensor's name.
         name: String,
         /// The number of elements in each row.
         ne0: u64,
+        /// The number of elements in one block of the tensor's type.
+        block: u64,
     },
     /// A tensor has a type gip does not read.
     #[error("tensor {name} has unsupported type {type_id}")]
@@ -101,15 +97,23 @@ pub enum Error {
     DuplicateTensor(String),
 }
 
-/// A tensor type gip reads. The ids match ggml's type ids.
+/// A tensor type gip reads. The ids and block layouts match ggml's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TensorType {
     /// 32-bit IEEE floats.
     F32,
     /// 16-bit IEEE floats.
     F16,
-    /// Blocks of 32 int8 quants with one fp16 scale.
+    /// Blocks of 32 elements: an fp16 scale and 32 4-bit quants.
+    Q4_0,
+    /// Blocks of 32 elements: an fp16 scale and 32 int8 quants.
     Q8_0,
+    /// Super-blocks of 256 elements: fp16 scales for the scales and the minimums, eight 6-bit
+    /// scales and minimums of 32-element blocks, and 256 4-bit quants.
+    Q4K,
+    /// Super-blocks of 256 elements: 256 6-bit quants, sixteen int8 scales of 16-element blocks,
+    /// and an fp16 scale.
+    Q6K,
     /// bfloat16 floats.
     Bf16,
 }
@@ -120,7 +124,10 @@ impl TensorType {
         match id {
             0 => Some(Self::F32),
             1 => Some(Self::F16),
+            2 => Some(Self::Q4_0),
             8 => Some(Self::Q8_0),
+            12 => Some(Self::Q4K),
+            14 => Some(Self::Q6K),
             30 => Some(Self::Bf16),
             _ => None,
         }
@@ -131,25 +138,37 @@ impl TensorType {
         match self {
             Self::F32 => 0,
             Self::F16 => 1,
+            Self::Q4_0 => 2,
             Self::Q8_0 => 8,
+            Self::Q4K => 12,
+            Self::Q6K => 14,
             Self::Bf16 => 30,
+        }
+    }
+
+    /// Return the number of elements in one block of the type and the bytes the block occupies.
+    /// Unquantized types have blocks of one element.
+    pub fn block(self) -> (usize, usize) {
+        match self {
+            Self::F32 => (1, 4),
+            Self::F16 | Self::Bf16 => (1, 2),
+            Self::Q4_0 => (32, 18),
+            Self::Q8_0 => (32, 34),
+            Self::Q4K => (256, 144),
+            Self::Q6K => (256, 210),
         }
     }
 
     /// Return the bytes that `n_elements` consecutive elements of the type occupy.
     ///
-    /// Return `None` when the count overflows or, for Q8_0, when 32 does not divide `n_elements`.
+    /// Return `None` when the count overflows or fills no whole number of blocks.
     pub fn bytes_for(self, n_elements: u64) -> Option<u64> {
-        match self {
-            Self::F32 => n_elements.checked_mul(4),
-            Self::F16 | Self::Bf16 => n_elements.checked_mul(2),
-            Self::Q8_0 => {
-                if !n_elements.is_multiple_of(Q8_0_BLOCK_ELEMENTS) {
-                    return None;
-                }
-                (n_elements / Q8_0_BLOCK_ELEMENTS).checked_mul(Q8_0_BLOCK_BYTES)
-            }
+        let (elements, bytes) = self.block();
+        let (elements, bytes) = (u64::try_from(elements).ok()?, u64::try_from(bytes).ok()?);
+        if !n_elements.is_multiple_of(elements) {
+            return None;
         }
+        n_elements.checked_div(elements)?.checked_mul(bytes)
     }
 }
 
@@ -685,9 +704,12 @@ fn locate_tensor(
     let Some(data_type) = TensorType::from_id(type_id) else {
         return Err(Error::UnsupportedType { name, type_id });
     };
+    // Blocks never straddle rows, so each row must fill whole blocks.
     let [ne0, ..] = ne;
-    if data_type == TensorType::Q8_0 && !ne0.is_multiple_of(Q8_0_BLOCK_ELEMENTS) {
-        return Err(Error::Q8_0Row { name, ne0 });
+    let (block, _) = data_type.block();
+    let block = u64::try_from(block).map_err(|_| Error::TooLarge(name.clone()))?;
+    if !ne0.is_multiple_of(block) {
+        return Err(Error::BlockRow { name, ne0, block });
     }
     let Some(n_bytes) = data_type.bytes_for(n_elements) else {
         return Err(Error::TooLarge(name));
