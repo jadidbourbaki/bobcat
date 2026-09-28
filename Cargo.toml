@@ -18,6 +18,8 @@ gip-metal = { path = "crates/gip-metal" }
 half = { version = "2.7.1", default-features = false }
 libc = { version = "0.2.189", default-features = false }
 memmap2 = { version = "0.9.11" }
+minijinja = { version = "2.24.0", features = ["json", "loop_controls"] }
+minijinja-contrib = { version = "2.24.0", features = ["pycompat"] }
 objc2 = { version = "0.6.4" }
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
   "std",
@@ -43,6 +45,7 @@ objc2-metal = { version = "0.3.2", default-features = false, features = [
   "MTLTypes",
 ] }
 thiserror = { version = "2.0.21" }
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 
 [workspace.lints.rust]
 unreachable_pub = "warn"

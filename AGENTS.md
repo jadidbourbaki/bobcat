@@ -98,6 +98,7 @@ crates/
     src/lfm2.rs            LFM2 on the CPU with the scalar ops
     src/lfm2_metal.rs      LFM2 on the Metal GPU
     tests/                 reference and kernel tests
+  gip-cli/                 the gip command, which chats with a model
   gip-bench/               gip-bench, gpu-bw, and cpu-bw programs
 tools/                     Python reference dumps and benchmark scripts
 bench/                     baseline engine checkouts, gitignored

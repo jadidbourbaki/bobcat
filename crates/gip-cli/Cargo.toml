@@ -1,0 +1,25 @@
+[package]
+name = "gip-cli"
+description = "The gip command, which chats with a model on the Metal GPU"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "gip"
+path = "src/main.rs"
+# The binary shares its name with the library, whose documentation takes the path.
+doc = false
+
+[dependencies]
+clap = { workspace = true }
+gip = { workspace = true }
+minijinja = { workspace = true }
+minijinja-contrib = { workspace = true }
+tokenizers = { workspace = true }
+
+[lints]
+workspace = true
