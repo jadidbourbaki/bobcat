@@ -24,15 +24,12 @@ struct gip_lfm2_metal
   struct gip_metal_buffer *v_cache;
   struct gip_metal_buffer *conv_state;
   struct gip_metal_buffer *hidden;
-  struct gip_metal_buffer *normed;
-  struct gip_metal_buffer *block_out;
   struct gip_metal_buffer *bcx;
   struct gip_metal_buffer *conv_out;
   struct gip_metal_buffer *q;
   struct gip_metal_buffer *attn;
   struct gip_metal_buffer *scores;
-  struct gip_metal_buffer *gate;
-  struct gip_metal_buffer *up;
+  struct gip_metal_buffer *ffn;
   struct gip_metal_buffer *logits;
   struct gip_metal_buffer *trace_layers;
   struct gip_metal_buffer *trace_final;

@@ -4,9 +4,17 @@
 #include <metal_stdlib>
 using namespace metal;
 
-/* The rows each simdgroup of matvec_q8_0 computes.  The host sets the
-   value when it creates the pipeline.  */
+/* The rows each simdgroup of the matrix-vector kernels computes.  The
+   host sets the value when it creates the pipelines.  */
 constant uint rows_per_simdgroup [[function_constant (0)]];
+
+/* Whether a matrix-vector kernel RMS-normalizes its input and scales it
+   by NORM_WEIGHT before multiplying.  */
+constant bool fuse_norm [[function_constant (1)]];
+
+/* Whether a matrix-vector kernel adds its product to Y instead of
+   overwriting Y.  */
+constant bool accumulate [[function_constant (2)]];
 
 enum
 {
@@ -72,8 +80,63 @@ struct q8_0_block
   char quants[QK8_0];
 };
 
+/* Return the dot product of BLOCK with the 32 floats at INPUTS.  */
+static float
+q8_0_block_dot (device const q8_0_block *block, thread const float4 *inputs)
+{
+  /* The quants start two bytes into the block, so four-byte loads go
+     through the packed type, which needs only byte alignment.  */
+  device const packed_char4 *quants
+      = (device const packed_char4 *)block->quants;
+  float block_dot = 0.0f;
+
+  for (int i = 0; i < QK8_0 / 4; i++)
+    block_dot += dot (float4 (char4 (quants[i])), inputs[i]);
+  return float (block->scale) * block_dot;
+}
+
+/* Load the 32 inputs of block B from X into INPUTS and add their squares
+   to SUM_SQUARES.  With fuse_norm, multiply each input by its entry of
+   NORM_WEIGHT.
+
+   The RMS norm scale is one number for the whole vector, so the kernels
+   multiply by the weighted inputs and apply the scale to each finished
+   row sum.  The lanes of a simdgroup load every block between them, so
+   their squares add up to the whole norm with no extra reads.  */
+static void
+load_inputs (device const float *x, device const float *norm_weight, uint b,
+             thread float4 *inputs, thread float &sum_squares)
+{
+  device const float4 *xb = (device const float4 *)(x + b * QK8_0);
+
+  for (int i = 0; i < QK8_0 / 4; i++)
+    inputs[i] = xb[i];
+  if (fuse_norm)
+    {
+      device const float4 *wb
+          = (device const float4 *)(norm_weight + b * QK8_0);
+      for (int i = 0; i < QK8_0 / 4; i++)
+        {
+          sum_squares += dot (inputs[i], inputs[i]);
+          inputs[i] *= wb[i];
+        }
+    }
+}
+
+/* Return the RMS norm scale of N_COLS inputs whose squares, spread over
+   the lanes of a simdgroup, are SUM_SQUARES.  Every lane must call the
+   function.  */
+static float
+norm_scale (float sum_squares, uint n_cols, float eps)
+{
+  return precise::rsqrt (simd_sum (sum_squares) / float (n_cols) + eps);
+}
+
 /* Multiply the Q8_0 matrix WEIGHTS, which has N_ROWS rows of N_COLS
    elements, by the N_COLS floats at X and store the N_ROWS results at Y.
+   With fuse_norm, X is first RMS-normalized with epsilon EPS and scaled
+   by NORM_WEIGHT.  With accumulate, the results add to Y.
+
    Each simdgroup computes ROWS_PER_SIMDGROUP consecutive rows.  Each
    lane takes every 32nd block of those rows and loads the matching 32
    inputs once for all of them.  */
@@ -83,6 +146,9 @@ matvec_q8_0 (device const uchar *weights [[buffer (0)]],
              device float *y [[buffer (2)]],
              constant uint &n_rows [[buffer (3)]],
              constant uint &n_cols [[buffer (4)]],
+             device const float *norm_weight
+             [[buffer (5), function_constant (fuse_norm)]],
+             constant float &eps [[buffer (6), function_constant (fuse_norm)]],
              uint threadgroup_index [[threadgroup_position_in_grid]],
              uint simdgroup_index [[simdgroup_index_in_threadgroup]],
              uint simdgroups [[simdgroups_per_threadgroup]],
@@ -93,13 +159,12 @@ matvec_q8_0 (device const uchar *weights [[buffer (0)]],
   uint n_blocks = n_cols / QK8_0;
   ulong row_bytes = ulong (n_blocks) * Q8_0_BLOCK_BYTES;
   float sums[MAX_ROWS_PER_SIMDGROUP] = { 0.0f };
+  float sum_squares = 0.0f;
 
   for (uint b = lane; b < n_blocks; b += SIMD_WIDTH)
     {
-      device const float4 *xb = (device const float4 *)(x + b * QK8_0);
       float4 inputs[QK8_0 / 4];
-      for (int i = 0; i < QK8_0 / 4; i++)
-        inputs[i] = xb[i];
+      load_inputs (x, norm_weight, b, inputs, sum_squares);
 
       for (uint r = 0; r < rows_per_simdgroup; r++)
         {
@@ -108,18 +173,13 @@ matvec_q8_0 (device const uchar *weights [[buffer (0)]],
             break;
           device const q8_0_block *block
               = (device const q8_0_block *)(weights + row * row_bytes) + b;
-          float block_dot = 0.0f;
-          for (int i = 0; i < QK8_0 / 4; i++)
-            {
-              float4 q = float4 (block->quants[4 * i],
-                                 block->quants[4 * i + 1],
-                                 block->quants[4 * i + 2],
-                                 block->quants[4 * i + 3]);
-              block_dot += dot (q, inputs[i]);
-            }
-          sums[r] += float (block->scale) * block_dot;
+          sums[r] += q8_0_block_dot (block, inputs);
         }
     }
+
+  float scale = 1.0f;
+  if (fuse_norm)
+    scale = norm_scale (sum_squares, n_cols, eps);
 
   /* Every lane of a simdgroup sees the same rows, so all lanes reach
      each simd_sum together.  */
@@ -128,9 +188,72 @@ matvec_q8_0 (device const uchar *weights [[buffer (0)]],
       uint row = first_row + r;
       if (row >= n_rows)
         break;
-      float total = simd_sum (sums[r]);
+      float total = simd_sum (sums[r]) * scale;
       if (lane == 0)
-        y[row] = total;
+        y[row] = accumulate ? y[row] + total : total;
+    }
+}
+
+/* Multiply the Q8_0 matrices GATE and UP, which each have N_ROWS rows of
+   N_COLS elements, by the N_COLS floats at X, and store SiLU of each
+   gate result times the matching up result at Y.  With fuse_norm, X is
+   first RMS-normalized with epsilon EPS and scaled by NORM_WEIGHT.  The
+   layout follows matvec_q8_0, with each lane reading both matrices.  */
+kernel void
+matvec_q8_0_swiglu (device const uchar *gate [[buffer (0)]],
+                    device const uchar *up [[buffer (1)]],
+                    device const float *x [[buffer (2)]],
+                    device float *y [[buffer (3)]],
+                    constant uint &n_rows [[buffer (4)]],
+                    constant uint &n_cols [[buffer (5)]],
+                    device const float *norm_weight
+                    [[buffer (6), function_constant (fuse_norm)]],
+                    constant float &eps
+                    [[buffer (7), function_constant (fuse_norm)]],
+                    uint threadgroup_index [[threadgroup_position_in_grid]],
+                    uint simdgroup_index [[simdgroup_index_in_threadgroup]],
+                    uint simdgroups [[simdgroups_per_threadgroup]],
+                    uint lane [[thread_index_in_simdgroup]])
+{
+  uint first_row
+      = (threadgroup_index * simdgroups + simdgroup_index) * rows_per_simdgroup;
+  uint n_blocks = n_cols / QK8_0;
+  ulong row_bytes = ulong (n_blocks) * Q8_0_BLOCK_BYTES;
+  float gate_sums[MAX_ROWS_PER_SIMDGROUP] = { 0.0f };
+  float up_sums[MAX_ROWS_PER_SIMDGROUP] = { 0.0f };
+  float sum_squares = 0.0f;
+
+  for (uint b = lane; b < n_blocks; b += SIMD_WIDTH)
+    {
+      float4 inputs[QK8_0 / 4];
+      load_inputs (x, norm_weight, b, inputs, sum_squares);
+
+      for (uint r = 0; r < rows_per_simdgroup; r++)
+        {
+          uint row = first_row + r;
+          if (row >= n_rows)
+            break;
+          ulong offset = row * row_bytes;
+          gate_sums[r] += q8_0_block_dot (
+              (device const q8_0_block *)(gate + offset) + b, inputs);
+          up_sums[r] += q8_0_block_dot (
+              (device const q8_0_block *)(up + offset) + b, inputs);
+        }
+    }
+
+  float scale = 1.0f;
+  if (fuse_norm)
+    scale = norm_scale (sum_squares, n_cols, eps);
+
+  for (uint r = 0; r < rows_per_simdgroup; r++)
+    {
+      uint row = first_row + r;
+      if (row >= n_rows)
+        break;
+      float g = simd_sum (gate_sums[r]) * scale;
+      float u = simd_sum (up_sums[r]) * scale;
+      if (lane == 0)
+        y[row] = g / (1.0f + precise::exp (-g)) * u;
     }
 }
 
@@ -363,30 +486,6 @@ short_conv (device const float *bcx [[buffer (0)]],
     history[k * n_embd + ch] = history[(k + 1) * n_embd + ch];
   history[(kernel_size - 2) * n_embd + ch] = bx;
   out[ch] = bcx[n_embd + ch] * sum;
-}
-
-/* Replace each of the N floats at GATE with its SiLU times the matching
-   float at UP.  */
-kernel void
-swiglu (device float *gate [[buffer (0)]],
-        device const float *up [[buffer (1)]], constant uint &n [[buffer (2)]],
-        uint i [[thread_position_in_grid]])
-{
-  if (i >= n)
-    return;
-  float g = gate[i];
-  gate[i] = g / (1.0f + precise::exp (-g)) * up[i];
-}
-
-/* Add the N floats at DELTA to the N floats at H.  */
-kernel void
-add_in_place (device float *h [[buffer (0)]],
-              device const float *delta [[buffer (1)]],
-              constant uint &n [[buffer (2)]],
-              uint i [[thread_position_in_grid]])
-{
-  if (i < n)
-    h[i] += delta[i];
 }
 
 /* Copy the N floats at SRC to DST.  */

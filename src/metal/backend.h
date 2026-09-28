@@ -56,13 +56,36 @@ void gip_metal_buffer_free (struct gip_metal_buffer *buffer);
    Each launch reads the results of the launches recorded before it.  */
 enum gip_status gip_metal_begin (struct gip_metal *metal);
 
+/* Work a matrix-vector launch folds in.  When NORM_WEIGHT has a buffer,
+   the launch RMS-normalizes its input with epsilon EPS and scales it by
+   NORM_WEIGHT before multiplying.  When ACCUMULATE is nonzero, the
+   launch adds its results to Y.  */
+struct gip_metal_matvec_options
+{
+  struct gip_metal_view norm_weight;
+  float eps;
+  int accumulate;
+};
+
 /* Record a multiply of the Q8_0 matrix at WEIGHTS, which has N_ROWS rows
    of N_COLS elements, by the N_COLS floats at X.  The N_ROWS results go
-   to Y.  */
+   to Y.  OPTIONS may be null for a plain multiply.  */
 void gip_metal_matvec_q8_0 (struct gip_metal *metal,
                             struct gip_metal_view weights, uint32_t n_rows,
                             uint32_t n_cols, struct gip_metal_view x,
-                            struct gip_metal_view y);
+                            struct gip_metal_view y,
+                            const struct gip_metal_matvec_options *options);
+
+/* Record the multiply of the Q8_0 matrices at GATE and UP, which each
+   have N_ROWS rows of N_COLS elements, by the N_COLS floats at X after
+   RMS normalization with epsilon EPS and scaling by NORM_WEIGHT.  Y
+   receives SiLU of each gate result times the matching up result.  */
+void gip_metal_matvec_q8_0_swiglu (struct gip_metal *metal,
+                                   struct gip_metal_view gate,
+                                   struct gip_metal_view up, uint32_t n_rows,
+                                   uint32_t n_cols, struct gip_metal_view x,
+                                   struct gip_metal_view norm_weight,
+                                   float eps, struct gip_metal_view y);
 
 /* Record an RMS normalization of the N floats at X, scaled by the N
    floats at WEIGHT, into OUT.  */
@@ -104,14 +127,6 @@ void gip_metal_short_conv (struct gip_metal *metal, struct gip_metal_view bcx,
                            struct gip_metal_view history,
                            struct gip_metal_view out, uint32_t n_embd,
                            uint32_t kernel_size);
-
-/* Record GATE = SiLU (GATE) * UP over N floats.  */
-void gip_metal_swiglu (struct gip_metal *metal, struct gip_metal_view gate,
-                       struct gip_metal_view up, uint32_t n);
-
-/* Record H += DELTA over N floats.  */
-void gip_metal_add (struct gip_metal *metal, struct gip_metal_view h,
-                    struct gip_metal_view delta, uint32_t n);
 
 /* Record a copy of N floats from SRC to DST.  */
 void gip_metal_copy (struct gip_metal *metal, struct gip_metal_view src,

@@ -127,25 +127,21 @@ gip_lfm2_metal_init (const struct gip_lfm2_model *model,
   gpu->v_cache = new_floats (gpu, cache_floats);
   gpu->conv_state = new_floats (gpu, conv_floats);
   gpu->hidden = new_floats (gpu, n_embd);
-  gpu->normed = new_floats (gpu, n_embd);
-  gpu->block_out = new_floats (gpu, n_embd);
   gpu->bcx = new_floats (gpu, 3 * n_embd);
   gpu->conv_out = new_floats (gpu, n_embd);
   gpu->q = new_floats (gpu, q_dim);
   gpu->attn = new_floats (gpu, q_dim);
   gpu->scores = new_floats (gpu, gip_metal_attention_scratch (
                                      model->n_heads, model->head_dim, n_ctx));
-  gpu->gate = new_floats (gpu, model->n_ff);
-  gpu->up = new_floats (gpu, model->n_ff);
+  gpu->ffn = new_floats (gpu, model->n_ff);
   gpu->logits = new_floats (gpu, model->n_vocab);
   gpu->trace_layers = new_floats (gpu, (size_t)model->n_layers * n_embd);
   gpu->trace_final = new_floats (gpu, n_embd);
 
   if (gpu->weights == NULL || gpu->k_cache == NULL || gpu->v_cache == NULL
-      || gpu->conv_state == NULL || gpu->hidden == NULL || gpu->normed == NULL
-      || gpu->block_out == NULL || gpu->bcx == NULL || gpu->conv_out == NULL
-      || gpu->q == NULL || gpu->attn == NULL || gpu->scores == NULL
-      || gpu->gate == NULL || gpu->up == NULL || gpu->logits == NULL
+      || gpu->conv_state == NULL || gpu->hidden == NULL || gpu->bcx == NULL
+      || gpu->conv_out == NULL || gpu->q == NULL || gpu->attn == NULL
+      || gpu->scores == NULL || gpu->ffn == NULL || gpu->logits == NULL
       || gpu->trace_layers == NULL || gpu->trace_final == NULL)
     {
       gip_format_error (err, err_size, "cannot allocate Metal buffers");
@@ -159,11 +155,10 @@ void
 gip_lfm2_metal_free (struct gip_lfm2_metal *gpu)
 {
   struct gip_metal_buffer *buffers[] = {
-    gpu->weights,     gpu->k_cache, gpu->v_cache,   gpu->conv_state,
-    gpu->hidden,      gpu->normed,  gpu->block_out, gpu->bcx,
-    gpu->conv_out,    gpu->q,       gpu->attn,      gpu->scores,
-    gpu->gate,        gpu->up,      gpu->logits,    gpu->trace_layers,
-    gpu->trace_final,
+    gpu->weights,      gpu->k_cache,     gpu->v_cache,  gpu->conv_state,
+    gpu->hidden,       gpu->bcx,         gpu->conv_out, gpu->q,
+    gpu->attn,         gpu->scores,      gpu->ffn,      gpu->logits,
+    gpu->trace_layers, gpu->trace_final,
   };
 
   for (size_t i = 0; i < sizeof buffers / sizeof buffers[0]; i++)
@@ -188,17 +183,35 @@ floats_at (struct gip_metal_buffer *buffer, size_t index)
   return gip_metal_at (buffer, index * sizeof (float));
 }
 
-/* Record a multiply of the matrix TENSOR by X into Y.  */
+/* Record a multiply of the matrix TENSOR by X into Y with OPTIONS, which
+   may be null.  */
 static void
 matvec (struct gip_lfm2_metal *gpu, const struct gip_gguf_tensor *tensor,
-        struct gip_metal_view x, struct gip_metal_view y)
+        struct gip_metal_view x, struct gip_metal_view y,
+        const struct gip_metal_matvec_options *options)
 {
   gip_metal_matvec_q8_0 (gpu->metal, weights_of (gpu, tensor),
                          (uint32_t)tensor->ne[1], (uint32_t)tensor->ne[0], x,
-                         y);
+                         y, options);
 }
 
-/* Record the gated short convolution of LAYER on the normed input.  */
+/* Return options that normalize the input with NORM before the
+   multiply.  */
+static struct gip_metal_matvec_options
+normalized (const struct gip_lfm2_metal *gpu,
+            const struct gip_gguf_tensor *norm)
+{
+  struct gip_metal_matvec_options options
+      = { .norm_weight = weights_of (gpu, norm), .eps = gpu->model->norm_eps };
+  return options;
+}
+
+/* Options that add the product to the residual stream.  */
+static const struct gip_metal_matvec_options add_to_residual
+    = { .accumulate = 1 };
+
+/* Record the gated short convolution of LAYER on the residual stream and
+   add its output back.  */
 static void
 record_conv (struct gip_lfm2_metal *gpu, const struct gip_lfm2_layer *layer)
 {
@@ -206,19 +219,21 @@ record_conv (struct gip_lfm2_metal *gpu, const struct gip_lfm2_layer *layer)
   size_t n_embd = model->n_embd;
   size_t history
       = (size_t)layer->cache_index * (model->conv_kernel - 1) * n_embd;
+  struct gip_metal_view h = floats_at (gpu->hidden, 0);
+  struct gip_metal_matvec_options norm = normalized (gpu, layer->attn_norm);
 
-  matvec (gpu, layer->conv_in_proj, floats_at (gpu->normed, 0),
-          floats_at (gpu->bcx, 0));
+  matvec (gpu, layer->conv_in_proj, h, floats_at (gpu->bcx, 0), &norm);
   gip_metal_short_conv (
       gpu->metal, floats_at (gpu->bcx, 0), weights_of (gpu, layer->conv),
       floats_at (gpu->conv_state, history), floats_at (gpu->conv_out, 0),
       (uint32_t)n_embd, model->conv_kernel);
-  matvec (gpu, layer->conv_out_proj, floats_at (gpu->conv_out, 0),
-          floats_at (gpu->block_out, 0));
+  matvec (gpu, layer->conv_out_proj, floats_at (gpu->conv_out, 0), h,
+          &add_to_residual);
 }
 
-/* Record the attention of LAYER at position POS on the normed input.
-   The K and V projections write straight into the caches.  */
+/* Record the attention of LAYER at position POS on the residual stream
+   and add its output back.  The K and V projections write straight into
+   the caches.  */
 static void
 record_attention (struct gip_lfm2_metal *gpu,
                   const struct gip_lfm2_layer *layer, uint32_t pos)
@@ -230,11 +245,12 @@ record_attention (struct gip_lfm2_metal *gpu,
       = floats_at (gpu->k_cache, layer_base + (size_t)pos * kv_dim);
   struct gip_metal_view v_slot
       = floats_at (gpu->v_cache, layer_base + (size_t)pos * kv_dim);
-  struct gip_metal_view normed = floats_at (gpu->normed, 0);
+  struct gip_metal_view h = floats_at (gpu->hidden, 0);
+  struct gip_metal_matvec_options norm = normalized (gpu, layer->attn_norm);
 
-  matvec (gpu, layer->attn_q, normed, floats_at (gpu->q, 0));
-  matvec (gpu, layer->attn_k, normed, k_slot);
-  matvec (gpu, layer->attn_v, normed, v_slot);
+  matvec (gpu, layer->attn_q, h, floats_at (gpu->q, 0), &norm);
+  matvec (gpu, layer->attn_k, h, k_slot, &norm);
+  matvec (gpu, layer->attn_v, h, v_slot, &norm);
   gip_metal_qk_norm_rope (gpu->metal, floats_at (gpu->q, 0),
                           weights_of (gpu, layer->attn_q_norm), model->n_heads,
                           model->head_dim, pos, model->rope_theta,
@@ -248,8 +264,8 @@ record_attention (struct gip_lfm2_metal *gpu,
       floats_at (gpu->v_cache, layer_base), floats_at (gpu->scores, 0),
       floats_at (gpu->attn, 0), model->n_heads, model->n_kv_heads,
       model->head_dim, pos + 1, gpu->n_ctx);
-  matvec (gpu, layer->attn_output, floats_at (gpu->attn, 0),
-          floats_at (gpu->block_out, 0));
+  matvec (gpu, layer->attn_output, floats_at (gpu->attn, 0), h,
+          &add_to_residual);
 }
 
 enum gip_status
@@ -279,28 +295,21 @@ gip_lfm2_metal_step (struct gip_lfm2_metal *gpu, int32_t token, float *logits,
     return status;
 
   struct gip_metal_view h = floats_at (gpu->hidden, 0);
-  struct gip_metal_view normed = floats_at (gpu->normed, 0);
-  struct gip_metal_view block_out = floats_at (gpu->block_out, 0);
+  struct gip_metal_view ffn = floats_at (gpu->ffn, 0);
   for (uint32_t il = 0; il < model->n_layers; il++)
     {
       const struct gip_lfm2_layer *layer = &model->layers[il];
 
-      gip_metal_rms_norm (metal, h, weights_of (gpu, layer->attn_norm), normed,
-                          n_embd, model->norm_eps);
       if (layer->is_attention)
         record_attention (gpu, layer, pos);
       else
         record_conv (gpu, layer);
-      gip_metal_add (metal, h, block_out, n_embd);
 
-      gip_metal_rms_norm (metal, h, weights_of (gpu, layer->ffn_norm), normed,
-                          n_embd, model->norm_eps);
-      matvec (gpu, layer->ffn_gate, normed, floats_at (gpu->gate, 0));
-      matvec (gpu, layer->ffn_up, normed, floats_at (gpu->up, 0));
-      gip_metal_swiglu (metal, floats_at (gpu->gate, 0),
-                        floats_at (gpu->up, 0), model->n_ff);
-      matvec (gpu, layer->ffn_down, floats_at (gpu->gate, 0), block_out);
-      gip_metal_add (metal, h, block_out, n_embd);
+      gip_metal_matvec_q8_0_swiglu (
+          metal, weights_of (gpu, layer->ffn_gate),
+          weights_of (gpu, layer->ffn_up), model->n_ff, n_embd, h,
+          weights_of (gpu, layer->ffn_norm), model->norm_eps, ffn);
+      matvec (gpu, layer->ffn_down, ffn, h, &add_to_residual);
 
       if (trace != NULL && trace->layers != NULL)
         gip_metal_copy (metal, h,
@@ -308,12 +317,18 @@ gip_lfm2_metal_step (struct gip_lfm2_metal *gpu, int32_t token, float *logits,
                         n_embd);
     }
 
-  gip_metal_rms_norm (metal, h, weights_of (gpu, model->output_norm), normed,
-                      n_embd, model->norm_eps);
+  /* The output matrix normalizes the last hidden state itself.  Only a
+     trace needs the normalized vector on its own.  */
   if (trace != NULL && trace->final_norm != NULL)
-    gip_metal_copy (metal, normed, floats_at (gpu->trace_final, 0), n_embd);
+    gip_metal_rms_norm (metal, h, weights_of (gpu, model->output_norm),
+                        floats_at (gpu->trace_final, 0), n_embd,
+                        model->norm_eps);
   if (logits != NULL)
-    matvec (gpu, model->output, normed, floats_at (gpu->logits, 0));
+    {
+      struct gip_metal_matvec_options norm
+          = normalized (gpu, model->output_norm);
+      matvec (gpu, model->output, h, floats_at (gpu->logits, 0), &norm);
+    }
 
   gpu->last_encode_seconds = now_seconds () - encode_start;
   status = gip_metal_end (metal, &gpu->last_gpu_seconds);

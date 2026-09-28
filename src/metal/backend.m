@@ -16,9 +16,12 @@ extern const char gip_metal_source[];
 enum
 {
   SIMD_WIDTH = 32,
-  /* Four rows per simdgroup and two simdgroups per threadgroup match
-     the starting point of llama.cpp's Q8_0 matrix-vector kernel.  Tune
-     both with just bench.  */
+  /* A sweep of 1 to 8 rows per simdgroup and 1 to 8 simdgroups per
+     threadgroup on an M4 Pro found no setting clearly best.  One row
+     favored LFM2.5-350M at about 407 tokens per second, four rows
+     favored LFM2.5-2.6B at about 73, and most settings fell within 3%
+     of each other.  Four rows and two simdgroups sit near the best for
+     both.  */
   MATVEC_Q8_0_ROWS_PER_SIMDGROUP = 4,
   MATVEC_Q8_0_SIMDGROUPS = 2,
   /* Threads per threadgroup for the reduction and elementwise
@@ -41,16 +44,20 @@ struct profile_table
 
 /* The state behind a struct gip_metal.  */
 @interface GipMetal : NSObject
+{
+@public
+  /* The matrix-vector pipelines, indexed by whether they fuse the norm
+     and whether they accumulate.  */
+  id<MTLComputePipelineState> matvec_q8_0[2][2];
+}
 @property (nonatomic, strong) id<MTLDevice> device;
 @property (nonatomic, strong) id<MTLCommandQueue> queue;
-@property (nonatomic, strong) id<MTLComputePipelineState> matvec_q8_0;
+@property (nonatomic, strong) id<MTLComputePipelineState> matvec_q8_0_swiglu;
 @property (nonatomic, strong) id<MTLComputePipelineState> rms_norm;
 @property (nonatomic, strong) id<MTLComputePipelineState> qk_norm_rope;
 @property (nonatomic, strong) id<MTLComputePipelineState> attention_chunk;
 @property (nonatomic, strong) id<MTLComputePipelineState> attention_combine;
 @property (nonatomic, strong) id<MTLComputePipelineState> short_conv;
-@property (nonatomic, strong) id<MTLComputePipelineState> swiglu;
-@property (nonatomic, strong) id<MTLComputePipelineState> add_in_place;
 /* Objective-C treats a property named copy... as returning an owned
    object, so the copy pipeline takes a different name.  */
 @property (nonatomic, strong) id<MTLComputePipelineState> float_copy;
@@ -83,15 +90,18 @@ metal_buffer (struct gip_metal_buffer *buffer)
   return (__bridge id<MTLBuffer>)(void *)buffer;
 }
 
-/* Return a pipeline for the kernel NAME in LIBRARY on DEVICE with the
-   function constant at index 0 set to CONSTANT, or nil.  Store any
-   error in ERROR.  Kernels without the constant ignore it.  */
+/* Return a pipeline for the kernel NAME in LIBRARY on DEVICE, or nil.
+   The function constants take the values ROWS for rows_per_simdgroup,
+   FUSE_NORM for fuse_norm, and ACCUMULATE for accumulate.  Kernels
+   without those constants ignore them.  Store any error in ERROR.  */
 static id<MTLComputePipelineState>
 make_pipeline (id<MTLDevice> device, id<MTLLibrary> library, NSString *name,
-               uint32_t constant, NSError **error)
+               uint32_t rows, bool fuse_norm, bool accumulate, NSError **error)
 {
   MTLFunctionConstantValues *constants = [MTLFunctionConstantValues new];
-  [constants setConstantValue:&constant type:MTLDataTypeUInt atIndex:0];
+  [constants setConstantValue:&rows type:MTLDataTypeUInt atIndex:0];
+  [constants setConstantValue:&fuse_norm type:MTLDataTypeBool atIndex:1];
+  [constants setConstantValue:&accumulate type:MTLDataTypeBool atIndex:2];
 
   id<MTLFunction> function = [library newFunctionWithName:name
                                            constantValues:constants
@@ -131,27 +141,33 @@ gip_metal_open (struct gip_metal **out, char *err, size_t err_size)
     GipMetal *metal = [GipMetal new];
     metal.device = device;
     metal.queue = [device newCommandQueue];
-    metal.matvec_q8_0 = make_pipeline (device, library, @"matvec_q8_0",
-                                       MATVEC_Q8_0_ROWS_PER_SIMDGROUP, &error);
-    metal.rms_norm = make_pipeline (device, library, @"rms_norm", 0, &error);
-    metal.qk_norm_rope
-        = make_pipeline (device, library, @"qk_norm_rope", 0, &error);
-    metal.attention_chunk
-        = make_pipeline (device, library, @"attention_chunk", 0, &error);
-    metal.attention_combine
-        = make_pipeline (device, library, @"attention_combine", 0, &error);
-    metal.short_conv
-        = make_pipeline (device, library, @"short_conv", 0, &error);
-    metal.swiglu = make_pipeline (device, library, @"swiglu", 0, &error);
-    metal.add_in_place
-        = make_pipeline (device, library, @"add_in_place", 0, &error);
-    metal.float_copy
-        = make_pipeline (device, library, @"copy_floats", 0, &error);
-    if (metal.queue == nil || metal.matvec_q8_0 == nil || metal.rms_norm == nil
-        || metal.qk_norm_rope == nil || metal.attention_chunk == nil
-        || metal.attention_combine == nil || metal.short_conv == nil
-        || metal.swiglu == nil || metal.add_in_place == nil
-        || metal.float_copy == nil)
+    uint32_t rows = MATVEC_Q8_0_ROWS_PER_SIMDGROUP;
+    for (int norm = 0; norm < 2; norm++)
+      for (int acc = 0; acc < 2; acc++)
+        metal->matvec_q8_0[norm][acc] = make_pipeline (
+            device, library, @"matvec_q8_0", rows, norm, acc, &error);
+    metal.matvec_q8_0_swiglu = make_pipeline (
+        device, library, @"matvec_q8_0_swiglu", rows, true, false, &error);
+    metal.rms_norm = make_pipeline (device, library, @"rms_norm", 0, false,
+                                    false, &error);
+    metal.qk_norm_rope = make_pipeline (device, library, @"qk_norm_rope", 0,
+                                        false, false, &error);
+    metal.attention_chunk = make_pipeline (device, library, @"attention_chunk",
+                                           0, false, false, &error);
+    metal.attention_combine = make_pipeline (
+        device, library, @"attention_combine", 0, false, false, &error);
+    metal.short_conv = make_pipeline (device, library, @"short_conv", 0, false,
+                                      false, &error);
+    metal.float_copy = make_pipeline (device, library, @"copy_floats", 0,
+                                      false, false, &error);
+    bool have_matvec = true;
+    for (int norm = 0; norm < 2; norm++)
+      for (int acc = 0; acc < 2; acc++)
+        have_matvec &= metal->matvec_q8_0[norm][acc] != nil;
+    if (metal.queue == nil || !have_matvec || metal.matvec_q8_0_swiglu == nil
+        || metal.rms_norm == nil || metal.qk_norm_rope == nil
+        || metal.attention_chunk == nil || metal.attention_combine == nil
+        || metal.short_conv == nil || metal.float_copy == nil)
       {
         gip_format_error (err, err_size, "cannot create Metal pipelines: %s",
                           error != nil ? error.localizedDescription.UTF8String
@@ -356,30 +372,79 @@ gip_metal_profile (struct gip_metal *metal,
   return m.profile->count;
 }
 
-void
-gip_metal_matvec_q8_0 (struct gip_metal *metal, struct gip_metal_view weights,
-                       uint32_t n_rows, uint32_t n_cols,
-                       struct gip_metal_view x, struct gip_metal_view y)
+/* Dispatch the current matrix-vector pipeline of ENCODER over N_ROWS
+   rows.  */
+static void
+dispatch_matvec (id<MTLComputeCommandEncoder> encoder, uint32_t n_rows)
 {
-  GipMetal *m = backend (metal);
-  id<MTLComputeCommandEncoder> encoder = op_encoder (m);
   uint32_t rows_per_threadgroup
       = MATVEC_Q8_0_ROWS_PER_SIMDGROUP * MATVEC_Q8_0_SIMDGROUPS;
   NSUInteger n_threadgroups
       = (n_rows + rows_per_threadgroup - 1) / rows_per_threadgroup;
 
-  [encoder setComputePipelineState:m.matvec_q8_0];
+  [encoder
+       dispatchThreadgroups:MTLSizeMake (n_threadgroups, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake (SIMD_WIDTH * MATVEC_Q8_0_SIMDGROUPS,
+                                         1, 1)];
+}
+
+/* Return the bytes of a Q8_0 matrix of N_ROWS rows of N_COLS
+   elements.  */
+static uint64_t
+q8_0_bytes (uint32_t n_rows, uint32_t n_cols)
+{
+  return (uint64_t)n_rows * (n_cols / 32) * 34;
+}
+
+void
+gip_metal_matvec_q8_0 (struct gip_metal *metal, struct gip_metal_view weights,
+                       uint32_t n_rows, uint32_t n_cols,
+                       struct gip_metal_view x, struct gip_metal_view y,
+                       const struct gip_metal_matvec_options *options)
+{
+  GipMetal *m = backend (metal);
+  bool norm = options != NULL && options->norm_weight.buffer != NULL;
+  bool acc = options != NULL && options->accumulate;
+  id<MTLComputeCommandEncoder> encoder = op_encoder (m);
+
+  [encoder setComputePipelineState:m->matvec_q8_0[norm][acc]];
   bind (encoder, weights, 0);
   bind (encoder, x, 1);
   bind (encoder, y, 2);
   bind_bytes (encoder, &n_rows, sizeof n_rows, 3);
   bind_bytes (encoder, &n_cols, sizeof n_cols, 4);
-  [encoder
-       dispatchThreadgroups:MTLSizeMake (n_threadgroups, 1, 1)
-      threadsPerThreadgroup:MTLSizeMake (SIMD_WIDTH * MATVEC_Q8_0_SIMDGROUPS,
-                                         1, 1)];
-  op_done (m, "matvec_q8_0", n_rows, n_cols,
-           (uint64_t)n_rows * (n_cols / 32) * 34);
+  if (norm)
+    {
+      bind (encoder, options->norm_weight, 5);
+      bind_bytes (encoder, &options->eps, sizeof options->eps, 6);
+    }
+  dispatch_matvec (encoder, n_rows);
+  op_done (m, "matvec_q8_0", n_rows, n_cols, q8_0_bytes (n_rows, n_cols));
+}
+
+void
+gip_metal_matvec_q8_0_swiglu (struct gip_metal *metal,
+                              struct gip_metal_view gate,
+                              struct gip_metal_view up, uint32_t n_rows,
+                              uint32_t n_cols, struct gip_metal_view x,
+                              struct gip_metal_view norm_weight, float eps,
+                              struct gip_metal_view y)
+{
+  GipMetal *m = backend (metal);
+  id<MTLComputeCommandEncoder> encoder = op_encoder (m);
+
+  [encoder setComputePipelineState:m.matvec_q8_0_swiglu];
+  bind (encoder, gate, 0);
+  bind (encoder, up, 1);
+  bind (encoder, x, 2);
+  bind (encoder, y, 3);
+  bind_bytes (encoder, &n_rows, sizeof n_rows, 4);
+  bind_bytes (encoder, &n_cols, sizeof n_cols, 5);
+  bind (encoder, norm_weight, 6);
+  bind_bytes (encoder, &eps, sizeof eps, 7);
+  dispatch_matvec (encoder, n_rows);
+  op_done (m, "matvec_q8_0_swiglu", n_rows, n_cols,
+           2 * q8_0_bytes (n_rows, n_cols));
 }
 
 void
@@ -498,36 +563,6 @@ gip_metal_short_conv (struct gip_metal *metal, struct gip_metal_view bcx,
   bind_bytes (encoder, &kernel_size, sizeof kernel_size, 5);
   dispatch_elements (encoder, n_embd);
   op_done (m, "short_conv", 0, 0, 0);
-}
-
-void
-gip_metal_swiglu (struct gip_metal *metal, struct gip_metal_view gate,
-                  struct gip_metal_view up, uint32_t n)
-{
-  GipMetal *m = backend (metal);
-  id<MTLComputeCommandEncoder> encoder = op_encoder (m);
-
-  [encoder setComputePipelineState:m.swiglu];
-  bind (encoder, gate, 0);
-  bind (encoder, up, 1);
-  bind_bytes (encoder, &n, sizeof n, 2);
-  dispatch_elements (encoder, n);
-  op_done (m, "swiglu", 0, 0, 0);
-}
-
-void
-gip_metal_add (struct gip_metal *metal, struct gip_metal_view h,
-               struct gip_metal_view delta, uint32_t n)
-{
-  GipMetal *m = backend (metal);
-  id<MTLComputeCommandEncoder> encoder = op_encoder (m);
-
-  [encoder setComputePipelineState:m.add_in_place];
-  bind (encoder, h, 0);
-  bind (encoder, delta, 1);
-  bind_bytes (encoder, &n, sizeof n, 2);
-  dispatch_elements (encoder, n);
-  op_done (m, "add", 0, 0, 0);
 }
 
 void
