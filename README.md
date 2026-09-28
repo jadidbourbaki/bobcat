@@ -1,12 +1,20 @@
 # gip
 
-gip, the general inference program, runs language models on the Apple
-silicon GPU. It reads GGUF files, the format most quantized models on
-Hugging Face ship in, and runs them with its own Metal kernels. The
-goal is the fastest local inference on a Mac.
+<p>
+  <a href="https://github.com/jadidbourbaki/gip/actions/workflows/ci.yml"><img src="https://github.com/jadidbourbaki/gip/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/jadidbourbaki/gip/releases/latest"><img src="https://img.shields.io/github/v/release/jadidbourbaki/gip?include_prereleases" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
+  <a href="CONTRIBUTING.md"><img src="https://img.shields.io/badge/contributions-welcome-brightgreen.svg" alt="Contributions welcome"></a>
+</p>
+
+**gip runs language models on your Mac's GPU.**
+
+It reads the GGUF files on Hugging Face and runs them with its own
+Metal kernels, built to be the fastest way to run a model locally on
+Apple silicon.
 
 ```console
-$ gip chat -m LiquidAI/LFM2.5-1.2B-Instruct-GGUF:Q4_K_M
+$ gip chat -m lfm2.5:1.2b
 > What is the capital of Japan? One sentence.
 The capital of Japan is Tokyo.
 ```
@@ -14,75 +22,28 @@ The capital of Japan is Tokyo.
 gip is early. It runs Liquid AI's LFM2 and LFM2.5 models today, in the
 Q8_0, Q4_0, and Q4_K_M quantizations. More model families come next.
 
-## Install
+## Quick start
 
-gip needs a Mac with Apple silicon, macOS 15 or newer, and a Rust
-toolchain from [rustup](https://rustup.rs). It needs no Xcode, because
-it compiles its GPU kernels when it starts.
+Install gip on a Mac with Apple silicon and macOS 15 or newer:
 
 ```console
-$ cargo install --locked --git https://github.com/jadidbourbaki/gip gip-cli
+$ curl -fsSL https://raw.githubusercontent.com/jadidbourbaki/gip/main/install.sh | sh
 ```
 
-## Use
-
-`gip chat` holds a conversation in the terminal. Ctrl-D ends it.
-Models that reason before they answer, such as LFM2.5-2.6B, show their
-reasoning in dim text first.
+Download a model:
 
 ```console
-$ gip chat -m LiquidAI/LFM2.5-2.6B-GGUF:Q4_K_M
+$ gip pull lfm2.5:1.2b
 ```
 
-`gip respond` answers one prompt and writes only the answer to
-standard output, so it works in scripts and pipes. Text on standard
-input follows the prompt.
+Chat with it:
 
 ```console
-$ gip respond -m LiquidAI/LFM2.5-1.2B-Instruct-GGUF "Name three primes."
-$ cat notes.md | gip respond -m LiquidAI/LFM2.5-1.2B-Instruct-GGUF "Summarize this."
+$ gip chat -m lfm2.5:1.2b
 ```
 
-A model name is a Hugging Face repository with an optional
-quantization tag, which defaults to Q8_0. gip downloads a model the
-first time a command names it, into the shared Hugging Face cache at
-`~/.cache/huggingface`. `-m` also takes a path to a GGUF file.
+Or answer one prompt, for scripts and pipes:
 
-| Command | Meaning |
-|---|---|
-| `gip pull NAME` | Download a model and print the path of its file |
-| `gip list` | List the downloaded models and their sizes |
-| `gip rm NAME` | Remove a downloaded model |
-
-Replies sample with the settings the model file recommends, or with
-the settings of the model's authors when the file names none.
-`--temperature`, `--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`,
-and `--seed` override them. `gip help` lists every option.
-
-## Speed
-
-Tokens per second on an M4 Pro with a 20-core GPU, measured on
-2026-09-28 against llama.cpp `4da6337` on the same GGUF files. Each
-run prefills a 512-token prompt and then generates 128 tokens, and
-each number is the mean of 5 runs.
-
-| Model | gip decode | llama.cpp decode | gip prefill | llama.cpp prefill |
-|---|---|---|---|---|
-| LFM2.5-350M Q4_K_M | 612 | 554 | 7,516 | 9,793 |
-| LFM2.5-2.6B Q4_K_M | 119 | 117 | 994 | 1,269 |
-
-gip generates text faster than llama.cpp. Prompt processing is slower,
-and it is the current focus of the kernel work. `just bench` in a
-checkout reruns these measurements, along with mlx-lm, mistral.rs, and
-candle.
-
-## Develop
-
-`AGENTS.md` describes the code layout, the conventions, and the
-benchmark protocol. `just check` runs the formatters, the linters, and
-the tests. The tests compare every layer of the forward pass with
-transformers.
-
-## License
-
-MIT
+```console
+$ gip respond -m lfm2.5:1.2b "Name three primes."
+```
