@@ -284,29 +284,30 @@ rms_norm (device const float *x [[buffer (0)]],
     out[i] = weight[i] * (x[i] * scale);
 }
 
-/* Normalize each of the heads of HEAD_DIM floats at VEC by its root mean
-   square, scale it by the HEAD_DIM floats at WEIGHT, and rotate it for
-   position POS with base THETA, pairing element I with element I +
-   HEAD_DIM / 2.  One threadgroup of HEAD_DIM threads handles one
-   head.  */
+/* Normalize each of the heads of HEAD_DIM floats at SRC by its root mean
+   square, scale it by the HEAD_DIM floats at WEIGHT, rotate it for
+   position POS with base THETA, and store it at DST as T.  Element I
+   pairs with element I + HEAD_DIM / 2.  One threadgroup of HEAD_DIM
+   threads handles one head.  SRC and DST may be the same floats.  */
+template <typename T>
 kernel void
-qk_norm_rope (device float *vec [[buffer (0)]],
-              device const float *weight [[buffer (1)]],
-              constant uint &head_dim [[buffer (2)]],
-              constant uint &pos [[buffer (3)]],
-              constant float &theta [[buffer (4)]],
-              constant float &eps [[buffer (5)]],
-              uint head [[threadgroup_position_in_grid]],
-              uint i [[thread_position_in_threadgroup]],
-              uint simdgroup_index [[simdgroup_index_in_threadgroup]],
-              uint simdgroups [[simdgroups_per_threadgroup]],
-              uint lane [[thread_index_in_simdgroup]])
+norm_rope (device const float *src [[buffer (0)]],
+           device T *dst [[buffer (1)]],
+           device const float *weight [[buffer (2)]],
+           constant uint &head_dim [[buffer (3)]],
+           constant uint &pos [[buffer (4)]],
+           constant float &theta [[buffer (5)]],
+           constant float &eps [[buffer (6)]],
+           uint head [[threadgroup_position_in_grid]],
+           uint i [[thread_position_in_threadgroup]],
+           uint simdgroup_index [[simdgroup_index_in_threadgroup]],
+           uint simdgroups [[simdgroups_per_threadgroup]],
+           uint lane [[thread_index_in_simdgroup]])
 {
   threadgroup float partials[MAX_SIMDGROUPS];
   threadgroup float normed[MAX_HEAD_DIM];
-  device float *v = vec + head * head_dim;
 
-  float value = v[i];
+  float value = src[head * head_dim + i];
   float sum_squares = threadgroup_sum (value * value, partials,
                                        simdgroup_index, simdgroups, lane);
   float scale = precise::rsqrt (sum_squares / float (head_dim) + eps);
@@ -314,6 +315,7 @@ qk_norm_rope (device float *vec [[buffer (0)]],
   threadgroup_barrier (mem_flags::mem_threadgroup);
 
   uint half_dim = head_dim / 2;
+  device T *out = dst + head * head_dim;
   if (i < half_dim)
     {
       float inv_freq
@@ -323,9 +325,26 @@ qk_norm_rope (device float *vec [[buffer (0)]],
       float s = precise::sin (angle);
       float x0 = normed[i];
       float x1 = normed[i + half_dim];
-      v[i] = x0 * c - x1 * s;
-      v[i + half_dim] = x1 * c + x0 * s;
+      out[i] = T (x0 * c - x1 * s);
+      out[i + half_dim] = T (x1 * c + x0 * s);
     }
+}
+
+/* The element type appears in the signature, so each instantiation
+   names its own type.  */
+template [[host_name ("norm_rope_f32")]] kernel decltype (norm_rope<float>)
+    norm_rope<float>;
+template [[host_name ("norm_rope_f16")]] kernel decltype (norm_rope<half>)
+    norm_rope<half>;
+
+/* Convert the N floats at SRC to half precision at DST.  */
+kernel void
+convert_half (device const float *src [[buffer (0)]],
+              device half *dst [[buffer (1)]], constant uint &n [[buffer (2)]],
+              uint i [[thread_position_in_grid]])
+{
+  if (i < n)
+    dst[i] = half (src[i]);
 }
 
 /* Attend with the query heads at Q over one chunk of ATTENTION_CHUNK
@@ -338,12 +357,13 @@ qk_norm_rope (device float *vec [[buffer (0)]],
    position, so K and V are read once per chunk.  For each query head
    the pass stores the chunk's largest score, its sum of exponentials
    relative to that score, and its unnormalized weighted sum of values in
-   SCRATCH, laid out as attention_combine expects for MAX_CHUNKS
-   chunks.  */
+   SCRATCH, laid out as attention_combine expects for MAX_CHUNKS chunks.
+   The caches hold elements of type T.  */
+template <typename T>
 kernel void
 attention_chunk (device const float *q [[buffer (0)]],
-                 device const float *k_cache [[buffer (1)]],
-                 device const float *v_cache [[buffer (2)]],
+                 device const T *k_cache [[buffer (1)]],
+                 device const T *v_cache [[buffer (2)]],
                  device float *scratch [[buffer (3)]],
                  constant uint &n_heads [[buffer (4)]],
                  constant uint &n_kv_heads [[buffer (5)]],
@@ -378,9 +398,9 @@ attention_chunk (device const float *q [[buffer (0)]],
 
   float score[ATTENTION_MAX_GROUP];
   bool valid = tid < count;
-  device const float4 *key
-      = (device const float4 *)(k_cache + (start + tid) * kv_dim
-                                + kv_head * head_dim);
+  device const vec<T, 4> *key
+      = (device const vec<T, 4> *)(k_cache + (start + tid) * kv_dim
+                                   + kv_head * head_dim);
   for (uint g = 0; g < group; g++)
     {
       threadgroup const float4 *qg
@@ -388,7 +408,7 @@ attention_chunk (device const float *q [[buffer (0)]],
       float s = 0.0f;
       if (valid)
         for (uint d = 0; d < head_dim / 4; d++)
-          s += dot (qg[d], key[d]);
+          s += dot (qg[d], float4 (key[d]));
       score[g] = valid ? s * scale : -INFINITY;
     }
 
@@ -413,7 +433,7 @@ attention_chunk (device const float *q [[buffer (0)]],
 
   /* Neighboring threads take neighboring elements of each value row, so
      the reads coalesce.  */
-  device const float *values = v_cache + start * kv_dim + kv_head * head_dim;
+  device const T *values = v_cache + start * kv_dim + kv_head * head_dim;
   for (uint i = tid; i < group * head_dim; i += threads)
     {
       uint g = i / head_dim;
@@ -421,10 +441,15 @@ attention_chunk (device const float *q [[buffer (0)]],
       threadgroup const float *w = weights + g * ATTENTION_CHUNK;
       float acc = 0.0f;
       for (uint t = 0; t < count; t++)
-        acc += w[t] * values[t * kv_dim + d];
+        acc += w[t] * float (values[t * kv_dim + d]);
       scratch[((first_head + g) * max_chunks + chunk) * head_dim + d] = acc;
     }
 }
+
+template [[host_name ("attention_chunk_f32")]] kernel decltype (
+    attention_chunk<float>) attention_chunk<float>;
+template [[host_name ("attention_chunk_f16")]] kernel decltype (
+    attention_chunk<half>) attention_chunk<half>;
 
 /* Combine the N_CHUNKS chunk results of attention_chunk in SCRATCH into
    the result of each query head at OUT, as the second of two passes.

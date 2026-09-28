@@ -8,6 +8,7 @@
 
 /* The GPU state of one LFM2 decode on METAL: the weights, the caches,
    and the scratch buffers.  N_PAST counts the tokens processed so far.
+   KV_HALF is true when the KV cache holds half-precision numbers.
    LAST_ENCODE_SECONDS and LAST_GPU_SECONDS time the CPU recording and
    the GPU execution of the latest step.  */
 struct gip_lfm2_metal
@@ -16,12 +17,15 @@ struct gip_lfm2_metal
   struct gip_metal *metal;
   uint32_t n_ctx;
   uint32_t n_past;
+  bool kv_half;
   double last_encode_seconds;
   double last_gpu_seconds;
   struct gip_metal_buffer *weights;
   const unsigned char *weights_base;
   struct gip_metal_buffer *k_cache;
   struct gip_metal_buffer *v_cache;
+  struct gip_metal_buffer *k;
+  struct gip_metal_buffer *v;
   struct gip_metal_buffer *conv_state;
   struct gip_metal_buffer *hidden;
   struct gip_metal_buffer *bcx;
@@ -36,12 +40,13 @@ struct gip_lfm2_metal
 };
 
 /* Prepare GPU for decoding sequences of up to N_CTX tokens of MODEL on
-   METAL.  Every matrix of MODEL must be Q8_0.  On failure, write a
-   message to ERR, which holds ERR_SIZE bytes.  */
+   METAL.  Every matrix of MODEL must be Q8_0.  The KV cache holds half
+   precision when KV_HALF is nonzero and floats otherwise.  On failure,
+   write a message to ERR, which holds ERR_SIZE bytes.  */
 enum gip_status gip_lfm2_metal_init (const struct gip_lfm2_model *model,
                                      struct gip_metal *metal, uint32_t n_ctx,
-                                     struct gip_lfm2_metal *gpu, char *err,
-                                     size_t err_size);
+                                     int kv_half, struct gip_lfm2_metal *gpu,
+                                     char *err, size_t err_size);
 
 /* Release everything GPU owns.  */
 void gip_lfm2_metal_free (struct gip_lfm2_metal *gpu);

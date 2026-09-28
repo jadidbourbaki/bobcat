@@ -49,13 +49,18 @@ struct profile_table
   /* The matrix-vector pipelines, indexed by whether they fuse the norm
      and whether they accumulate.  */
   id<MTLComputePipelineState> matvec_q8_0[2][2];
+  /* The norm and rotation pipelines, indexed by whether they write half
+     precision.  */
+  id<MTLComputePipelineState> norm_rope[2];
+  /* The first attention pass, indexed by whether the caches hold half
+     precision.  */
+  id<MTLComputePipelineState> attention_chunk[2];
 }
 @property (nonatomic, strong) id<MTLDevice> device;
 @property (nonatomic, strong) id<MTLCommandQueue> queue;
 @property (nonatomic, strong) id<MTLComputePipelineState> matvec_q8_0_swiglu;
 @property (nonatomic, strong) id<MTLComputePipelineState> rms_norm;
-@property (nonatomic, strong) id<MTLComputePipelineState> qk_norm_rope;
-@property (nonatomic, strong) id<MTLComputePipelineState> attention_chunk;
+@property (nonatomic, strong) id<MTLComputePipelineState> convert_half;
 @property (nonatomic, strong) id<MTLComputePipelineState> attention_combine;
 @property (nonatomic, strong) id<MTLComputePipelineState> short_conv;
 /* Objective-C treats a property named copy... as returning an owned
@@ -90,10 +95,10 @@ metal_buffer (struct gip_metal_buffer *buffer)
   return (__bridge id<MTLBuffer>)(void *)buffer;
 }
 
-/* Return a pipeline for the kernel NAME in LIBRARY on DEVICE, or nil.
-   The function constants take the values ROWS for rows_per_simdgroup,
-   FUSE_NORM for fuse_norm, and ACCUMULATE for accumulate.  Kernels
-   without those constants ignore them.  Store any error in ERROR.  */
+/* Return a pipeline for the matrix-vector kernel NAME in LIBRARY on
+   DEVICE, or nil.  The function constants take the values ROWS for
+   rows_per_simdgroup, FUSE_NORM for fuse_norm, and ACCUMULATE for
+   accumulate.  Store any error in ERROR.  */
 static id<MTLComputePipelineState>
 make_pipeline (id<MTLDevice> device, id<MTLLibrary> library, NSString *name,
                uint32_t rows, bool fuse_norm, bool accumulate, NSError **error)
@@ -106,6 +111,19 @@ make_pipeline (id<MTLDevice> device, id<MTLLibrary> library, NSString *name,
   id<MTLFunction> function = [library newFunctionWithName:name
                                            constantValues:constants
                                                     error:error];
+  if (function == nil)
+    return nil;
+  return [device newComputePipelineStateWithFunction:function error:error];
+}
+
+/* Return a pipeline for the kernel NAME, which has no function
+   constants, in LIBRARY on DEVICE, or nil.  Store any error in
+   ERROR.  */
+static id<MTLComputePipelineState>
+plain_pipeline (id<MTLDevice> device, id<MTLLibrary> library, NSString *name,
+                NSError **error)
+{
+  id<MTLFunction> function = [library newFunctionWithName:name];
   if (function == nil)
     return nil;
   return [device newComputePipelineStateWithFunction:function error:error];
@@ -148,26 +166,33 @@ gip_metal_open (struct gip_metal **out, char *err, size_t err_size)
             device, library, @"matvec_q8_0", rows, norm, acc, &error);
     metal.matvec_q8_0_swiglu = make_pipeline (
         device, library, @"matvec_q8_0_swiglu", rows, true, false, &error);
-    metal.rms_norm = make_pipeline (device, library, @"rms_norm", 0, false,
-                                    false, &error);
-    metal.qk_norm_rope = make_pipeline (device, library, @"qk_norm_rope", 0,
-                                        false, false, &error);
-    metal.attention_chunk = make_pipeline (device, library, @"attention_chunk",
-                                           0, false, false, &error);
-    metal.attention_combine = make_pipeline (
-        device, library, @"attention_combine", 0, false, false, &error);
-    metal.short_conv = make_pipeline (device, library, @"short_conv", 0, false,
-                                      false, &error);
-    metal.float_copy = make_pipeline (device, library, @"copy_floats", 0,
-                                      false, false, &error);
-    bool have_matvec = true;
+    metal.rms_norm = plain_pipeline (device, library, @"rms_norm", &error);
+    metal->norm_rope[0]
+        = plain_pipeline (device, library, @"norm_rope_f32", &error);
+    metal->norm_rope[1]
+        = plain_pipeline (device, library, @"norm_rope_f16", &error);
+    metal.convert_half
+        = plain_pipeline (device, library, @"convert_half", &error);
+    metal->attention_chunk[0]
+        = plain_pipeline (device, library, @"attention_chunk_f32", &error);
+    metal->attention_chunk[1]
+        = plain_pipeline (device, library, @"attention_chunk_f16", &error);
+    metal.attention_combine
+        = plain_pipeline (device, library, @"attention_combine", &error);
+    metal.short_conv = plain_pipeline (device, library, @"short_conv", &error);
+    metal.float_copy
+        = plain_pipeline (device, library, @"copy_floats", &error);
+    bool have_all = true;
     for (int norm = 0; norm < 2; norm++)
       for (int acc = 0; acc < 2; acc++)
-        have_matvec &= metal->matvec_q8_0[norm][acc] != nil;
-    if (metal.queue == nil || !have_matvec || metal.matvec_q8_0_swiglu == nil
-        || metal.rms_norm == nil || metal.qk_norm_rope == nil
-        || metal.attention_chunk == nil || metal.attention_combine == nil
-        || metal.short_conv == nil || metal.float_copy == nil)
+        have_all &= metal->matvec_q8_0[norm][acc] != nil;
+    for (int half_precision = 0; half_precision < 2; half_precision++)
+      have_all &= metal->norm_rope[half_precision] != nil
+                  && metal->attention_chunk[half_precision] != nil;
+    if (metal.queue == nil || !have_all || metal.matvec_q8_0_swiglu == nil
+        || metal.rms_norm == nil || metal.convert_half == nil
+        || metal.attention_combine == nil || metal.short_conv == nil
+        || metal.float_copy == nil)
       {
         gip_format_error (err, err_size, "cannot create Metal pipelines: %s",
                           error != nil ? error.localizedDescription.UTF8String
@@ -467,24 +492,40 @@ gip_metal_rms_norm (struct gip_metal *metal, struct gip_metal_view x,
 }
 
 void
-gip_metal_qk_norm_rope (struct gip_metal *metal, struct gip_metal_view vec,
-                        struct gip_metal_view weight, uint32_t n_heads,
-                        uint32_t head_dim, uint32_t pos, float theta,
-                        float eps)
+gip_metal_norm_rope (struct gip_metal *metal, struct gip_metal_view src,
+                     struct gip_metal_view dst, int dst_half,
+                     struct gip_metal_view weight, uint32_t n_heads,
+                     uint32_t head_dim, uint32_t pos, float theta, float eps)
 {
   GipMetal *m = backend (metal);
   id<MTLComputeCommandEncoder> encoder = op_encoder (m);
 
-  [encoder setComputePipelineState:m.qk_norm_rope];
-  bind (encoder, vec, 0);
-  bind (encoder, weight, 1);
-  bind_bytes (encoder, &head_dim, sizeof head_dim, 2);
-  bind_bytes (encoder, &pos, sizeof pos, 3);
-  bind_bytes (encoder, &theta, sizeof theta, 4);
-  bind_bytes (encoder, &eps, sizeof eps, 5);
+  [encoder setComputePipelineState:m->norm_rope[dst_half != 0]];
+  bind (encoder, src, 0);
+  bind (encoder, dst, 1);
+  bind (encoder, weight, 2);
+  bind_bytes (encoder, &head_dim, sizeof head_dim, 3);
+  bind_bytes (encoder, &pos, sizeof pos, 4);
+  bind_bytes (encoder, &theta, sizeof theta, 5);
+  bind_bytes (encoder, &eps, sizeof eps, 6);
   [encoder dispatchThreadgroups:MTLSizeMake (n_heads, 1, 1)
           threadsPerThreadgroup:MTLSizeMake (head_dim, 1, 1)];
-  op_done (m, "qk_norm_rope", 0, 0, 0);
+  op_done (m, "norm_rope", 0, 0, 0);
+}
+
+void
+gip_metal_convert_half (struct gip_metal *metal, struct gip_metal_view src,
+                        struct gip_metal_view dst, uint32_t n)
+{
+  GipMetal *m = backend (metal);
+  id<MTLComputeCommandEncoder> encoder = op_encoder (m);
+
+  [encoder setComputePipelineState:m.convert_half];
+  bind (encoder, src, 0);
+  bind (encoder, dst, 1);
+  bind_bytes (encoder, &n, sizeof n, 2);
+  dispatch_elements (encoder, n);
+  op_done (m, "convert_half", 0, 0, 0);
 }
 
 /* Return the number of attention chunks covering N positions.  */
@@ -506,7 +547,7 @@ gip_metal_attention_scratch (uint32_t n_heads, uint32_t head_dim,
 void
 gip_metal_attention (struct gip_metal *metal, struct gip_metal_view q,
                      struct gip_metal_view k_cache,
-                     struct gip_metal_view v_cache,
+                     struct gip_metal_view v_cache, int kv_half,
                      struct gip_metal_view scratch, struct gip_metal_view out,
                      uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
                      uint32_t n_keys, uint32_t n_ctx)
@@ -517,7 +558,7 @@ gip_metal_attention (struct gip_metal *metal, struct gip_metal_view q,
   uint32_t max_chunks = attention_chunks (n_ctx);
 
   id<MTLComputeCommandEncoder> encoder = op_encoder (m);
-  [encoder setComputePipelineState:m.attention_chunk];
+  [encoder setComputePipelineState:m->attention_chunk[kv_half != 0]];
   bind (encoder, q, 0);
   bind (encoder, k_cache, 1);
   bind (encoder, v_cache, 2);

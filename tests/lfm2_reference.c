@@ -31,6 +31,11 @@ enum
    so only summation order separates them.  */
 static const double TOLERANCE = 1e-4;
 
+/* The largest error allowed when the KV cache holds half precision,
+   which rounds every cached key and value to 11 significant bits.  On
+   LFM2.5-350M the largest error measured was 1.2e-3.  */
+static const double HALF_KV_TOLERANCE = 5e-3;
+
 /* The forward pass under test.  */
 struct runner
 {
@@ -129,13 +134,16 @@ main (int argc, char **argv)
 {
   if (argc != 3 && argc != 4)
     {
-      fprintf (stderr,
-               "usage: lfm2_reference MODEL.gguf REF_DIR [scalar|metal]\n");
+      fprintf (stderr, "usage: lfm2_reference MODEL.gguf REF_DIR "
+                       "[scalar|metal|metal_f32]\n");
       return EXIT_FAILURE;
     }
   const char *model_path = argv[1];
   const char *ref_dir = argv[2];
-  bool use_metal = argc == 4 && strcmp (argv[3], "metal") == 0;
+  const char *mode = argc == 4 ? argv[3] : "scalar";
+  bool use_metal = strncmp (mode, "metal", 5) == 0;
+  bool kv_half = strcmp (mode, "metal") == 0;
+  double tolerance = kv_half ? HALF_KV_TOLERANCE : TOLERANCE;
   if (use_metal && !GIP_HAVE_METAL)
     {
       printf ("skip: this build has no Metal backend\n");
@@ -209,8 +217,8 @@ main (int argc, char **argv)
           printf ("skip: %s\n", err);
           return EXIT_SKIP;
         }
-      status = gip_lfm2_metal_init (&model, runner.metal, n_ctx, &runner.gpu,
-                                    err, sizeof err);
+      status = gip_lfm2_metal_init (&model, runner.metal, n_ctx, kv_half,
+                                    &runner.gpu, err, sizeof err);
       if (status != GIP_OK)
         {
           fprintf (stderr, "lfm2_reference: %s\n", err);
@@ -282,13 +290,13 @@ main (int argc, char **argv)
       else
         snprintf (label, sizeof label, "logits");
       printf ("%-14s %.3e\n", label, worst[i]);
-      if (first_bad < 0 && !(worst[i] <= TOLERANCE))
+      if (first_bad < 0 && !(worst[i] <= tolerance))
         first_bad = (int)i;
     }
   if (first_bad >= 0)
     {
       printf ("FAIL: activation %d exceeds the tolerance %.0e\n", first_bad,
-              TOLERANCE);
+              tolerance);
       return EXIT_FAILURE;
     }
 

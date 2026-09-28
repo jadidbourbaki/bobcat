@@ -71,7 +71,7 @@ new_floats (struct gip_lfm2_metal *gpu, size_t count)
 
 enum gip_status
 gip_lfm2_metal_init (const struct gip_lfm2_model *model,
-                     struct gip_metal *metal, uint32_t n_ctx,
+                     struct gip_metal *metal, uint32_t n_ctx, int kv_half,
                      struct gip_lfm2_metal *gpu, char *err, size_t err_size)
 {
   size_t n_embd = model->n_embd;
@@ -104,6 +104,7 @@ gip_lfm2_metal_init (const struct gip_lfm2_model *model,
   gpu->model = model;
   gpu->metal = metal;
   gpu->n_ctx = n_ctx;
+  gpu->kv_half = kv_half != 0;
   gpu->weights_base = model->gguf.base;
 
   /* A memory-mapped file becomes a GPU buffer with no copy.  A file read
@@ -120,11 +121,17 @@ gip_lfm2_metal_init (const struct gip_lfm2_model *model,
                 model->gguf.size);
     }
 
-  size_t cache_floats = (size_t)model->n_attention_layers * n_ctx * kv_dim;
+  /* A half-precision cache holds two elements in the space of one
+     float.  */
+  size_t cache_elements = (size_t)model->n_attention_layers * n_ctx * kv_dim;
+  size_t cache_floats
+      = gpu->kv_half ? (cache_elements + 1) / 2 : cache_elements;
   size_t conv_floats
       = (size_t)model->n_conv_layers * (model->conv_kernel - 1) * n_embd;
   gpu->k_cache = new_floats (gpu, cache_floats);
   gpu->v_cache = new_floats (gpu, cache_floats);
+  gpu->k = new_floats (gpu, kv_dim);
+  gpu->v = new_floats (gpu, kv_dim);
   gpu->conv_state = new_floats (gpu, conv_floats);
   gpu->hidden = new_floats (gpu, n_embd);
   gpu->bcx = new_floats (gpu, 3 * n_embd);
@@ -139,10 +146,11 @@ gip_lfm2_metal_init (const struct gip_lfm2_model *model,
   gpu->trace_final = new_floats (gpu, n_embd);
 
   if (gpu->weights == NULL || gpu->k_cache == NULL || gpu->v_cache == NULL
-      || gpu->conv_state == NULL || gpu->hidden == NULL || gpu->bcx == NULL
-      || gpu->conv_out == NULL || gpu->q == NULL || gpu->attn == NULL
-      || gpu->scores == NULL || gpu->ffn == NULL || gpu->logits == NULL
-      || gpu->trace_layers == NULL || gpu->trace_final == NULL)
+      || gpu->k == NULL || gpu->v == NULL || gpu->conv_state == NULL
+      || gpu->hidden == NULL || gpu->bcx == NULL || gpu->conv_out == NULL
+      || gpu->q == NULL || gpu->attn == NULL || gpu->scores == NULL
+      || gpu->ffn == NULL || gpu->logits == NULL || gpu->trace_layers == NULL
+      || gpu->trace_final == NULL)
     {
       gip_format_error (err, err_size, "cannot allocate Metal buffers");
       gip_lfm2_metal_free (gpu);
@@ -155,10 +163,10 @@ void
 gip_lfm2_metal_free (struct gip_lfm2_metal *gpu)
 {
   struct gip_metal_buffer *buffers[] = {
-    gpu->weights,      gpu->k_cache,     gpu->v_cache,  gpu->conv_state,
-    gpu->hidden,       gpu->bcx,         gpu->conv_out, gpu->q,
-    gpu->attn,         gpu->scores,      gpu->ffn,      gpu->logits,
-    gpu->trace_layers, gpu->trace_final,
+    gpu->weights,  gpu->k_cache,    gpu->v_cache,      gpu->k,
+    gpu->v,        gpu->conv_state, gpu->hidden,       gpu->bcx,
+    gpu->conv_out, gpu->q,          gpu->attn,         gpu->scores,
+    gpu->ffn,      gpu->logits,     gpu->trace_layers, gpu->trace_final,
   };
 
   for (size_t i = 0; i < sizeof buffers / sizeof buffers[0]; i++)
@@ -231,39 +239,54 @@ record_conv (struct gip_lfm2_metal *gpu, const struct gip_lfm2_layer *layer)
           &add_to_residual);
 }
 
+/* Return a view of the KV cache BUFFER at element INDEX, whose elements
+   are half precision when GPU's cache is.  */
+static struct gip_metal_view
+cache_at (const struct gip_lfm2_metal *gpu, struct gip_metal_buffer *buffer,
+          size_t index)
+{
+  return gip_metal_at (buffer, index * (gpu->kv_half ? 2 : sizeof (float)));
+}
+
 /* Record the attention of LAYER at position POS on the residual stream
-   and add its output back.  The K and V projections write straight into
-   the caches.  */
+   and add its output back.  The new key goes into the cache through the
+   norm and rotation, and the new value goes into the cache directly or
+   through a conversion to half precision.  */
 static void
 record_attention (struct gip_lfm2_metal *gpu,
                   const struct gip_lfm2_layer *layer, uint32_t pos)
 {
   const struct gip_lfm2_model *model = gpu->model;
+  struct gip_metal *metal = gpu->metal;
   size_t kv_dim = (size_t)model->n_kv_heads * model->head_dim;
   size_t layer_base = (size_t)layer->cache_index * gpu->n_ctx * kv_dim;
   struct gip_metal_view k_slot
-      = floats_at (gpu->k_cache, layer_base + (size_t)pos * kv_dim);
+      = cache_at (gpu, gpu->k_cache, layer_base + (size_t)pos * kv_dim);
   struct gip_metal_view v_slot
-      = floats_at (gpu->v_cache, layer_base + (size_t)pos * kv_dim);
+      = cache_at (gpu, gpu->v_cache, layer_base + (size_t)pos * kv_dim);
   struct gip_metal_view h = floats_at (gpu->hidden, 0);
+  struct gip_metal_view q = floats_at (gpu->q, 0);
+  struct gip_metal_view k = floats_at (gpu->k, 0);
+  struct gip_metal_view v = floats_at (gpu->v, 0);
   struct gip_metal_matvec_options norm = normalized (gpu, layer->attn_norm);
 
-  matvec (gpu, layer->attn_q, h, floats_at (gpu->q, 0), &norm);
-  matvec (gpu, layer->attn_k, h, k_slot, &norm);
-  matvec (gpu, layer->attn_v, h, v_slot, &norm);
-  gip_metal_qk_norm_rope (gpu->metal, floats_at (gpu->q, 0),
-                          weights_of (gpu, layer->attn_q_norm), model->n_heads,
-                          model->head_dim, pos, model->rope_theta,
-                          model->norm_eps);
-  gip_metal_qk_norm_rope (gpu->metal, k_slot,
-                          weights_of (gpu, layer->attn_k_norm),
-                          model->n_kv_heads, model->head_dim, pos,
-                          model->rope_theta, model->norm_eps);
-  gip_metal_attention (
-      gpu->metal, floats_at (gpu->q, 0), floats_at (gpu->k_cache, layer_base),
-      floats_at (gpu->v_cache, layer_base), floats_at (gpu->scores, 0),
-      floats_at (gpu->attn, 0), model->n_heads, model->n_kv_heads,
-      model->head_dim, pos + 1, gpu->n_ctx);
+  matvec (gpu, layer->attn_q, h, q, &norm);
+  matvec (gpu, layer->attn_k, h, k, &norm);
+  matvec (gpu, layer->attn_v, h, gpu->kv_half ? v : v_slot, &norm);
+  gip_metal_norm_rope (metal, q, q, 0, weights_of (gpu, layer->attn_q_norm),
+                       model->n_heads, model->head_dim, pos, model->rope_theta,
+                       model->norm_eps);
+  gip_metal_norm_rope (metal, k, k_slot, gpu->kv_half,
+                       weights_of (gpu, layer->attn_k_norm), model->n_kv_heads,
+                       model->head_dim, pos, model->rope_theta,
+                       model->norm_eps);
+  if (gpu->kv_half)
+    gip_metal_convert_half (metal, v, v_slot, (uint32_t)kv_dim);
+  gip_metal_attention (metal, q, cache_at (gpu, gpu->k_cache, layer_base),
+                       cache_at (gpu, gpu->v_cache, layer_base), gpu->kv_half,
+                       floats_at (gpu->scores, 0), floats_at (gpu->attn, 0),
+                       model->n_heads, model->n_kv_heads, model->head_dim,
+                       pos + 1, gpu->n_ctx);
   matvec (gpu, layer->attn_output, floats_at (gpu->attn, 0), h,
           &add_to_residual);
 }

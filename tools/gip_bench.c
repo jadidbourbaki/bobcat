@@ -28,6 +28,7 @@ static const struct option long_options[] = {
   { "generate", required_argument, NULL, 'n' },
   { "reps", required_argument, NULL, 'r' },
   { "profile", no_argument, NULL, 'P' },
+  { "kv", required_argument, NULL, 'k' },
   { "help", no_argument, NULL, 'h' },
   { "version", no_argument, NULL, 'V' },
   { NULL, 0, NULL, 0 },
@@ -45,6 +46,7 @@ print_usage (FILE *stream)
            "  -n, --generate=N   generated tokens (default %d)\n"
            "  -r, --reps=N       repetitions (default %d)\n"
            "  -P, --profile      break decode GPU time down by kernel\n"
+           "  -k, --kv=TYPE      KV cache type, f16 or f32 (default f16)\n"
            "  -h, --help         display this help and exit\n"
            "  -V, --version      output version information and exit\n",
            DEFAULT_PROMPT, DEFAULT_GENERATE, DEFAULT_REPS);
@@ -118,16 +120,18 @@ compare_entries (const void *a, const void *b)
 
 /* Prefill N_PROMPT tokens of MODEL on METAL, then decode N_GENERATE
    tokens with profiling on and print each kernel's GPU time per token.
-   LOGITS holds the model's vocabulary size in floats.  */
+   The KV cache holds half precision when KV_HALF is nonzero.  LOGITS
+   holds the model's vocabulary size in floats.  */
 static void
 profile_decode (const struct gip_lfm2_model *model, struct gip_metal *metal,
-                unsigned n_prompt, unsigned n_generate, float *logits)
+                unsigned n_prompt, unsigned n_generate, int kv_half,
+                float *logits)
 {
   struct gip_lfm2_metal gpu;
   char err[512] = "";
 
-  if (gip_lfm2_metal_init (model, metal, n_prompt + n_generate, &gpu, err,
-                           sizeof err)
+  if (gip_lfm2_metal_init (model, metal, n_prompt + n_generate, kv_half, &gpu,
+                           err, sizeof err)
       != GIP_OK)
     {
       fprintf (stderr, "gip_bench: %s\n", err);
@@ -188,9 +192,10 @@ main (int argc, char **argv)
   unsigned n_generate = DEFAULT_GENERATE;
   unsigned reps = DEFAULT_REPS;
   int profile = 0;
+  int kv_half = 1;
   int opt;
 
-  while ((opt = getopt_long (argc, argv, "p:n:r:PhV", long_options, NULL))
+  while ((opt = getopt_long (argc, argv, "p:n:r:Pk:hV", long_options, NULL))
          != -1)
     switch (opt)
       {
@@ -205,6 +210,14 @@ main (int argc, char **argv)
         break;
       case 'P':
         profile = 1;
+        break;
+      case 'k':
+        if (strcmp (optarg, "f16") != 0 && strcmp (optarg, "f32") != 0)
+          {
+            fprintf (stderr, "gip_bench: invalid KV cache type: %s\n", optarg);
+            return EXIT_FAILURE;
+          }
+        kv_half = strcmp (optarg, "f16") == 0;
         break;
       case 'h':
         print_usage (stdout);
@@ -251,8 +264,8 @@ main (int argc, char **argv)
   for (unsigned rep = 0; rep <= reps; rep++)
     {
       struct gip_lfm2_metal gpu;
-      if (gip_lfm2_metal_init (&model, metal, n_prompt + n_generate, &gpu, err,
-                               sizeof err)
+      if (gip_lfm2_metal_init (&model, metal, n_prompt + n_generate, kv_half,
+                               &gpu, err, sizeof err)
           != GIP_OK)
         {
           fprintf (stderr, "gip_bench: %s\n", err);
@@ -316,7 +329,7 @@ main (int argc, char **argv)
               * per_token);
 
   if (profile)
-    profile_decode (&model, metal, n_prompt, n_generate, logits);
+    profile_decode (&model, metal, n_prompt, n_generate, kv_half, logits);
 
   free (logits);
   free (prefill_rates);

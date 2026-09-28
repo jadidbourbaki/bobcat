@@ -35,6 +35,7 @@ foreach variant : [
   ['bf16', 'LFM2.5-350M-BF16.gguf', 'LFM2.5-350M', 'scalar'],
   ['q8_0', 'LFM2.5-350M-Q8_0.gguf', 'LFM2.5-350M-Q8_0', 'scalar'],
   ['metal_q8_0', 'LFM2.5-350M-Q8_0.gguf', 'LFM2.5-350M-Q8_0', 'metal'],
+  ['metal_f32_q8_0', 'LFM2.5-350M-Q8_0.gguf', 'LFM2.5-350M-Q8_0', 'metal_f32'],
 ]
   test(
     'lfm2_reference_' + variant[0],
