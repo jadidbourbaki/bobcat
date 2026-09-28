@@ -216,7 +216,7 @@ fn chat(options: &ModelOptions) -> Result<(), Error> {
     };
 
     loop {
-        let line = match editor.readline("› ") {
+        let line = match editor.readline("> ") {
             Ok(line) => line,
             Err(ReadlineError::Eof | ReadlineError::Interrupted) => return Ok(()),
             Err(error) => return Err(error.into()),
