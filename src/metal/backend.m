@@ -300,7 +300,8 @@ gip_metal_begin (struct gip_metal *metal)
   @autoreleasepool
   {
     m.command_buffer = [m.queue commandBuffer];
-    m.encoder = [m.command_buffer computeCommandEncoder];
+    m.encoder = [m.command_buffer
+        computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
   }
   if (m.command_buffer == nil || m.encoder == nil)
     {
@@ -309,6 +310,17 @@ gip_metal_begin (struct gip_metal *metal)
       return GIP_ERR_NOMEM;
     }
   return GIP_OK;
+}
+
+void
+gip_metal_barrier (struct gip_metal *metal)
+{
+  GipMetal *m = backend (metal);
+
+  /* While profiling, each launch waits for its own command buffer, which
+     orders the launches already.  */
+  if (!m.profiling)
+    [m.encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
 /* Bind VIEW to buffer slot INDEX of ENCODER.  */
@@ -586,6 +598,7 @@ gip_metal_attention (struct gip_metal *metal, struct gip_metal_view q,
   [encoder dispatchThreadgroups:MTLSizeMake (n_kv_heads, n_chunks, 1)
           threadsPerThreadgroup:MTLSizeMake (ATTENTION_CHUNK, 1, 1)];
   op_done (m, "attention_chunk", 0, 0, 0);
+  gip_metal_barrier (metal);
 
   encoder = op_encoder (m);
   [encoder setComputePipelineState:m.attention_combine];

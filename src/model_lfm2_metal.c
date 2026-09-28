@@ -252,12 +252,15 @@ record_conv (struct gip_lfm2_metal *gpu, const struct gip_lfm2_layer *layer)
   struct gip_metal_matvec_options norm = normalized (gpu, layer->attn_norm);
 
   matvec (gpu, layer->conv_in_proj, h, floats_at (gpu->bcx, 0), &norm);
+  gip_metal_barrier (gpu->metal);
   gip_metal_short_conv (
       gpu->metal, floats_at (gpu->bcx, 0), weights_of (gpu, layer->conv),
       floats_at (gpu->conv_state, history), floats_at (gpu->conv_out, 0),
       (uint32_t)n_embd, model->conv_kernel);
+  gip_metal_barrier (gpu->metal);
   matvec (gpu, layer->conv_out_proj, floats_at (gpu->conv_out, 0), h,
           &add_to_residual);
+  gip_metal_barrier (gpu->metal);
 }
 
 /* Return a view of the KV cache BUFFER at element INDEX, whose elements
@@ -291,9 +294,13 @@ record_attention (struct gip_lfm2_metal *gpu,
   struct gip_metal_view v = floats_at (gpu->v, 0);
   struct gip_metal_matvec_options norm = normalized (gpu, layer->attn_norm);
 
+  /* The three projections read the same input and write different
+     buffers, so they run together.  So do the two rotations and the
+     value conversion that follow.  */
   matvec (gpu, layer->attn_q, h, q, &norm);
   matvec (gpu, layer->attn_k, h, k, &norm);
   matvec (gpu, layer->attn_v, h, gpu->kv_half ? v : v_slot, &norm);
+  gip_metal_barrier (metal);
   gip_metal_norm_rope (metal, q, q, 0, weights_of (gpu, layer->attn_q_norm),
                        model->n_heads, model->head_dim, pos, model->rope_theta,
                        model->norm_eps);
@@ -303,13 +310,16 @@ record_attention (struct gip_lfm2_metal *gpu,
                        model->norm_eps);
   if (gpu->kv_half)
     gip_metal_convert_half (metal, v, v_slot, (uint32_t)kv_dim);
+  gip_metal_barrier (metal);
   gip_metal_attention (metal, q, cache_at (gpu, gpu->k_cache, layer_base),
                        cache_at (gpu, gpu->v_cache, layer_base), gpu->kv_half,
                        floats_at (gpu->scores, 0), floats_at (gpu->attn, 0),
                        model->n_heads, model->n_kv_heads, model->head_dim,
                        pos + 1, gpu->n_ctx);
+  gip_metal_barrier (metal);
   matvec (gpu, layer->attn_output, floats_at (gpu->attn, 0), h,
           &add_to_residual);
+  gip_metal_barrier (metal);
 }
 
 /* Record one forward pass of GPU's model on the token at TOKENS[POS]:
@@ -329,6 +339,11 @@ record_step (struct gip_lfm2_metal *gpu, uint32_t pos, int want_logits,
   gip_metal_embed_q8_0 (metal, weights_of (gpu, model->token_embd),
                         gip_metal_at (gpu->tokens, pos * sizeof (int32_t)), h,
                         n_embd);
+  gip_metal_barrier (metal);
+
+  /* Trace copies only read the residual stream, so they run alongside
+     the next launches that read it.  Every later write to the stream
+     comes after a barrier.  */
   if (trace != NULL && trace->embedding != NULL)
     gip_metal_copy (metal, h, floats_at (gpu->trace_embedding, 0), n_embd);
 
@@ -345,7 +360,9 @@ record_step (struct gip_lfm2_metal *gpu, uint32_t pos, int want_logits,
           metal, weights_of (gpu, layer->ffn_gate),
           weights_of (gpu, layer->ffn_up), model->n_ff, n_embd, h,
           weights_of (gpu, layer->ffn_norm), model->norm_eps, ffn);
+      gip_metal_barrier (metal);
       matvec (gpu, layer->ffn_down, ffn, h, &add_to_residual);
+      gip_metal_barrier (metal);
 
       if (trace != NULL && trace->layers != NULL)
         gip_metal_copy (metal, h,
@@ -442,6 +459,7 @@ gip_lfm2_metal_generate (struct gip_lfm2_metal *gpu, uint32_t n, int32_t *out)
       gip_metal_argmax (gpu->metal, floats_at (gpu->logits, 0),
                         gip_metal_at (gpu->tokens, pos * sizeof (int32_t)),
                         model->n_vocab);
+      gip_metal_barrier (gpu->metal);
       record_step (gpu, pos, 1, NULL);
       status = gip_metal_commit (gpu->metal, slot);
       encode_seconds += now_seconds () - encode_start;

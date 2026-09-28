@@ -53,8 +53,12 @@ struct gip_metal_view gip_metal_at (struct gip_metal_buffer *buffer,
 void gip_metal_buffer_free (struct gip_metal_buffer *buffer);
 
 /* Start recording kernel launches on METAL into a new command buffer.
-   Each launch reads the results of the launches recorded before it.  */
+   Launches may run at the same time until a barrier separates them.  */
 enum gip_status gip_metal_begin (struct gip_metal *metal);
+
+/* Record a barrier on METAL.  Every launch recorded after the barrier
+   sees the results of every launch recorded before it.  */
+void gip_metal_barrier (struct gip_metal *metal);
 
 /* Work a matrix-vector launch folds in.  When NORM_WEIGHT has a buffer,
    the launch RMS-normalizes its input with epsilon EPS and scales it by
