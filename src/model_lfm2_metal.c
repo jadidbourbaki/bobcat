@@ -20,7 +20,10 @@ enum
   /* Generation keeps up to this many steps submitted ahead of the GPU.
      Each step depends on the one before, so more steps in flight save
      nothing once the GPU never waits for the CPU.  */
-  GENERATE_IN_FLIGHT = 3
+  GENERATE_IN_FLIGHT = 3,
+  /* Prefill runs the prompt through the model this many tokens at a
+     time.  */
+  PREFILL_BATCH = 512
 };
 
 /* Return the monotonic clock time in seconds.  */
@@ -131,19 +134,26 @@ gip_lfm2_metal_init (const struct gip_lfm2_model *model,
       = gpu->kv_half ? (cache_elements + 1) / 2 : cache_elements;
   size_t conv_floats
       = (size_t)model->n_conv_layers * (model->conv_kernel - 1) * n_embd;
+  /* The scratch buffers hold one row per token of a prefill batch.
+     Decode uses the first row.  */
+  size_t batch = n_ctx < PREFILL_BATCH ? n_ctx : PREFILL_BATCH;
+  gpu->batch = (uint32_t)batch;
   gpu->k_cache = new_floats (gpu, cache_floats);
   gpu->v_cache = new_floats (gpu, cache_floats);
-  gpu->k = new_floats (gpu, kv_dim);
-  gpu->v = new_floats (gpu, kv_dim);
+  gpu->k = new_floats (gpu, batch * kv_dim);
+  gpu->v = new_floats (gpu, batch * kv_dim);
   gpu->conv_state = new_floats (gpu, conv_floats);
-  gpu->hidden = new_floats (gpu, n_embd);
-  gpu->bcx = new_floats (gpu, 3 * n_embd);
-  gpu->conv_out = new_floats (gpu, n_embd);
-  gpu->q = new_floats (gpu, q_dim);
-  gpu->attn = new_floats (gpu, q_dim);
-  gpu->scores = new_floats (gpu, gip_metal_attention_scratch (
-                                     model->n_heads, model->head_dim, n_ctx));
-  gpu->ffn = new_floats (gpu, model->n_ff);
+  gpu->hidden = new_floats (gpu, batch * n_embd);
+  gpu->normed = new_floats (gpu, batch * n_embd);
+  gpu->bcx = new_floats (gpu, batch * 3 * n_embd);
+  gpu->conv_out = new_floats (gpu, batch * n_embd);
+  gpu->q = new_floats (gpu, batch * q_dim);
+  gpu->attn = new_floats (gpu, batch * q_dim);
+  gpu->scores = new_floats (
+      gpu, gip_metal_attention_scratch (model->n_heads, model->head_dim, n_ctx,
+                                        (uint32_t)batch));
+  gpu->ffn = new_floats (gpu, batch * model->n_ff);
+  gpu->up = new_floats (gpu, batch * model->n_ff);
   gpu->logits = new_floats (gpu, model->n_vocab);
   /* An int32_t token id takes the space of one float.  */
   gpu->tokens = new_floats (gpu, n_ctx);
@@ -151,11 +161,13 @@ gip_lfm2_metal_init (const struct gip_lfm2_model *model,
   gpu->trace_layers = new_floats (gpu, (size_t)model->n_layers * n_embd);
   gpu->trace_final = new_floats (gpu, n_embd);
 
+  gpu->trace_rows = 1;
   if (gpu->weights == NULL || gpu->k_cache == NULL || gpu->v_cache == NULL
       || gpu->k == NULL || gpu->v == NULL || gpu->conv_state == NULL
-      || gpu->hidden == NULL || gpu->bcx == NULL || gpu->conv_out == NULL
-      || gpu->q == NULL || gpu->attn == NULL || gpu->scores == NULL
-      || gpu->ffn == NULL || gpu->logits == NULL || gpu->tokens == NULL
+      || gpu->hidden == NULL || gpu->normed == NULL || gpu->bcx == NULL
+      || gpu->conv_out == NULL || gpu->q == NULL || gpu->attn == NULL
+      || gpu->scores == NULL || gpu->ffn == NULL || gpu->up == NULL
+      || gpu->logits == NULL || gpu->tokens == NULL
       || gpu->trace_embedding == NULL || gpu->trace_layers == NULL
       || gpu->trace_final == NULL)
     {
@@ -177,12 +189,14 @@ gip_lfm2_metal_free (struct gip_lfm2_metal *gpu)
     gpu->v,
     gpu->conv_state,
     gpu->hidden,
+    gpu->normed,
     gpu->bcx,
     gpu->conv_out,
     gpu->q,
     gpu->attn,
     gpu->scores,
     gpu->ffn,
+    gpu->up,
     gpu->logits,
     gpu->tokens,
     gpu->trace_embedding,
@@ -256,7 +270,7 @@ record_conv (struct gip_lfm2_metal *gpu, const struct gip_lfm2_layer *layer)
   gip_metal_short_conv (
       gpu->metal, floats_at (gpu->bcx, 0), weights_of (gpu, layer->conv),
       floats_at (gpu->conv_state, history), floats_at (gpu->conv_out, 0),
-      (uint32_t)n_embd, model->conv_kernel);
+      (uint32_t)n_embd, model->conv_kernel, 1);
   gip_metal_barrier (gpu->metal);
   matvec (gpu, layer->conv_out_proj, floats_at (gpu->conv_out, 0), h,
           &add_to_residual);
@@ -302,11 +316,11 @@ record_attention (struct gip_lfm2_metal *gpu,
   matvec (gpu, layer->attn_v, h, gpu->kv_half ? v : v_slot, &norm);
   gip_metal_barrier (metal);
   gip_metal_norm_rope (metal, q, q, 0, weights_of (gpu, layer->attn_q_norm),
-                       model->n_heads, model->head_dim, pos, model->rope_theta,
-                       model->norm_eps);
+                       model->n_heads, model->head_dim, pos, 1, 0, 0,
+                       model->rope_theta, model->norm_eps);
   gip_metal_norm_rope (metal, k, k_slot, gpu->kv_half,
                        weights_of (gpu, layer->attn_k_norm), model->n_kv_heads,
-                       model->head_dim, pos, model->rope_theta,
+                       model->head_dim, pos, 1, 0, 0, model->rope_theta,
                        model->norm_eps);
   if (gpu->kv_half)
     gip_metal_convert_half (metal, v, v_slot, (uint32_t)kv_dim);
@@ -314,8 +328,8 @@ record_attention (struct gip_lfm2_metal *gpu,
   gip_metal_attention (metal, q, cache_at (gpu, gpu->k_cache, layer_base),
                        cache_at (gpu, gpu->v_cache, layer_base), gpu->kv_half,
                        floats_at (gpu->scores, 0), floats_at (gpu->attn, 0),
-                       model->n_heads, model->n_kv_heads, model->head_dim,
-                       pos + 1, gpu->n_ctx);
+                       model->n_heads, model->n_kv_heads, model->head_dim, pos,
+                       1, gpu->n_ctx);
   gip_metal_barrier (metal);
   matvec (gpu, layer->attn_output, floats_at (gpu->attn, 0), h,
           &add_to_residual);
@@ -338,7 +352,7 @@ record_step (struct gip_lfm2_metal *gpu, uint32_t pos, int want_logits,
 
   gip_metal_embed_q8_0 (metal, weights_of (gpu, model->token_embd),
                         gip_metal_at (gpu->tokens, pos * sizeof (int32_t)), h,
-                        n_embd);
+                        n_embd, 1);
   gip_metal_barrier (metal);
 
   /* Trace copies only read the residual stream, so they run alongside
@@ -374,7 +388,7 @@ record_step (struct gip_lfm2_metal *gpu, uint32_t pos, int want_logits,
      trace needs the normalized vector on its own.  */
   if (trace != NULL && trace->final_norm != NULL)
     gip_metal_rms_norm (metal, h, weights_of (gpu, model->output_norm),
-                        floats_at (gpu->trace_final, 0), n_embd,
+                        floats_at (gpu->trace_final, 0), n_embd, 1,
                         model->norm_eps);
   if (want_logits)
     {
@@ -482,6 +496,266 @@ gip_lfm2_metal_generate (struct gip_lfm2_metal *gpu, uint32_t n, int32_t *out)
 
   const int32_t *tokens = gip_metal_buffer_contents (gpu->tokens);
   memcpy (out, tokens + gpu->n_past, n * sizeof (int32_t));
+  gpu->n_past += n;
+  gpu->last_encode_seconds = encode_seconds;
+  gpu->last_gpu_seconds = gpu_seconds;
+  return GIP_OK;
+}
+
+/* Grow GPU's trace buffers to hold ROWS tokens.  */
+static enum gip_status
+ensure_trace_rows (struct gip_lfm2_metal *gpu, uint32_t rows)
+{
+  const struct gip_lfm2_model *model = gpu->model;
+  size_t n_embd = model->n_embd;
+
+  if (rows <= gpu->trace_rows)
+    return GIP_OK;
+  gip_metal_buffer_free (gpu->trace_embedding);
+  gip_metal_buffer_free (gpu->trace_layers);
+  gip_metal_buffer_free (gpu->trace_final);
+  gpu->trace_embedding = new_floats (gpu, rows * n_embd);
+  gpu->trace_layers
+      = new_floats (gpu, (size_t)model->n_layers * rows * n_embd);
+  gpu->trace_final = new_floats (gpu, rows * n_embd);
+  gpu->trace_rows = rows;
+  if (gpu->trace_embedding == NULL || gpu->trace_layers == NULL
+      || gpu->trace_final == NULL)
+    return GIP_ERR_NOMEM;
+  return GIP_OK;
+}
+
+/* Record a multiply of the matrix TENSOR by each of the N tokens at X
+   into Y, added to Y when ACCUMULATE is nonzero.  */
+static void
+matmul (struct gip_lfm2_metal *gpu, const struct gip_gguf_tensor *tensor,
+        struct gip_metal_view x, struct gip_metal_view y, uint32_t n,
+        int accumulate)
+{
+  gip_metal_matmul_q8_0 (gpu->metal, weights_of (gpu, tensor),
+                         (uint32_t)tensor->ne[1], (uint32_t)tensor->ne[0], x,
+                         y, n, accumulate);
+}
+
+/* Record the gated short convolution of LAYER over the N normalized
+   tokens of the batch and add its output to the residual stream.  */
+static void
+record_conv_batch (struct gip_lfm2_metal *gpu,
+                   const struct gip_lfm2_layer *layer, uint32_t n)
+{
+  const struct gip_lfm2_model *model = gpu->model;
+  struct gip_metal *metal = gpu->metal;
+  size_t n_embd = model->n_embd;
+  size_t history
+      = (size_t)layer->cache_index * (model->conv_kernel - 1) * n_embd;
+
+  matmul (gpu, layer->conv_in_proj, floats_at (gpu->normed, 0),
+          floats_at (gpu->bcx, 0), n, 0);
+  gip_metal_barrier (metal);
+  gip_metal_short_conv (
+      metal, floats_at (gpu->bcx, 0), weights_of (gpu, layer->conv),
+      floats_at (gpu->conv_state, history), floats_at (gpu->conv_out, 0),
+      (uint32_t)n_embd, model->conv_kernel, n);
+  gip_metal_barrier (metal);
+  matmul (gpu, layer->conv_out_proj, floats_at (gpu->conv_out, 0),
+          floats_at (gpu->hidden, 0), n, 1);
+  gip_metal_barrier (metal);
+}
+
+/* Record the causal attention of LAYER over the N normalized tokens of
+   the batch, which sit at positions POS through POS + N - 1, and add
+   its output to the residual stream.  The batch's keys and values go
+   into the caches first, so each token attends over the earlier tokens
+   of its own batch too.  */
+static void
+record_attention_batch (struct gip_lfm2_metal *gpu,
+                        const struct gip_lfm2_layer *layer, uint32_t pos,
+                        uint32_t n)
+{
+  const struct gip_lfm2_model *model = gpu->model;
+  struct gip_metal *metal = gpu->metal;
+  uint32_t kv_dim = model->n_kv_heads * model->head_dim;
+  uint32_t q_dim = model->n_heads * model->head_dim;
+  size_t layer_base = (size_t)layer->cache_index * gpu->n_ctx * kv_dim;
+  struct gip_metal_view k_rows
+      = cache_at (gpu, gpu->k_cache, layer_base + (size_t)pos * kv_dim);
+  struct gip_metal_view v_rows
+      = cache_at (gpu, gpu->v_cache, layer_base + (size_t)pos * kv_dim);
+  struct gip_metal_view normed = floats_at (gpu->normed, 0);
+  struct gip_metal_view q = floats_at (gpu->q, 0);
+  struct gip_metal_view k = floats_at (gpu->k, 0);
+  struct gip_metal_view v = floats_at (gpu->v, 0);
+
+  matmul (gpu, layer->attn_q, normed, q, n, 0);
+  matmul (gpu, layer->attn_k, normed, k, n, 0);
+  matmul (gpu, layer->attn_v, normed, gpu->kv_half ? v : v_rows, n, 0);
+  gip_metal_barrier (metal);
+  gip_metal_norm_rope (metal, q, q, 0, weights_of (gpu, layer->attn_q_norm),
+                       model->n_heads, model->head_dim, pos, n, q_dim, q_dim,
+                       model->rope_theta, model->norm_eps);
+  gip_metal_norm_rope (metal, k, k_rows, gpu->kv_half,
+                       weights_of (gpu, layer->attn_k_norm), model->n_kv_heads,
+                       model->head_dim, pos, n, kv_dim, kv_dim,
+                       model->rope_theta, model->norm_eps);
+  if (gpu->kv_half)
+    gip_metal_convert_half (metal, v, v_rows, n * kv_dim);
+  gip_metal_barrier (metal);
+  gip_metal_attention (metal, q, cache_at (gpu, gpu->k_cache, layer_base),
+                       cache_at (gpu, gpu->v_cache, layer_base), gpu->kv_half,
+                       floats_at (gpu->scores, 0), floats_at (gpu->attn, 0),
+                       model->n_heads, model->n_kv_heads, model->head_dim, pos,
+                       n, gpu->n_ctx);
+  gip_metal_barrier (metal);
+  matmul (gpu, layer->attn_output, floats_at (gpu->attn, 0),
+          floats_at (gpu->hidden, 0), n, 1);
+  gip_metal_barrier (metal);
+}
+
+/* Record the forward pass of the N tokens at TOKENS[POS] onward, a batch
+   of at most GPU->batch.  When WANT_LOGITS is nonzero, the last token's
+   logits go to the logits buffer.  When TRACED is nonzero, the trace
+   buffers receive the batch's activations, with layer IL's outputs
+   starting TRACE_LAYER_STRIDE floats after layer IL - 1's.  */
+static void
+record_batch (struct gip_lfm2_metal *gpu, uint32_t pos, uint32_t n,
+              int want_logits, int traced, size_t trace_layer_stride)
+{
+  const struct gip_lfm2_model *model = gpu->model;
+  struct gip_metal *metal = gpu->metal;
+  uint32_t n_embd = model->n_embd;
+  uint32_t n_ff = model->n_ff;
+  struct gip_metal_view h = floats_at (gpu->hidden, 0);
+  struct gip_metal_view normed = floats_at (gpu->normed, 0);
+
+  gip_metal_embed_q8_0 (metal, weights_of (gpu, model->token_embd),
+                        gip_metal_at (gpu->tokens, pos * sizeof (int32_t)), h,
+                        n_embd, n);
+  gip_metal_barrier (metal);
+  if (traced)
+    gip_metal_copy (metal, h, floats_at (gpu->trace_embedding, 0), n * n_embd);
+
+  for (uint32_t il = 0; il < model->n_layers; il++)
+    {
+      const struct gip_lfm2_layer *layer = &model->layers[il];
+
+      gip_metal_rms_norm (metal, h, weights_of (gpu, layer->attn_norm), normed,
+                          n_embd, n, model->norm_eps);
+      gip_metal_barrier (metal);
+      if (layer->is_attention)
+        record_attention_batch (gpu, layer, pos, n);
+      else
+        record_conv_batch (gpu, layer, n);
+
+      gip_metal_rms_norm (metal, h, weights_of (gpu, layer->ffn_norm), normed,
+                          n_embd, n, model->norm_eps);
+      gip_metal_barrier (metal);
+      matmul (gpu, layer->ffn_gate, normed, floats_at (gpu->ffn, 0), n, 0);
+      matmul (gpu, layer->ffn_up, normed, floats_at (gpu->up, 0), n, 0);
+      gip_metal_barrier (metal);
+      gip_metal_swiglu (metal, floats_at (gpu->ffn, 0), floats_at (gpu->up, 0),
+                        n * n_ff);
+      gip_metal_barrier (metal);
+      matmul (gpu, layer->ffn_down, floats_at (gpu->ffn, 0), h, n, 1);
+      gip_metal_barrier (metal);
+
+      if (traced)
+        gip_metal_copy (metal, h,
+                        floats_at (gpu->trace_layers, il * trace_layer_stride),
+                        n * n_embd);
+    }
+
+  if (traced)
+    gip_metal_rms_norm (metal, h, weights_of (gpu, model->output_norm),
+                        floats_at (gpu->trace_final, 0), n_embd, n,
+                        model->norm_eps);
+  if (want_logits)
+    {
+      struct gip_metal_matvec_options norm
+          = normalized (gpu, model->output_norm);
+      matvec (gpu, model->output, floats_at (gpu->hidden, (n - 1) * n_embd),
+              floats_at (gpu->logits, 0), &norm);
+    }
+}
+
+enum gip_status
+gip_lfm2_metal_prefill (struct gip_lfm2_metal *gpu, const int32_t *tokens,
+                        uint32_t n, float *logits,
+                        const struct gip_lfm2_trace *trace)
+{
+  const struct gip_lfm2_model *model = gpu->model;
+  size_t n_embd = model->n_embd;
+  enum gip_status status = GIP_OK;
+  double gpu_seconds = 0.0;
+  double encode_seconds = 0.0;
+
+  if (n == 0 || n > gpu->n_ctx - gpu->n_past)
+    return GIP_ERR_ARGUMENT;
+  for (uint32_t i = 0; i < n; i++)
+    if (tokens[i] < 0 || (uint32_t)tokens[i] >= model->n_vocab)
+      return GIP_ERR_ARGUMENT;
+
+  /* Nothing is in flight, so every prompt token goes into the shared
+     buffer before the first batch.  */
+  int32_t *token_buffer = gip_metal_buffer_contents (gpu->tokens);
+  memcpy (token_buffer + gpu->n_past, tokens, n * sizeof (int32_t));
+
+  if (trace != NULL)
+    {
+      status = ensure_trace_rows (gpu, gpu->batch);
+      if (status != GIP_OK)
+        return status;
+    }
+
+  for (uint32_t done = 0; done < n && status == GIP_OK;)
+    {
+      uint32_t count = n - done < gpu->batch ? n - done : gpu->batch;
+      uint32_t pos = gpu->n_past + done;
+      int last = done + count == n;
+      uint64_t ticket;
+
+      double encode_start = now_seconds ();
+      status = gip_metal_begin (gpu->metal);
+      if (status != GIP_OK)
+        break;
+      record_batch (gpu, pos, count, last, trace != NULL,
+                    (size_t)gpu->batch * n_embd);
+      status = gip_metal_commit (gpu->metal, &ticket);
+      encode_seconds += now_seconds () - encode_start;
+
+      /* A traced batch waits so its activations can be copied out before
+         the next batch overwrites them.  Other batches run back to
+         back.  */
+      if (status == GIP_OK && (trace != NULL || last))
+        status = gip_metal_wait (gpu->metal, ticket, &gpu_seconds);
+      if (status == GIP_OK && trace != NULL)
+        {
+          size_t rows = (size_t)count * n_embd;
+          if (trace->embedding != NULL)
+            memcpy (trace->embedding + done * n_embd,
+                    gip_metal_buffer_contents (gpu->trace_embedding),
+                    rows * sizeof (float));
+          if (trace->final_norm != NULL)
+            memcpy (trace->final_norm + done * n_embd,
+                    gip_metal_buffer_contents (gpu->trace_final),
+                    rows * sizeof (float));
+          if (trace->layers != NULL)
+            {
+              const float *layers
+                  = gip_metal_buffer_contents (gpu->trace_layers);
+              for (uint32_t il = 0; il < model->n_layers; il++)
+                memcpy (trace->layers + ((size_t)il * n + done) * n_embd,
+                        layers + (size_t)il * gpu->batch * n_embd,
+                        rows * sizeof (float));
+            }
+        }
+      done += count;
+    }
+  if (status != GIP_OK)
+    return status;
+
+  if (logits != NULL)
+    memcpy (logits, gip_metal_buffer_contents (gpu->logits),
+            (size_t)model->n_vocab * sizeof (float));
   gpu->n_past += n;
   gpu->last_encode_seconds = encode_seconds;
   gpu->last_gpu_seconds = gpu_seconds;

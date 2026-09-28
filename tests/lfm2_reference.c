@@ -135,14 +135,15 @@ main (int argc, char **argv)
   if (argc != 3 && argc != 4)
     {
       fprintf (stderr, "usage: lfm2_reference MODEL.gguf REF_DIR "
-                       "[scalar|metal|metal_f32]\n");
+                       "[scalar|metal|metal_f32|metal_batch]\n");
       return EXIT_FAILURE;
     }
   const char *model_path = argv[1];
   const char *ref_dir = argv[2];
   const char *mode = argc == 4 ? argv[3] : "scalar";
   bool use_metal = strncmp (mode, "metal", 5) == 0;
-  bool kv_half = strcmp (mode, "metal") == 0;
+  bool batched = strcmp (mode, "metal_batch") == 0;
+  bool kv_half = strcmp (mode, "metal") == 0 || batched;
   double tolerance = kv_half ? HALF_KV_TOLERANCE : TOLERANCE;
   if (use_metal && !GIP_HAVE_METAL)
     {
@@ -250,26 +251,73 @@ main (int argc, char **argv)
       return EXIT_FAILURE;
     }
 
-  for (size_t t = 0; t < n_tokens; t++)
+  /* The batched mode runs the whole prompt in one prefill call, which
+     traces every token and returns only the last token's logits.  */
+  float *batch_embedding = NULL;
+  float *batch_layers = NULL;
+  float *batch_final = NULL;
+#if GIP_HAVE_METAL
+  if (batched)
     {
-      status = run_step (&runner, tokens[t], logits, &trace);
+      batch_embedding = malloc (n_tokens * n_embd * sizeof (float));
+      batch_layers = malloc (n_layers * n_tokens * n_embd * sizeof (float));
+      batch_final = malloc (n_tokens * n_embd * sizeof (float));
+      if (batch_embedding == NULL || batch_layers == NULL
+          || batch_final == NULL)
+        {
+          fprintf (stderr, "lfm2_reference: out of memory\n");
+          return EXIT_FAILURE;
+        }
+      struct gip_lfm2_trace batch_trace
+          = { batch_embedding, batch_layers, batch_final };
+      status = gip_lfm2_metal_prefill (&runner.gpu, tokens, (uint32_t)n_tokens,
+                                       logits, &batch_trace);
       if (status != GIP_OK)
         {
-          fprintf (stderr, "lfm2_reference: step failed: %s\n",
+          fprintf (stderr, "lfm2_reference: prefill failed: %s\n",
                    gip_status_string (status));
           return EXIT_FAILURE;
         }
+    }
+#endif
+
+  for (size_t t = 0; t < n_tokens; t++)
+    {
+      const float *got_embedding = embedding;
+      const float *got_final = final_norm;
+      if (batched)
+        {
+          got_embedding = batch_embedding + t * n_embd;
+          got_final = batch_final + t * n_embd;
+        }
+      else
+        {
+          status = run_step (&runner, tokens[t], logits, &trace);
+          if (status != GIP_OK)
+            {
+              fprintf (stderr, "lfm2_reference: step failed: %s\n",
+                       gip_status_string (status));
+              return EXIT_FAILURE;
+            }
+        }
 
       double errors[n_checks];
-      errors[0]
-          = relative_error (embedding, want_embedding + t * n_embd, n_embd);
+      errors[0] = relative_error (got_embedding, want_embedding + t * n_embd,
+                                  n_embd);
       for (size_t il = 0; il < n_layers; il++)
-        errors[1 + il] = relative_error (layers + il * n_embd,
-                                         want_layers[il] + t * n_embd, n_embd);
+        {
+          const float *got_layer
+              = batched ? batch_layers + (il * n_tokens + t) * n_embd
+                        : layers + il * n_embd;
+          errors[1 + il] = relative_error (
+              got_layer, want_layers[il] + t * n_embd, n_embd);
+        }
       errors[n_layers + 1]
-          = relative_error (final_norm, want_final + t * n_embd, n_embd);
-      errors[n_layers + 2]
-          = relative_error (logits, want_logits + t * n_vocab, n_vocab);
+          = relative_error (got_final, want_final + t * n_embd, n_embd);
+      errors[n_layers + 2] = 0.0;
+      if (!batched || t + 1 == n_tokens)
+        errors[n_layers + 2]
+            = relative_error (logits, want_logits + t * n_vocab, n_vocab);
       for (size_t i = 0; i < n_checks; i++)
         if (errors[i] > worst[i])
           worst[i] = errors[i];
@@ -362,6 +410,9 @@ main (int argc, char **argv)
   free (tokens);
   free (generated);
   free (gpu_tokens);
+  free (batch_embedding);
+  free (batch_layers);
+  free (batch_final);
 #if GIP_HAVE_METAL
   if (use_metal)
     {

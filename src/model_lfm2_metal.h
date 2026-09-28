@@ -8,15 +8,18 @@
 
 /* The GPU state of one LFM2 decode on METAL: the weights, the caches,
    and the scratch buffers.  N_PAST counts the tokens processed so far.
-   KV_HALF is true when the KV cache holds half-precision numbers.
-   LAST_ENCODE_SECONDS and LAST_GPU_SECONDS time the CPU recording and
-   the GPU execution of the latest step.  */
+   KV_HALF is true when the KV cache holds half-precision numbers.  The
+   scratch buffers hold BATCH tokens, and the trace buffers hold
+   TRACE_ROWS tokens.  LAST_ENCODE_SECONDS and LAST_GPU_SECONDS time the
+   CPU recording and the GPU execution of the latest call.  */
 struct gip_lfm2_metal
 {
   const struct gip_lfm2_model *model;
   struct gip_metal *metal;
   uint32_t n_ctx;
   uint32_t n_past;
+  uint32_t batch;
+  uint32_t trace_rows;
   bool kv_half;
   double last_encode_seconds;
   double last_gpu_seconds;
@@ -28,12 +31,14 @@ struct gip_lfm2_metal
   struct gip_metal_buffer *v;
   struct gip_metal_buffer *conv_state;
   struct gip_metal_buffer *hidden;
+  struct gip_metal_buffer *normed;
   struct gip_metal_buffer *bcx;
   struct gip_metal_buffer *conv_out;
   struct gip_metal_buffer *q;
   struct gip_metal_buffer *attn;
   struct gip_metal_buffer *scores;
   struct gip_metal_buffer *ffn;
+  struct gip_metal_buffer *up;
   struct gip_metal_buffer *logits;
   struct gip_metal_buffer *tokens;
   struct gip_metal_buffer *trace_embedding;
@@ -58,6 +63,17 @@ void gip_lfm2_metal_free (struct gip_lfm2_metal *gpu);
 enum gip_status gip_lfm2_metal_step (struct gip_lfm2_metal *gpu, int32_t token,
                                      float *logits,
                                      const struct gip_lfm2_trace *trace);
+
+/* Run the model on the N tokens at TOKENS at the next positions of GPU,
+   in batches of GPU->batch tokens.  Store the logits of the last token
+   at LOGITS unless LOGITS is null, in which case the logits buffer
+   still receives them for gip_lfm2_metal_generate.  When TRACE is not
+   null, its members receive one entry per token.  TRACE->layers holds
+   every token's output of layer 0, then of layer 1, and so on.  */
+enum gip_status gip_lfm2_metal_prefill (struct gip_lfm2_metal *gpu,
+                                        const int32_t *tokens, uint32_t n,
+                                        float *logits,
+                                        const struct gip_lfm2_trace *trace);
 
 /* Decode N tokens greedily on GPU and store them at OUT.  The first
    token is the argmax of the logits of the previous step, which must

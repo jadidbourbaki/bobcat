@@ -91,21 +91,25 @@ void gip_metal_matvec_q8_0_swiglu (struct gip_metal *metal,
                                    struct gip_metal_view norm_weight,
                                    float eps, struct gip_metal_view y);
 
-/* Record an RMS normalization of the N floats at X, scaled by the N
-   floats at WEIGHT, into OUT.  */
+/* Record an RMS normalization of each of the N_ROWS rows of N floats at
+   X, scaled by the N floats at WEIGHT, into the matching rows of OUT.  */
 void gip_metal_rms_norm (struct gip_metal *metal, struct gip_metal_view x,
                          struct gip_metal_view weight,
-                         struct gip_metal_view out, uint32_t n, float eps);
+                         struct gip_metal_view out, uint32_t n,
+                         uint32_t n_rows, float eps);
 
 /* Record the per-head RMS normalization and rotary embedding of the
-   N_HEADS heads of HEAD_DIM floats at SRC for position POS.  The result
-   goes to DST, as half-precision numbers when DST_HALF is nonzero and
-   as floats otherwise.  SRC and DST may be the same floats.  */
+   N_HEADS heads of HEAD_DIM floats of each of N_TOKENS tokens at SRC.
+   Token I sits at position POS + I, SRC_STRIDE floats into SRC and
+   DST_STRIDE elements into DST.  The result goes to DST, as
+   half-precision numbers when DST_HALF is nonzero and as floats
+   otherwise.  SRC and DST may be the same floats.  */
 void gip_metal_norm_rope (struct gip_metal *metal, struct gip_metal_view src,
                           struct gip_metal_view dst, int dst_half,
                           struct gip_metal_view weight, uint32_t n_heads,
-                          uint32_t head_dim, uint32_t pos, float theta,
-                          float eps);
+                          uint32_t head_dim, uint32_t pos, uint32_t n_tokens,
+                          uint32_t src_stride, uint32_t dst_stride,
+                          float theta, float eps);
 
 /* Record a conversion of the N floats at SRC to half precision at
    DST.  */
@@ -113,45 +117,65 @@ void gip_metal_convert_half (struct gip_metal *metal,
                              struct gip_metal_view src,
                              struct gip_metal_view dst, uint32_t n);
 
-/* Return the floats of scratch gip_metal_attention needs for N_HEADS
-   query heads of HEAD_DIM floats over up to N_CTX positions.  */
+/* Return the floats of scratch gip_metal_attention needs for N_QUERIES
+   queries of N_HEADS heads of HEAD_DIM floats over up to N_CTX
+   positions.  */
 size_t gip_metal_attention_scratch (uint32_t n_heads, uint32_t head_dim,
-                                    uint32_t n_ctx);
+                                    uint32_t n_ctx, uint32_t n_queries);
 
-/* Record attention of the N_HEADS query heads at Q over the first N_KEYS
-   positions of K_CACHE and V_CACHE into OUT.  Each cache holds
-   N_KV_HEADS heads of HEAD_DIM numbers per position, in half precision
-   when KV_HALF is nonzero and as floats otherwise.  SCRATCH holds the
-   floats gip_metal_attention_scratch returns for N_CTX positions.  */
+/* Record causal attention of N_QUERIES queries at Q, each of N_HEADS
+   heads, into OUT.  Query I sits at position FIRST_POS + I and attends
+   over positions 0 through FIRST_POS + I of K_CACHE and V_CACHE.  Each
+   cache holds N_KV_HEADS heads of HEAD_DIM numbers per position, in
+   half precision when KV_HALF is nonzero and as floats otherwise.
+   SCRATCH holds the floats gip_metal_attention_scratch returns for N_CTX
+   positions and N_QUERIES queries.  */
 void gip_metal_attention (struct gip_metal *metal, struct gip_metal_view q,
                           struct gip_metal_view k_cache,
                           struct gip_metal_view v_cache, int kv_half,
                           struct gip_metal_view scratch,
                           struct gip_metal_view out, uint32_t n_heads,
                           uint32_t n_kv_heads, uint32_t head_dim,
-                          uint32_t n_keys, uint32_t n_ctx);
+                          uint32_t first_pos, uint32_t n_queries,
+                          uint32_t n_ctx);
 
-/* Record the gated short convolution of the 3 * N_EMBD floats at BCX
-   with KERNEL_SIZE taps per channel at TAPS.  HISTORY holds the previous
-   KERNEL_SIZE - 1 inputs and moves forward one token.  The N_EMBD
-   results go to OUT.  */
+/* Record the gated short convolution of N_TOKENS tokens, each with 3 *
+   N_EMBD floats at BCX, with KERNEL_SIZE taps per channel at TAPS.
+   HISTORY holds the previous KERNEL_SIZE - 1 inputs and moves forward
+   one token at a time.  Each token's N_EMBD results go to OUT.  */
 void gip_metal_short_conv (struct gip_metal *metal, struct gip_metal_view bcx,
                            struct gip_metal_view taps,
                            struct gip_metal_view history,
                            struct gip_metal_view out, uint32_t n_embd,
-                           uint32_t kernel_size);
+                           uint32_t kernel_size, uint32_t n_tokens);
+
+/* Record a multiply of the Q8_0 matrix at WEIGHTS, which has N_ROWS rows
+   of N_COLS elements, by each of the N_TOKENS rows of N_COLS floats at X.
+   Each token's N_ROWS results go to its row of Y, added to what Y holds
+   when ACCUMULATE is nonzero.  */
+void gip_metal_matmul_q8_0 (struct gip_metal *metal,
+                            struct gip_metal_view weights, uint32_t n_rows,
+                            uint32_t n_cols, struct gip_metal_view x,
+                            struct gip_metal_view y, uint32_t n_tokens,
+                            int accumulate);
+
+/* Record GATE = SiLU (GATE) * UP over N floats.  */
+void gip_metal_swiglu (struct gip_metal *metal, struct gip_metal_view gate,
+                       struct gip_metal_view up, uint32_t n);
 
 /* Record a copy of N floats from SRC to DST.  */
 void gip_metal_copy (struct gip_metal *metal, struct gip_metal_view src,
                      struct gip_metal_view dst, uint32_t n);
 
-/* Record a dequantization of the Q8_0 row TOKEN[0] of WEIGHTS, whose
-   rows hold N_EMBD elements, into the N_EMBD floats at OUT.  TOKEN views
-   one int32_t.  */
+/* Record a dequantization of the Q8_0 rows TOKENS[0] through
+   TOKENS[N_TOKENS - 1] of WEIGHTS, whose rows hold N_EMBD elements, into
+   N_TOKENS rows of N_EMBD floats at OUT.  TOKENS views int32_t token
+   ids.  */
 void gip_metal_embed_q8_0 (struct gip_metal *metal,
                            struct gip_metal_view weights,
-                           struct gip_metal_view token,
-                           struct gip_metal_view out, uint32_t n_embd);
+                           struct gip_metal_view tokens,
+                           struct gip_metal_view out, uint32_t n_embd,
+                           uint32_t n_tokens);
 
 /* Record a store at OUT, one int32_t, of the index of the largest of the
    N floats at X.  Ties go to the lowest index.  */

@@ -248,10 +248,14 @@ main (int argc, char **argv)
 
   float *logits = malloc ((size_t)model.n_vocab * sizeof (float));
   int32_t *generated = malloc (n_generate * sizeof *generated);
+  int32_t *prompt = malloc (n_prompt * sizeof *prompt);
+  if (prompt != NULL)
+    for (unsigned t = 0; t < n_prompt; t++)
+      prompt[t] = PROMPT_TOKEN;
   double *prefill_rates = calloc (reps, sizeof *prefill_rates);
   double *decode_rates = calloc (reps, sizeof *decode_rates);
-  if (logits == NULL || generated == NULL || prefill_rates == NULL
-      || decode_rates == NULL)
+  if (logits == NULL || generated == NULL || prompt == NULL
+      || prefill_rates == NULL || decode_rates == NULL)
     {
       fprintf (stderr, "gip_bench: out of memory\n");
       return EXIT_FAILURE;
@@ -274,17 +278,13 @@ main (int argc, char **argv)
           return EXIT_FAILURE;
         }
 
-      /* Prefill runs one token per step until batched prefill exists.
-         Only the last prompt token needs logits.  */
       double start = now_seconds ();
-      for (unsigned t = 0; t < n_prompt; t++)
-        if (gip_lfm2_metal_step (&gpu, PROMPT_TOKEN,
-                                 t + 1 == n_prompt ? logits : NULL, NULL)
-            != GIP_OK)
-          {
-            fprintf (stderr, "gip_bench: prefill step failed\n");
-            return EXIT_FAILURE;
-          }
+      if (gip_lfm2_metal_prefill (&gpu, prompt, n_prompt, NULL, NULL)
+          != GIP_OK)
+        {
+          fprintf (stderr, "gip_bench: prefill failed\n");
+          return EXIT_FAILURE;
+        }
       double prefill_seconds = now_seconds () - start;
 
       /* Decode runs pipelined, the way an application generates text.  */
@@ -328,6 +328,7 @@ main (int argc, char **argv)
 
   free (logits);
   free (generated);
+  free (prompt);
   free (prefill_rates);
   free (decode_rates);
   gip_metal_close (metal);
