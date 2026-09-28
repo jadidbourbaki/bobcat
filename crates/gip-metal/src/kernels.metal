@@ -786,20 +786,25 @@ matmul_q8_0 (device const uchar *weights [[buffer (0)]],
       /* The simdgroup barriers order nothing.  They split the loads from
          the multiplies, which lets the compiler schedule each group
          together, as in llama.cpp.  */
+#pragma unroll
       for (ushort k = 0; k < QK8_0 / 8; k++)
         {
           simdgroup_half8x8 a[4];
           simdgroup_float8x8 bm[2];
           simdgroup_barrier (mem_flags::mem_none);
+#pragma unroll
           for (ushort i = 0; i < 4; i++)
             simdgroup_load (
                 a[i], weight_tile + 64 * (8 * k + row_block_base + i), 8);
           simdgroup_barrier (mem_flags::mem_none);
+#pragma unroll
           for (ushort j = 0; j < 2; j++)
             simdgroup_load (
                 bm[j], input_tile + 64 * (4 * k + token_block_base + j), 8);
           simdgroup_barrier (mem_flags::mem_none);
+#pragma unroll
           for (ushort j = 0; j < 2; j++)
+#pragma unroll
             for (ushort i = 0; i < 4; i++)
               simdgroup_multiply_accumulate (acc[4 * j + i], bm[j], a[i],
                                              acc[4 * j + i]);
