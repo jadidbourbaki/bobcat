@@ -100,7 +100,7 @@ crates/
     tests/                reference and kernel tests
   bobcat-cli/              the bobcat command: respond, chat, pull, list, and rm
   bobcat-bench/            bobcat-bench, bobcat-matmul-bench, gpu-bw, and cpu-bw programs
-docs/                      design notes, starting at docs/README.md
+docs/design.md             the design and the research plan
 tools/                     Python reference dumps and benchmark scripts
 bench/                     baseline engine checkouts, gitignored
 models/                    downloaded GGUF files, gitignored
