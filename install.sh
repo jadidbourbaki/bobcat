@@ -27,7 +27,7 @@ main() {
     [ "$(uname -s)" = "Darwin" ] || fail "bobcat runs on macOS only"
     [ "$(uname -m)" = "arm64" ] || fail "bobcat needs a Mac with Apple silicon"
     macos_major="$(sw_vers -productVersion | cut -d. -f1)"
-    [ "$macos_major" -ge 15 ] || fail "bobcat needs macOS 15 or newer"
+    [ "$macos_major" -ge 26 ] || fail "bobcat needs macOS 26 or newer"
     for tool in curl shasum tar; do
         command -v "$tool" >/dev/null || fail "bobcat needs $tool"
     done

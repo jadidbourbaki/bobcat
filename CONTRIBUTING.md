@@ -21,8 +21,8 @@ too. Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md).
 
 ## Setting up
 
-bobcat builds on a Mac with Apple silicon and macOS 15 or newer. It needs
-no Xcode.
+bobcat builds on a Mac with Apple silicon and macOS 26 or newer. The
+build needs no Xcode.
 
 1. Install Rust with [rustup](https://rustup.rs). The repository pins
    its Rust version in `rust-toolchain.toml`, and rustup installs that
