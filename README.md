@@ -47,30 +47,32 @@ $ bobcat respond -m lfm2.5:1.2b "Name three primes."
 
 ## Supported models
 
-Each model has a short name to pass to `-m`.
+Each model has a short name. Pull a model by its short name, then pass
+the same name to `bobcat chat -m` or `bobcat respond -m`. `chat` and
+`respond` also pull a model the first time they use it.
 
 **[LFM2.5-350M](https://huggingface.co/LiquidAI/LFM2.5-350M-GGUF)**
 
 ```sh
-bobcat chat -m lfm2.5:350m
+bobcat pull lfm2.5:350m
 ```
 
 **[LFM2.5-1.2B-Instruct](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct-GGUF)**
 
 ```sh
-bobcat chat -m lfm2.5:1.2b
+bobcat pull lfm2.5:1.2b
 ```
 
 **[LFM2.5-2.6B](https://huggingface.co/LiquidAI/LFM2.5-2.6B-GGUF)**
 
 ```sh
-bobcat chat -m lfm2.5:2.6b
+bobcat pull lfm2.5:2.6b
 ```
 
-Other LFM2 and LFM2.5 models on Hugging Face run by their full name:
+Other LFM2 and LFM2.5 models on Hugging Face pull by their full name:
 
 ```sh
-bobcat chat -m LiquidAI/LFM2-1.2B-GGUF
+bobcat pull LiquidAI/LFM2-1.2B-GGUF
 ```
 
 bobcat is still in alpha. We are rapidly adding support for more models
