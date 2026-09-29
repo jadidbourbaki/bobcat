@@ -63,7 +63,7 @@ main() {
         echo "    echo 'export PATH=\"$install_dir:\$PATH\"' >> ~/.zshrc" >&2
         ;;
     esac
-    status "Installed. Try: bobcat chat -m lfm2.5:1.2b"
+    status "Installed. Try: bobcat chat -m lfm2.5:2.6b"
 }
 
 main "$@"

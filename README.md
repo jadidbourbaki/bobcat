@@ -14,7 +14,7 @@
 local models on your Mac at unbelievably fast speeds.
 
 ```console
-$ bobcat chat -m lfm2.5:1.2b
+bobcat chat -m lfm2.5:2.6b
 > What is the capital of Japan? One sentence.
 The capital of Japan is Tokyo.
 ```
@@ -23,26 +23,26 @@ The capital of Japan is Tokyo.
 
 Install bobcat on a Mac with Apple silicon and macOS 26 or newer:
 
-```console
-$ curl -fsSL https://raw.githubusercontent.com/jadidbourbaki/bobcat/main/install.sh | sh
+```sh
+curl -fsSL https://raw.githubusercontent.com/jadidbourbaki/bobcat/main/install.sh | sh
 ```
 
 Download a model:
 
-```console
-$ bobcat pull lfm2.5:1.2b
+```sh
+bobcat pull lfm2.5:2.6b
 ```
 
 Chat with it:
 
-```console
-$ bobcat chat -m lfm2.5:1.2b
+```sh
+bobcat chat -m lfm2.5:2.6b
 ```
 
 Or answer one prompt, for scripts and pipes:
 
-```console
-$ bobcat respond -m lfm2.5:1.2b "Name three primes."
+```sh
+bobcat respond -m lfm2.5:2.6b "Name three primes."
 ```
 
 ## Supported models
