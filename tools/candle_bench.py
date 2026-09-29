@@ -8,7 +8,7 @@ Usage:
 
 The example runs one prompt per process, so the script runs it once to
 warm the shader cache and then `--reps` more times. Each run decodes
-greedily with no repeat penalty, the way gip-bench decodes. The script
+greedily with no repeat penalty, the way bobcat-bench decodes. The script
 prints the mean and sample standard deviation of each rate.
 """
 

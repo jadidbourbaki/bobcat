@@ -1,7 +1,7 @@
 [project]
-name = "gip-tools"
+name = "bobcat-tools"
 version = "0.1.0"
-description = "Reference dumps and benchmark scripts for gip"
+description = "Reference dumps and benchmark scripts for bobcat"
 requires-python = ">=3.12"
 dependencies = [
     "accelerate==1.15.0",

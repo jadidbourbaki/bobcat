@@ -2,7 +2,7 @@
 
 GGUF is the file format that llama.cpp defined for quantized models.
 Nearly every quantized model on Hugging Face ships as a GGUF file, so
-gip reads GGUF directly and needs no conversion step. The `gip-gguf`
+bobcat reads GGUF directly and needs no conversion step. The `bobcat-gguf`
 crate holds the parser.
 
 ## The file
@@ -21,7 +21,7 @@ A GGUF file has four parts in order:
 4. The data section, which starts at the next multiple of the file's
    alignment and holds every tensor's bytes.
 
-gip reads versions 2 and 3, which differ from version 1 in using 64-bit
+bobcat reads versions 2 and 3, which differ from version 1 in using 64-bit
 counts.
 
 ## The parser
@@ -38,7 +38,7 @@ demand. `Gguf::tensor` looks up a tensor by name, and
 
 A GGUF file comes from whoever uploaded it, so the parser treats every
 byte as hostile. llama.cpp has shipped memory-safety bugs in its GGUF
-parser. gip's parser defends in three layers:
+parser. bobcat's parser defends in three layers:
 
 - The crate declares `#![forbid(unsafe_code)]`, so no parsing bug can
   corrupt memory.
@@ -50,9 +50,9 @@ parser. gip's parser defends in three layers:
   before any allocation. A file that claims four billion metadata
   entries fails at once, since each entry needs at least 13 bytes.
 
-Every failure is a variant of `gip_gguf::Error` that names what went
+Every failure is a variant of `bobcat_gguf::Error` that names what went
 wrong, such as `OutsideFile` for a tensor whose data runs past the end
-of the file. `crates/gip-gguf/tests/malformed.rs` crafts broken files
+of the file. `crates/bobcat-gguf/tests/malformed.rs` crafts broken files
 and checks that each one yields the right error.
 
 ## Quantization formats
@@ -81,9 +81,9 @@ precision.
 A model's file name names its quantization mix. Liquid's `Q4_K_M` files
 store most matrices in Q4_K and keep the token embedding and some
 `attn_v` and `ffn_down` matrices in Q6_K. Liquid's `Q4_0` files keep
-the token embedding in Q6_K. gip therefore reads Q4_0, Q4_K, and Q6_K
+the token embedding in Q6_K. bobcat therefore reads Q4_0, Q4_K, and Q6_K
 to run those files.
 
-`crates/gip/src/scalar.rs` dequantizes every type with the arithmetic
+`crates/bobcat/src/scalar.rs` dequantizes every type with the arithmetic
 of ggml's reference code in `ggml/src/ggml-quants.c`. The GPU kernels
 are tested against those functions.

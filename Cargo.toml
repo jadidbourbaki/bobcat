@@ -7,15 +7,15 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
-repository = "https://github.com/jadidbourbaki/gip"
+repository = "https://github.com/jadidbourbaki/bobcat"
 
 [workspace.dependencies]
 block2 = { version = "0.6.2", default-features = false, features = ["std"] }
+bobcat = { path = "crates/bobcat" }
+bobcat-gguf = { path = "crates/bobcat-gguf" }
+bobcat-metal = { path = "crates/bobcat-metal" }
 clap = { version = "4.6.7", features = ["derive"] }
 fastrand = { version = "2.5.0" }
-gip = { path = "crates/gip" }
-gip-gguf = { path = "crates/gip-gguf" }
-gip-metal = { path = "crates/gip-metal" }
 half = { version = "2.7.1", default-features = false }
 hf-hub = { version = "1.0.0", features = ["blocking"] }
 libc = { version = "0.2.189", default-features = false }

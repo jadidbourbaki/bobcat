@@ -1,4 +1,4 @@
-"""Dump reference activations from transformers for gip's tests.
+"""Dump reference activations from transformers for bobcat's tests.
 
 Usage:
 
@@ -35,7 +35,7 @@ DEFAULT_PROMPT = "The capital of France is"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Dump reference activations for gip's tests."
+        description="Dump reference activations for bobcat's tests."
     )
     parser.add_argument("--model", required=True, help="Hugging Face repo or path")
     parser.add_argument(

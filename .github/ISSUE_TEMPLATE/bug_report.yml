@@ -1,5 +1,5 @@
 name: Bug report
-description: Something in gip does not work as it should.
+description: Something in bobcat does not work as it should.
 labels: [bug]
 body:
   - type: markdown
@@ -13,14 +13,14 @@ body:
       label: What happened
       description: What you ran, what you expected, and what happened instead.
       placeholder: |
-        I ran `gip chat -m LiquidAI/LFM2.5-2.6B-GGUF:Q4_K_M` and expected ...
+        I ran `bobcat chat -m LiquidAI/LFM2.5-2.6B-GGUF:Q4_K_M` and expected ...
     validations:
       required: true
   - type: textarea
     id: output
     attributes:
       label: Output
-      description: The full output, including any `gip:` error line.
+      description: The full output, including any `bobcat:` error line.
       render: text
   - type: input
     id: model
@@ -39,7 +39,7 @@ body:
   - type: input
     id: version
     attributes:
-      label: gip version
-      description: The output of `gip --version`, or the commit you built.
+      label: bobcat version
+      description: The output of `bobcat --version`, or the commit you built.
     validations:
       required: true

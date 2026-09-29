@@ -1,8 +1,8 @@
 # Security policy
 
-gip reads model files that people download from strangers, so we treat
+bobcat reads model files that people download from strangers, so we treat
 every parsing and memory-safety bug as a security bug. Thank you for
-helping keep gip and its users safe.
+helping keep bobcat and its users safe.
 
 ## Reporting a vulnerability
 
@@ -10,7 +10,7 @@ Please report vulnerabilities privately, and do not open a public issue
 or pull request about them.
 
 1. Open the repository's
-   [Security tab](https://github.com/jadidbourbaki/gip/security) and
+   [Security tab](https://github.com/jadidbourbaki/bobcat/security) and
    choose **Report a vulnerability**. GitHub keeps the report private
    between you and the maintainers.
 2. If you cannot use GitHub, email hayder@alumni.harvard.edu.
@@ -34,26 +34,26 @@ would rather stay anonymous.
 
 ## Supported versions
 
-gip has not reached 1.0. Security fixes go into the latest release
+bobcat has not reached 1.0. Security fixes go into the latest release
 only.
 
 ## Scope
 
 The following count as vulnerabilities:
 
-- A GGUF file or `tokenizer.json` that makes gip read or write memory
+- A GGUF file or `tokenizer.json` that makes bobcat read or write memory
   out of bounds, crash, hang, or allocate without bound.
-- A model name or download that makes `gip pull` write outside the
+- A model name or download that makes `bobcat pull` write outside the
   Hugging Face cache.
 - A problem in `install.sh` or the release binaries that lets someone
   other than the maintainers change what gets installed.
 
-gip runs the model the user chooses. Harmful or false text that a model
+bobcat runs the model the user chooses. Harmful or false text that a model
 produces is a property of that model and outside this policy.
 
-## How gip limits the damage
+## How bobcat limits the damage
 
-- The GGUF parser in `crates/gip-gguf` contains no unsafe code, and its
+- The GGUF parser in `crates/bobcat-gguf` contains no unsafe code, and its
   lints reject unchecked indexing and arithmetic, so a malformed file
   yields an error.
 - Unsafe code is confined to the Metal backend, memory-mapping model

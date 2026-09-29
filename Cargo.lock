@@ -222,6 +222,61 @@ dependencies = [
 ]
 
 [[package]]
+name = "bobcat"
+version = "0.1.0"
+dependencies = [
+ "bobcat-gguf",
+ "bobcat-metal",
+ "half",
+ "memmap2",
+ "thiserror",
+]
+
+[[package]]
+name = "bobcat-bench"
+version = "0.1.0"
+dependencies = [
+ "bobcat",
+ "clap",
+ "libc",
+]
+
+[[package]]
+name = "bobcat-cli"
+version = "0.1.0"
+dependencies = [
+ "bobcat",
+ "bobcat-gguf",
+ "clap",
+ "fastrand",
+ "hf-hub",
+ "minijinja",
+ "minijinja-contrib",
+ "rustyline",
+ "tokenizers",
+]
+
+[[package]]
+name = "bobcat-gguf"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "bobcat-metal"
+version = "0.1.0"
+dependencies = [
+ "block2",
+ "libc",
+ "memmap2",
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
+ "thiserror",
+]
+
+[[package]]
 name = "bon"
 version = "3.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -976,61 +1031,6 @@ dependencies = [
  "r-efi 6.0.0",
  "rand_core 0.10.1",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "gip"
-version = "0.1.0"
-dependencies = [
- "gip-gguf",
- "gip-metal",
- "half",
- "memmap2",
- "thiserror",
-]
-
-[[package]]
-name = "gip-bench"
-version = "0.1.0"
-dependencies = [
- "clap",
- "gip",
- "libc",
-]
-
-[[package]]
-name = "gip-cli"
-version = "0.1.0"
-dependencies = [
- "clap",
- "fastrand",
- "gip",
- "gip-gguf",
- "hf-hub",
- "minijinja",
- "minijinja-contrib",
- "rustyline",
- "tokenizers",
-]
-
-[[package]]
-name = "gip-gguf"
-version = "0.1.0"
-dependencies = [
- "thiserror",
-]
-
-[[package]]
-name = "gip-metal"
-version = "0.1.0"
-dependencies = [
- "block2",
- "libc",
- "memmap2",
- "objc2",
- "objc2-foundation",
- "objc2-metal",
- "thiserror",
 ]
 
 [[package]]

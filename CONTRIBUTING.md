@@ -1,6 +1,6 @@
-# Contributing to gip
+# Contributing to bobcat
 
-Thank you for considering a contribution to gip. Bug reports, benchmark
+Thank you for considering a contribution to bobcat. Bug reports, benchmark
 results from your Mac, documentation fixes, tests, new model families,
 and faster kernels are all welcome, and first contributions are welcome
 too. Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md).
@@ -8,7 +8,7 @@ too. Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md).
 ## Ways to help
 
 - **Report a bug** with the bug report form on the
-  [issues page](https://github.com/jadidbourbaki/gip/issues). Include
+  [issues page](https://github.com/jadidbourbaki/bobcat/issues). Include
   your Mac model, your macOS version, the command you ran, and the
   model name.
 - **Share benchmark numbers** from your machine. Different chips and
@@ -21,7 +21,7 @@ too. Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md).
 
 ## Setting up
 
-gip builds on a Mac with Apple silicon and macOS 15 or newer. It needs
+bobcat builds on a Mac with Apple silicon and macOS 15 or newer. It needs
 no Xcode.
 
 1. Install Rust with [rustup](https://rustup.rs). The repository pins
@@ -38,8 +38,8 @@ no Xcode.
 3. Fork the repository, clone your fork, and run the checks:
 
    ```console
-   $ git clone https://github.com/YOUR_USERNAME/gip.git
-   $ cd gip
+   $ git clone https://github.com/YOUR_USERNAME/bobcat.git
+   $ cd bobcat
    $ just check
    ```
 
@@ -48,7 +48,7 @@ the tests. `just` lists the other recipes.
 
 ### Test models
 
-The reference tests compare gip's forward pass, layer by layer, with
+The reference tests compare bobcat's forward pass, layer by layer, with
 Hugging Face transformers. They need model files in `models/` and
 reference dumps in `models/ref/`, and they print `skip:` when a file is
 missing. To produce the dumps, install [uv](https://docs.astral.sh/uv/)
@@ -80,7 +80,7 @@ saves a round of review.
 ### Performance changes
 
 A change that claims a speedup includes before and after numbers from
-`gip-bench`, measured on an idle Mac, with the chip named. A change
+`bobcat-bench`, measured on an idle Mac, with the chip named. A change
 that slows any benchmark says so. `AGENTS.md` describes the protocol.
 
 ## Using AI tools

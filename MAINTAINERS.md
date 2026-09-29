@@ -11,7 +11,7 @@ the project's direction. They also keep the community welcoming, as the
 ## Getting in touch
 
 Questions and ideas go in a
-[GitHub issue](https://github.com/jadidbourbaki/gip/issues).
+[GitHub issue](https://github.com/jadidbourbaki/bobcat/issues).
 Vulnerabilities go through the private process in
 [SECURITY.md](SECURITY.md).
 

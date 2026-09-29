@@ -1,11 +1,11 @@
 # AGENTS.md
 
-Guidance for AI agents working on the gip codebase. The CLAUDE.md
+Guidance for AI agents working on the bobcat codebase. The CLAUDE.md
 symlink resolves to this file. Read top to bottom on first session.
 
 ## Project context
 
-gip, the general inference program, is a local LLM inference engine
+bobcat is a local LLM inference engine
 written in Rust. The first goal is the fastest LLM inference on the Mac
 GPU, measured against mlx-lm and llama.cpp's Metal backend. The first
 models are Liquid AI's LFM2.5 family at Q8_0, and the first machine is
@@ -39,7 +39,7 @@ builds the documentation with warnings as errors, runs every test, and
 checks that each `Cargo.toml` lists its dependencies in sorted order. A
 change that fails `just check` locally is unfinished.
 
-Cargo builds gip, and [just](https://just.systems/) holds the everyday
+Cargo builds bobcat, and [just](https://just.systems/) holds the everyday
 commands.
 
 | Recipe | Meaning |
@@ -49,7 +49,7 @@ commands.
 | `just test` | Run the tests |
 | `just check` | Run the full quality gate |
 | `just fmt` | Format the Rust sources, the manifests, and the Metal kernels |
-| `just bench` | Measure GPU bandwidth, gip, and the baseline engines |
+| `just bench` | Measure GPU bandwidth, bobcat, and the baseline engines |
 | `just bench-cpu` | Measure CPU bandwidth and the llama.cpp CPU baseline |
 | `just clean` | Remove the build output |
 
@@ -72,9 +72,9 @@ Homebrew's `rust` formula installs its own `cargo` in
 `~/.cargo/bin` ahead of `/opt/homebrew/bin` in `PATH`, or uninstall the
 formula, so rustup's `cargo` runs.
 
-The Command Line Tools include no Metal shader compiler. gip embeds its
+The Command Line Tools include no Metal shader compiler. bobcat embeds its
 `.metal` sources in the library with `include_str!` and compiles them at
-load time with `newLibraryWithSource`, so building gip needs no Xcode.
+load time with `newLibraryWithSource`, so building bobcat needs no Xcode.
 macOS caches the compiled shaders between runs.
 
 `clang-format` from the Command Line Tools formats the Metal kernels.
@@ -90,16 +90,16 @@ rust-toolchain.toml        pinned Rust release
 rustfmt.toml, clippy.toml  formatter and linter settings
 justfile                   everyday commands
 crates/
-  gip-gguf/                GGUF parser in safe Rust
-  gip-metal/               Metal host code through objc2-metal
-    src/*.metal            Metal kernels by operation, embedded at build time
-  gip/                     model loading, scalar reference ops, and the LFM2 graph
-    src/scalar.rs          reference implementation of every op
-    src/lfm2.rs            LFM2 on the CPU with the scalar ops
-    src/lfm2_metal.rs      LFM2 on the Metal GPU
-    tests/                 reference and kernel tests
-  gip-cli/                 the gip command: respond, chat, pull, list, and rm
-  gip-bench/               gip-bench, gip-matmul-bench, gpu-bw, and cpu-bw programs
+  bobcat-gguf/             GGUF parser in safe Rust
+  bobcat-metal/            Metal host code through objc2-metal
+    src/*.metal           Metal kernels by operation, embedded at build time
+  bobcat/                  model loading, scalar reference ops, and the LFM2 graph
+    src/scalar.rs         reference implementation of every op
+    src/lfm2.rs           LFM2 on the CPU with the scalar ops
+    src/lfm2_metal.rs     LFM2 on the Metal GPU
+    tests/                reference and kernel tests
+  bobcat-cli/              the bobcat command: respond, chat, pull, list, and rm
+  bobcat-bench/            bobcat-bench, bobcat-matmul-bench, gpu-bw, and cpu-bw programs
 docs/                      design notes, starting at docs/README.md
 tools/                     Python reference dumps and benchmark scripts
 bench/                     baseline engine checkouts, gitignored
@@ -174,7 +174,7 @@ Right:
 
 ## Rust style
 
-gip follows the [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/)
+bobcat follows the [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/)
 and the conventions of Astral's [uv](https://github.com/astral-sh/uv)
 and [ruff](https://github.com/astral-sh/ruff). Where this document is
 silent, those sources decide. Where this document and those sources
@@ -236,7 +236,7 @@ caller needs it now.
 
 ### Constructs
 
-- Match exhaustively on enums gip defines. A wildcard arm hides the
+- Match exhaustively on enums bobcat defines. A wildcard arm hides the
   next variant someone adds.
 - Use let chains, `let ... else`, and `?` to keep the happy path at the
   left margin.
@@ -295,7 +295,7 @@ field's name with no `get_` prefix. Conversions follow the `as_`,
   exits, or panics on bad input, because it runs inside other people's
   processes.
 - The library keeps no mutable global state.
-- An impossible condition means a bug in gip. Use `unreachable!` with a
+- An impossible condition means a bug in bobcat. Use `unreachable!` with a
   message that explains why the condition cannot happen.
 - Tools parse options with `clap` and support `--help` and `--version`.
   Exit status is 0 on success and 1 on failure.
@@ -305,7 +305,7 @@ field's name with no `get_` prefix. Conversions follow the `as_`,
 - Declare every dependency once in `[workspace.dependencies]` with its
   version, and refer to it from each crate with `workspace = true`.
 - Turn off default features where the crate allows it, and list only
-  the features gip uses.
+  the features bobcat uses.
 - Commit `Cargo.lock`. Change a locked version with
   `cargo update --precise`, one dependency at a time.
 - Before adding a dependency, check that it is maintained and widely
@@ -313,38 +313,38 @@ field's name with no `get_` prefix. Conversions follow the `as_`,
 
 ## Command-line design
 
-gip's commands follow the Unix conventions that make tools compose.
+bobcat's commands follow the Unix conventions that make tools compose.
 Apple's `fm`, Simon Willison's `llm`, and `ollama run` are the
 references for how an LLM command behaves.
 
-- Each subcommand does one job. `gip respond` answers one prompt for
-  scripts and pipes. `gip chat` holds a conversation for a person at a
+- Each subcommand does one job. `bobcat respond` answers one prompt for
+  scripts and pipes. `bobcat chat` holds a conversation for a person at a
   terminal.
 - Standard output carries only data, such as the answer. Thinking,
   progress, and prompts go to standard error or appear only on a
   terminal.
 - Text on standard input joins the prompt argument, so
-  `cat notes.md | gip respond "Summarize this."` works. Neither source
+  `cat notes.md | bobcat respond "Summarize this."` works. Neither source
   is ever dropped in silence.
 - Styling such as dim text appears only when the output is a terminal
   and `NO_COLOR` is unset, as [no-color.org](https://no-color.org)
   describes.
-- A failure prints `gip: message` to standard error and exits with
+- A failure prints `bobcat: message` to standard error and exits with
   status 1.
 - Defaults cover the common case. A flag earns its place only when a
   user needs to change the default.
 
 ## Unsafe code
 
-`unsafe_code` is denied across the workspace. `gip-gguf` goes further
+`unsafe_code` is denied across the workspace. `bobcat-gguf` goes further
 with `#![forbid(unsafe_code)]`, so the parser that reads untrusted files
 holds no unsafe code at all. Three places opt out with
 `#[expect(unsafe_code, reason = "...")]`:
 
 | Module | Why it needs unsafe |
 |---|---|
-| `gip-metal` | Metal's API is Objective-C, reached through `objc2-metal`. The crate also holds the GPU bandwidth probe that `gpu-bw` runs |
-| `gip::storage` | `memmap2` maps model files |
+| `bobcat-metal` | Metal's API is Objective-C, reached through `objc2-metal`. The crate also holds the GPU bandwidth probe that `gpu-bw` runs |
+| `bobcat::storage` | `memmap2` maps model files |
 | `cpu-bw` | macOS sets a thread's quality of service class through `libc` |
 
 Adding unsafe code anywhere else needs the user's approval first.
@@ -377,12 +377,12 @@ the denial-of-service bugs that remain.
 - Compute every size with `checked_add` and `checked_mul`, and reject
   the file on overflow.
 - Read multi-byte fields with `from_le_bytes`. GGUF is little-endian.
-- A malformed file yields an error. `gip-gguf` warns on
+- A malformed file yields an error. `bobcat-gguf` warns on
   `clippy::indexing_slicing` and `clippy::arithmetic_side_effects`, so
   no input can reach a panic through an index or an overflow.
 - Reserve memory from a count in the file only after the count passes
   the file-size check.
-- Keep all parsing in `gip-gguf`. Every change to that crate runs the
+- Keep all parsing in `bobcat-gguf`. Every change to that crate runs the
   malformed-file tests and, once it exists, `just fuzz`.
 
 ## Memory and threads
@@ -409,7 +409,7 @@ the denial-of-service bugs that remain.
 
 ## Kernels
 
-- Every op has a scalar implementation in `crates/gip/src/scalar.rs`.
+- Every op has a scalar implementation in `crates/bobcat/src/scalar.rs`.
   The scalar version defines the correct output.
 - Every Metal kernel and every SIMD kernel is tested against the
   scalar version on random inputs, with the tolerance stated in the
@@ -470,7 +470,7 @@ file. Tests that load a model or open the GPU live in each crate's
 `test_` prefix. A test that needs a file from `models/` or a Metal
 device prints `skip:` and the reason to standard error and returns
 when the file or device is missing. Tests return `Result` and use `?`
-for setup that can fail. gip uses no test framework beyond the
+for setup that can fail. bobcat uses no test framework beyond the
 standard library.
 
 ## Benchmarks
@@ -481,7 +481,7 @@ candle, the leading Rust engines, run the same GGUF files and serve as
 further baselines. Every performance claim comes with numbers from this
 protocol:
 
-- Use the same GGUF file for gip, llama.cpp, mistral.rs, and candle.
+- Use the same GGUF file for bobcat, llama.cpp, mistral.rs, and candle.
 - Run mlx-lm on Liquid's official MLX 8-bit weights. Report the model
   bytes of each engine's weights, since MLX's 8-bit format differs
   from GGUF Q8_0.
@@ -505,9 +505,9 @@ The baselines live in gitignored checkouts under `bench/`:
 | candle | `cargo build --release --example quantized-lfm2 --features metal` |
 
 `MISTRALRS_METAL_PRECOMPILE=0` makes mistral.rs compile its kernels at
-load time, as gip does, since the Command Line Tools lack the `metal`
+load time, as bobcat does, since the Command Line Tools lack the `metal`
 compiler. mistral.rs measures decode at a context depth of 512, the
-same depth gip decodes at. candle's example runs one prompt per
+same depth bobcat decodes at. candle's example runs one prompt per
 process, so `tools/candle_bench.py` repeats it and reports the mean and
 standard deviation. Its prompt counts upward, so greedy decoding
 reaches all 128 tokens without an end-of-sequence token.
@@ -546,7 +546,7 @@ scripts. The engine never depends on Python.
 ## Don't reinvent the wheel
 
 The kernels, model graphs, KV cache, and scheduler are the product,
-and gip writes them. Everything around them gets the usual scrutiny.
+and bobcat writes them. Everything around them gets the usual scrutiny.
 Before writing any other non-trivial logic, search the standard library
 first, then the crates already in `[workspace.dependencies]`, then
 established crates on crates.io.

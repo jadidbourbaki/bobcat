@@ -4,7 +4,7 @@ mistralrs := "bench/mistral.rs/target/release/mistralrs"
 candle_lfm2 := "bench/candle/target/release/examples/quantized-lfm2"
 gguf_models := "models/LFM2.5-350M-Q8_0.gguf models/LFM2.5-1.2B-Instruct-Q8_0.gguf models/LFM2.5-2.6B-Q8_0.gguf"
 mlx_models := "models/LFM2.5-350M-MLX-8bit models/LFM2.5-1.2B-Instruct-MLX-8bit models/LFM2.5-2.6B-MLX-8bit"
-kernels := "crates/gip-metal/src/common.metal crates/gip-metal/src/quant.metal crates/gip-metal/src/matvec.metal crates/gip-metal/src/matmul.metal crates/gip-metal/src/attention.metal crates/gip-metal/src/conv.metal crates/gip-metal/src/norm.metal"
+kernels := "crates/bobcat-metal/src/common.metal crates/bobcat-metal/src/quant.metal crates/bobcat-metal/src/matvec.metal crates/bobcat-metal/src/matmul.metal crates/bobcat-metal/src/attention.metal crates/bobcat-metal/src/conv.metal crates/bobcat-metal/src/norm.metal"
 
 # List the recipes.
 default:
@@ -33,12 +33,12 @@ fmt:
     cargo sort --workspace
     clang-format -i {{kernels}}
 
-# Measure GPU bandwidth, gip, and the llama.cpp, mlx-lm, mistral.rs, and candle baselines.
+# Measure GPU bandwidth, bobcat, and the llama.cpp, mlx-lm, mistral.rs, and candle baselines.
 bench:
-    cargo build --release --locked -p gip-bench
+    cargo build --release --locked -p bobcat-bench
     target/release/gpu-bw
-    @echo "gip $(git rev-parse --short HEAD), Metal"
-    for model in {{gguf_models}}; do target/release/gip-bench "$model"; done
+    @echo "bobcat $(git rev-parse --short HEAD), Metal"
+    for model in {{gguf_models}}; do target/release/bobcat-bench "$model"; done
     @echo "llama.cpp $(git -C bench/llama.cpp rev-parse --short HEAD), Metal"
     {{llama_bench_metal}} $(printf -- '-m %s ' {{gguf_models}}) -p 512 -n 0 -r 5 -o md
     {{llama_bench_metal}} $(printf -- '-m %s ' {{gguf_models}}) -p 0 -n 128 -d 512 -r 5 -o md
@@ -51,7 +51,7 @@ bench:
 
 # Measure CPU bandwidth and the llama.cpp CPU baseline.
 bench-cpu:
-    cargo build --release --locked -p gip-bench
+    cargo build --release --locked -p bobcat-bench
     target/release/cpu-bw
     @echo "llama.cpp $(git -C bench/llama.cpp rev-parse --short HEAD), CPU"
     {{llama_bench_cpu}} $(printf -- '-m %s ' {{gguf_models}}) -t 1,4,8,10 -p 512 -n 0 -r 5 -o md
@@ -59,8 +59,8 @@ bench-cpu:
 
 # Measure warmed engine latency for greedy streaming output.
 bench-latency model="models/LFM2.5-2.6B-Q4_K_M.gguf":
-    cargo build --release --locked -p gip-bench
-    target/release/gip-bench --latency --reps 20 {{model}}
+    cargo build --release --locked -p bobcat-bench
+    target/release/bobcat-bench --latency --reps 20 {{model}}
 
 # Remove the build output.
 clean:

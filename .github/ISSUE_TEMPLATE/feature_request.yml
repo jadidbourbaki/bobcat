@@ -6,7 +6,7 @@ body:
     id: problem
     attributes:
       label: What you want to do
-      description: The task you want gip to help with, and what stops you today.
+      description: The task you want bobcat to help with, and what stops you today.
     validations:
       required: true
   - type: textarea

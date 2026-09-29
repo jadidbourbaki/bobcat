@@ -1,7 +1,7 @@
 # LFM2
 
 LFM2 is Liquid AI's family of hybrid language models. LFM2.5 keeps the
-same architecture with more training. gip runs LFM2 first because the
+same architecture with more training. bobcat runs LFM2 first because the
 models are small enough to run fast on a laptop and good enough to be
 useful.
 
@@ -64,7 +64,7 @@ every layer would need.
 
 ## The code
 
-`crates/gip/src/lfm2.rs` loads the model and runs it on the CPU.
+`crates/bobcat/src/lfm2.rs` loads the model and runs it on the CPU.
 
 `Model::load` maps the file, parses it, reads the hyperparameters, and
 finds every tensor. The loader checks each tensor's shape against the
@@ -78,7 +78,7 @@ allocates all of it for a fixed context length, so a step allocates
 nothing.
 
 `Model::step` runs one token through every layer with the functions in
-`crates/gip/src/scalar.rs`. The scalar functions use plain loops and
+`crates/bobcat/src/scalar.rs`. The scalar functions use plain loops and
 sum in double precision. The scalar functions run slowly and define the
 correct output of every operation. Every GPU kernel is tested against
 the scalar functions.
@@ -96,7 +96,7 @@ final normalization, the logits, and a greedy continuation. With
 `--gguf`, transformers loads the weights from a GGUF file, so both
 sides see the same dequantized weights.
 
-`crates/gip/tests/lfm2_reference.rs` runs gip on the same prompt and
+`crates/bobcat/tests/lfm2_reference.rs` runs bobcat on the same prompt and
 compares every activation. The error is measured relative to the
 largest magnitude in each reference row.
 

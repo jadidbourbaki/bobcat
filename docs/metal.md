@@ -1,8 +1,8 @@
 # Metal
 
-gip runs models on the GPU through Metal, Apple's GPU API. The
-`gip-metal` crate compiles gip's kernels and launches them. The
-`Lfm2Metal` type in `crates/gip/src/lfm2_metal.rs` strings the launches
+bobcat runs models on the GPU through Metal, Apple's GPU API. The
+`bobcat-metal` crate compiles bobcat's kernels and launches them. The
+`Lfm2Metal` type in `crates/bobcat/src/lfm2_metal.rs` strings the launches
 together into the LFM2 forward pass.
 
 ## Terms
@@ -37,7 +37,7 @@ matrix units.
 
 ## Compiling the kernels
 
-The kernels live in seven files in `crates/gip-metal/src`.
+The kernels live in seven files in `crates/bobcat-metal/src`.
 
 | File | Kernels |
 |---|---|
@@ -51,7 +51,7 @@ The kernels live in seven files in `crates/gip-metal/src`.
 
 `include_str!` embeds the files in the library. `Metal::open` joins
 them into one source string and compiles it with
-`newLibraryWithSource` when the program starts. Building gip therefore
+`newLibraryWithSource` when the program starts. Building bobcat therefore
 needs no Xcode, only the Command Line Tools. macOS caches the compiled
 result between runs.
 
@@ -83,7 +83,7 @@ that the system refused to map arrives in heap memory and is copied
 into a new buffer.
 
 Metal's API is Objective-C, reached through the `objc2-metal` crate,
-and every call into it is unsafe Rust. `gip-metal` keeps the unsafe
+and every call into it is unsafe Rust. `bobcat-metal` keeps the unsafe
 code behind a safe API. Every launch checks that each buffer range it
 binds lies inside its buffer, and a buffer from another `Metal` is
 rejected. The CPU reads and writes shared buffers only while no command
@@ -122,7 +122,7 @@ root mean square inside the matvec, so the normalized vector is never
 written to memory and read back. An accumulating matvec adds into the
 residual stream, so the block output needs no separate add kernel.
 
-`gip respond` and `gip chat` keep the KV cache in half precision,
+`bobcat respond` and `bobcat chat` keep the KV cache in half precision,
 which halves the bytes each attention step reads. The reference tests allow a larger
 error for the half-precision cache, as [LFM2](lfm2.md) describes.
 
@@ -174,7 +174,7 @@ Metal objects other than its command buffer.
 
 ## Profiling
 
-`gip-bench` measures prefill and decode speed and reports the time the
+`bobcat-bench` measures prefill and decode speed and reports the time the
 CPU spends recording against the time the GPU spends running. With
 `--profile`, `Metal` runs each launch in its own command buffer and
 records its time under the kernel's name and shape. The profile shows

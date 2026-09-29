@@ -1,0 +1,35 @@
+[package]
+name = "bobcat-bench"
+description = "Benchmark programs for bobcat"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "bobcat-bench"
+path = "src/bin/bobcat_bench.rs"
+
+[[bin]]
+name = "bobcat-matmul-bench"
+path = "src/bin/bobcat_matmul_bench.rs"
+
+[[bin]]
+name = "gpu-bw"
+path = "src/bin/gpu_bw.rs"
+
+[[bin]]
+name = "cpu-bw"
+path = "src/bin/cpu_bw.rs"
+
+[dependencies]
+bobcat = { workspace = true }
+clap = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
+
+[lints]
+workspace = true

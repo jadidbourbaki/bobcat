@@ -309,7 +309,7 @@ wheels = [
 ]
 
 [[package]]
-name = "gip-tools"
+name = "bobcat-tools"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
