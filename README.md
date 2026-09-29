@@ -9,20 +9,14 @@
   <a href="https://github.com/sponsors/jadidbourbaki"><img src="https://img.shields.io/badge/Sponsor-❤️-pink.svg" alt="Sponsor"></a>
 </p>
 
-**bobcat** is an inference engine for Apple silicon. It runs language
-models on your Mac's GPU with its own Metal kernels.
-
-It reads the GGUF files on Hugging Face and aims to be the fastest way
-to run a model locally on a Mac.
+**bobcat** is an inference engine optimized for Apple silicon. Run
+local models on your Mac at unbelievably fast speeds.
 
 ```console
 $ bobcat chat -m lfm2.5:1.2b
 > What is the capital of Japan? One sentence.
 The capital of Japan is Tokyo.
 ```
-
-bobcat is early. It runs Liquid AI's LFM2 and LFM2.5 models today, in the
-Q8_0, Q4_0, and Q4_K_M quantizations. More model families come next.
 
 ## Quick start
 
@@ -49,3 +43,12 @@ Or answer one prompt, for scripts and pipes:
 ```console
 $ bobcat respond -m lfm2.5:1.2b "Name three primes."
 ```
+
+## Supported models
+
+- [LFM2.5-350M](https://huggingface.co/LiquidAI/LFM2.5-350M-GGUF): `lfm2.5:350m`
+- [LFM2.5-1.2B-Instruct](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct-GGUF): `lfm2.5:1.2b`
+- [LFM2.5-2.6B](https://huggingface.co/LiquidAI/LFM2.5-2.6B-GGUF): `lfm2.5:2.6b`
+
+Other LFM2 and LFM2.5 models on Hugging Face run by their full name, as
+in `bobcat chat -m LiquidAI/LFM2-1.2B-GGUF`.
