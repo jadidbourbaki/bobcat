@@ -1,6 +1,8 @@
-# gip
+<p align="center">
+  <img src="assets/banner.svg" width="500" alt="bobcat">
+</p>
 
-<p>
+<p align="center">
   <a href="https://github.com/jadidbourbaki/gip/actions/workflows/ci.yml"><img src="https://github.com/jadidbourbaki/gip/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/jadidbourbaki/gip/releases/latest"><img src="https://img.shields.io/github/v/release/jadidbourbaki/gip?include_prereleases" alt="Latest release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
