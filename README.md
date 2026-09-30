@@ -77,3 +77,84 @@ bobcat pull LiquidAI/LFM2-1.2B-GGUF
 
 bobcat is still in alpha. We are rapidly adding support for more models
 and model families. Please stay tuned!
+
+## Using bobcat with agents
+
+`bobcat serve` answers requests in the OpenAI Chat Completions API and
+the Anthropic Messages API, so coding agents and chat apps can run on a
+local model:
+
+```sh
+bobcat serve -m lfm2.5:2.6b
+```
+
+The server listens on `http://127.0.0.1:8080` and answers one request
+at a time. Agents send the whole conversation with every request, and
+bobcat skips the part of the prompt it has already run.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-m`, `--model` | `BOBCAT_MODEL` | The model to serve |
+| `--host` | `127.0.0.1` | The address to listen on |
+| `--port` | `8080` | The port to listen on |
+| `-c`, `--context` | `32768` | The most tokens in one conversation |
+| `-n`, `--max-tokens` | `4096` | The most tokens in a reply when a request sets no limit |
+
+**[Claude Code](https://docs.claude.com/en/docs/claude-code/overview)**
+
+Claude Code's system prompt and tools take about 20,000 tokens, so give
+the server a larger context:
+
+```sh
+bobcat serve -m lfm2.5:2.6b -c 65536
+```
+
+Then start Claude Code with the same context:
+
+```sh
+ANTHROPIC_BASE_URL=http://127.0.0.1:8080 \
+ANTHROPIC_AUTH_TOKEN=bobcat \
+ANTHROPIC_API_KEY="" \
+CLAUDE_CODE_MAX_CONTEXT_TOKENS=65536 \
+claude --model lfm2.5:2.6b
+```
+
+**[opencode](https://opencode.ai)**
+
+Add bobcat as a provider in `opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "bobcat": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "bobcat",
+      "options": { "baseURL": "http://127.0.0.1:8080/v1" },
+      "models": { "lfm2.5:2.6b": { "name": "LFM2.5-2.6B" } }
+    }
+  }
+}
+```
+
+Then pick the model:
+
+```sh
+opencode -m bobcat/lfm2.5:2.6b
+```
+
+**[aider](https://aider.chat)**
+
+```sh
+OPENAI_API_BASE=http://127.0.0.1:8080/v1 \
+OPENAI_API_KEY=bobcat \
+aider --model openai/lfm2.5:2.6b
+```
+
+**Other OpenAI clients**
+
+Point the client's base URL at `http://127.0.0.1:8080/v1` and give it
+any API key. bobcat ignores the key.
+
+Codex CLI talks only to the OpenAI Responses API, which bobcat does not
+serve yet.
