@@ -1,0 +1,2 @@
+Apple M4 Pro, 14 CPU cores, 20 GPU cores, 48 GiB memory.
+macOS 26.5.1.
