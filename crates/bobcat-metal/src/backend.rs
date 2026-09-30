@@ -167,6 +167,9 @@ pub enum Error {
         /// The buffer's length.
         len: usize,
     },
+    /// The format has no kernel that expands it into half precision.
+    #[error("{0:?} matrices cannot expand into half precision")]
+    NoExpansion(Format),
     /// The GPU reported an error while running a command buffer.
     #[error("the GPU failed to run a command buffer: {0}")]
     Execution(String),
@@ -306,6 +309,17 @@ impl Format {
         }
     }
 
+    /// Return the kernel that expands a matrix of this format into half precision, if the format
+    /// has one.
+    fn expand_name(self) -> Option<&'static str> {
+        match self {
+            Self::Q4_0 => Some("expand_q4_0"),
+            Self::Q4K => Some("expand_q4k"),
+            Self::Q6K => Some("expand_q6k"),
+            Self::F16 | Self::Q8_0 => None,
+        }
+    }
+
     /// Return the weights and bytes of one block.
     fn block(self) -> (usize, usize) {
         match self {
@@ -368,8 +382,7 @@ enum Kernel {
     ShortConvBatch,
     ShortConvHistory,
     Matmul(Format, Store),
-    ExpandQ4K,
-    ExpandQ6K,
+    Expand(Format),
     Copy,
     Embed(Format),
     Argmax,
@@ -394,8 +407,7 @@ impl Kernel {
             Self::Matmul(format, Store::Overwrite | Store::Accumulate | Store::Swiglu) => {
                 format.kernel_names()[2]
             }
-            Self::ExpandQ4K => "expand_q4k",
-            Self::ExpandQ6K => "expand_q6k",
+            Self::Expand(format) => format.expand_name().unwrap_or("expand"),
             Self::Copy => "copy",
             Self::Embed(format) => format.kernel_names()[3],
             Self::Argmax => "argmax",
@@ -475,8 +487,8 @@ impl FormatPipelines {
 struct Pipelines {
     /// Indexed by [`Format::index`].
     formats: Vec<FormatPipelines>,
-    expand_q4k: Pipeline,
-    expand_q6k: Pipeline,
+    /// Indexed by [`Format::index`], for the formats that expand.
+    expand: Vec<Option<Pipeline>>,
     rms_norm: Pipeline,
     /// Indexed by whether the output is half precision.
     norm_rope: [Pipeline; 2],
@@ -502,8 +514,10 @@ impl Pipelines {
                 .into_iter()
                 .map(|format| FormatPipelines::new(compiler, library, format))
                 .collect::<Result<_, _>>()?,
-            expand_q4k: plain("expand_q4k")?,
-            expand_q6k: plain("expand_q6k")?,
+            expand: Format::ALL
+                .into_iter()
+                .map(|format| format.expand_name().map(plain).transpose())
+                .collect::<Result<_, _>>()?,
             rms_norm: plain("rms_norm")?,
             norm_rope: [plain("norm_rope_f32")?, plain("norm_rope_f16")?],
             convert_half: plain("convert_half")?,
@@ -541,8 +555,9 @@ impl Pipelines {
                 };
                 &self.formats[format.index()].matmul[index]
             }
-            Kernel::ExpandQ4K => &self.expand_q4k,
-            Kernel::ExpandQ6K => &self.expand_q6k,
+            Kernel::Expand(format) => self.expand[format.index()]
+                .as_ref()
+                .expect("Metal::expand launches only formats that have an expand pipeline"),
             Kernel::Copy => &self.copy,
             Kernel::Embed(format) => &self.formats[format.index()].embed,
             Kernel::Argmax => &self.argmax,
@@ -1396,55 +1411,33 @@ impl Metal {
         })
     }
 
-    /// Expand a Q4_K matrix into contiguous half-precision rows.
-    pub fn expand_q4k(
+    /// Expand a Q4_0, Q4_K, or Q6_K matrix of `format` into contiguous half-precision rows.
+    pub fn expand(
         &mut self,
+        format: Format,
         weights: View<'_>,
         out: View<'_>,
         n_rows: u32,
         n_cols: u32,
     ) -> Result<(), Error> {
+        if format.expand_name().is_none() {
+            return Err(Error::NoExpansion(format));
+        }
         let rows = to_usize(n_rows);
         let cols = to_usize(n_cols);
         let args = [
-            buffer(weights, Format::Q4K.matrix_bytes(rows, cols)),
+            buffer(weights, format.matrix_bytes(rows, cols)),
             buffer(out, Format::F16.matrix_bytes(rows, cols)),
             Arg::U32(n_rows),
             Arg::U32(n_cols),
         ];
         self.launch(&Launch {
-            kernel: Kernel::ExpandQ4K,
+            kernel: Kernel::Expand(format),
             args: &args,
             dispatch: Dispatch::Threads([product(&[rows, cols / 16]), 1, 1], [256, 1, 1]),
             n_rows,
             n_cols,
-            weight_bytes: to_u64(Format::Q4K.matrix_bytes(rows, cols)),
-        })
-    }
-
-    /// Expand a Q6_K matrix into contiguous half-precision rows.
-    pub fn expand_q6k(
-        &mut self,
-        weights: View<'_>,
-        out: View<'_>,
-        n_rows: u32,
-        n_cols: u32,
-    ) -> Result<(), Error> {
-        let rows = to_usize(n_rows);
-        let cols = to_usize(n_cols);
-        let args = [
-            buffer(weights, Format::Q6K.matrix_bytes(rows, cols)),
-            buffer(out, Format::F16.matrix_bytes(rows, cols)),
-            Arg::U32(n_rows),
-            Arg::U32(n_cols),
-        ];
-        self.launch(&Launch {
-            kernel: Kernel::ExpandQ6K,
-            args: &args,
-            dispatch: Dispatch::Threads([product(&[rows, cols / 16]), 1, 1], [256, 1, 1]),
-            n_rows,
-            n_cols,
-            weight_bytes: to_u64(Format::Q6K.matrix_bytes(rows, cols)),
+            weight_bytes: to_u64(format.matrix_bytes(rows, cols)),
         })
     }
 

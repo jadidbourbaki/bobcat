@@ -299,6 +299,11 @@ fn q6k_expansion_matches_quantized_matmul() -> Result<(), Box<dyn Error>> {
     check_expansion(TensorType::Q6K, Format::Q6K)
 }
 
+#[test]
+fn q4_0_expansion_matches_quantized_matmul() -> Result<(), Box<dyn Error>> {
+    check_expansion(TensorType::Q4_0, Format::Q4_0)
+}
+
 fn check_expansion(tensor_type: TensorType, format: Format) -> Result<(), Box<dyn Error>> {
     let mut metal = match Metal::open() {
         Ok(metal) => metal,
@@ -331,7 +336,13 @@ fn check_expansion(tensor_type: TensorType, format: Format) -> Result<(), Box<dy
                 bytes[192..208].fill(1);
                 bytes[208..210].copy_from_slice(&0x3000_u16.to_le_bytes());
             }
-            _ => unreachable!("only K-quants expand"),
+            TensorType::Q4_0 => {
+                bytes[..2].copy_from_slice(&0x3000_u16.to_le_bytes());
+                for (i, quant) in bytes[2..].iter_mut().enumerate() {
+                    *quant = u8::try_from((block * 17 + i * 13) % 251)?;
+                }
+            }
+            _ => unreachable!("only Q4_0 and the K-quants expand"),
         }
     }
     let input: Vec<f32> = (0..tokens * cols)
@@ -355,11 +366,7 @@ fn check_expansion(tensor_type: TensorType, format: Format) -> Result<(), Box<dy
         n_tokens,
         Store::Overwrite,
     )?;
-    match format {
-        Format::Q4K => metal.expand_q4k(quantized.at(0), expanded.at(0), n_rows, n_cols)?,
-        Format::Q6K => metal.expand_q6k(quantized.at(0), expanded.at(0), n_rows, n_cols)?,
-        _ => unreachable!("only K-quants expand"),
-    }
+    metal.expand(format, quantized.at(0), expanded.at(0), n_rows, n_cols)?;
     metal.barrier();
     metal.matmul(
         Format::F16,

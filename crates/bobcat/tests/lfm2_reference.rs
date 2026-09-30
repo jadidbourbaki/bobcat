@@ -83,10 +83,23 @@ fn q4_k_m_metal_batch() -> TestResult {
     check_metal("LFM2.5-350M-Q4_K_M", true, true)
 }
 
+/// A full 512-token batch expands its quantized matrices to half precision before multiplying,
+/// so its logits must match those of stepping through the same tokens one at a time.
 #[cfg(target_os = "macos")]
 #[test]
 fn q4_k_m_long_prefill_matches_steps() -> TestResult {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/LFM2.5-350M-Q4_K_M.gguf");
+    long_prefill_matches_steps("LFM2.5-350M-Q4_K_M.gguf")
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn q4_0_long_prefill_matches_steps() -> TestResult {
+    long_prefill_matches_steps("LFM2.5-350M-Q4_0.gguf")
+}
+
+#[cfg(target_os = "macos")]
+fn long_prefill_matches_steps(model_file: &str) -> TestResult {
+    let path = models_dir().join(model_file);
     if !path.exists() {
         eprintln!("skip: {} is missing", path.display());
         return Ok(());
@@ -113,7 +126,10 @@ fn q4_k_m_long_prefill_matches_steps() -> TestResult {
         }
     }
     let error = relative_error(&batch_logits, &step_logits);
-    assert!(error < HALF_KV_TOLERANCE, "long Q4_K prefill error {error}");
+    assert!(
+        error < HALF_KV_TOLERANCE,
+        "{model_file} long prefill error {error}"
+    );
     Ok(())
 }
 

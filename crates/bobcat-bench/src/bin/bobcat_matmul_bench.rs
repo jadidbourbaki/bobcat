@@ -54,7 +54,7 @@ struct Options {
     /// How the result combines with the output buffer.
     #[arg(long, value_enum, default_value_t = StoreMode::Overwrite)]
     store: StoreMode,
-    /// Expand Q4_K or Q6_K weights to half precision before each matrix multiply.
+    /// Expand Q4_0, Q4_K, or Q6_K weights to half precision before each matrix multiply.
     #[arg(long)]
     expand: bool,
     /// Matrix kernel selection for A/B comparisons.
@@ -101,8 +101,8 @@ fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
         Quant::Q4k => (Format::Q4K, 256, 144),
         Quant::Q6k => (Format::Q6K, 256, 210),
     };
-    if options.expand && !matches!(options.format, Quant::Q4k | Quant::Q6k) {
-        return Err("--expand requires --format q4k or q6k".into());
+    if options.expand && !matches!(options.format, Quant::Q4_0 | Quant::Q4k | Quant::Q6k) {
+        return Err("--expand requires --format q4-0, q4k, or q6k".into());
     }
     if options.matmul == Matmul::Tensor && !options.expand && !matches!(options.format, Quant::F16)
     {
@@ -154,15 +154,13 @@ fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
     for rep in 0..=options.reps {
         metal.begin()?;
         if let Some(expanded) = &expanded {
-            match options.format {
-                Quant::Q4k => {
-                    metal.expand_q4k(weights.at(0), expanded.at(0), options.rows, options.cols)?;
-                }
-                Quant::Q6k => {
-                    metal.expand_q6k(weights.at(0), expanded.at(0), options.rows, options.cols)?;
-                }
-                _ => unreachable!("only K-quants may expand"),
-            }
+            metal.expand(
+                format,
+                weights.at(0),
+                expanded.at(0),
+                options.rows,
+                options.cols,
+            )?;
             metal.barrier();
         }
         metal.matmul(

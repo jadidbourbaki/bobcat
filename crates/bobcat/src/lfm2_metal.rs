@@ -151,10 +151,7 @@ impl<'a> Lfm2Metal<'a> {
             .layers
             .iter()
             .flat_map(Layer::matrices)
-            .filter(|matrix| {
-                batch >= K_EXPAND_MIN_TOKENS
-                    && matches!(matrix.tensor.data_type(), TensorType::Q4K | TensorType::Q6K)
-            })
+            .filter(|matrix| batch >= K_EXPAND_MIN_TOKENS && expands(matrix.tensor.data_type()))
             .map(|matrix| to_usize(matrix.n_rows) * to_usize(matrix.n_cols) * 2)
             .max()
             .unwrap_or(0);
@@ -832,6 +829,15 @@ fn check_supported(model: &Model) -> Result<(), Error> {
     Ok(())
 }
 
+/// Report whether a full prefill batch expands matrices of `data_type` into half precision before
+/// multiplying, which lets the multiply use the Metal 4 tensor path.
+fn expands(data_type: TensorType) -> bool {
+    matches!(
+        data_type,
+        TensorType::Q4_0 | TensorType::Q4K | TensorType::Q6K
+    )
+}
+
 /// Return the kernel format of `matrix`.
 fn format(matrix: &Matrix) -> Result<Format, Error> {
     match matrix.tensor.data_type() {
@@ -901,23 +907,19 @@ impl<'r> Recorder<'r> {
     ) -> Result<(), Error> {
         let weights = self.buffers.weights(&matrix.tensor);
         let format = format(matrix)?;
-        if matches!(format, Format::Q4K | Format::Q6K) && n >= K_EXPAND_MIN_TOKENS {
+        if expands(matrix.tensor.data_type()) && n >= K_EXPAND_MIN_TOKENS {
             let expanded = self
                 .buffers
                 .expanded_weights
                 .as_ref()
-                .expect("K-quant matrices have expansion scratch");
-            match format {
-                Format::Q4K => {
-                    self.metal
-                        .expand_q4k(weights, expanded.at(0), matrix.n_rows, matrix.n_cols)?;
-                }
-                Format::Q6K => {
-                    self.metal
-                        .expand_q6k(weights, expanded.at(0), matrix.n_rows, matrix.n_cols)?;
-                }
-                _ => unreachable!("only K-quant matrices enter the expansion path"),
-            }
+                .expect("expanding formats have expansion scratch");
+            self.metal.expand(
+                format,
+                weights,
+                expanded.at(0),
+                matrix.n_rows,
+                matrix.n_cols,
+            )?;
             self.metal.barrier();
             self.metal.matmul(
                 Format::F16,

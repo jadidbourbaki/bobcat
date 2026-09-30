@@ -199,13 +199,14 @@ struct q6k_format
   }
 };
 
-/* Expand one Q4_K matrix into contiguous half-precision rows.  */
+/* Expand one matrix of format F into contiguous half-precision rows.
+   Each thread expands 16 weights.  */
+template <typename F>
 kernel void
-expand_q4k (device const uchar *weights [[buffer (0)]],
-            device half *out [[buffer (1)]],
-            constant uint &n_rows [[buffer (2)]],
-            constant uint &n_cols [[buffer (3)]],
-            uint index [[thread_position_in_grid]])
+expand (device const uchar *weights [[buffer (0)]],
+        device half *out [[buffer (1)]], constant uint &n_rows [[buffer (2)]],
+        constant uint &n_cols [[buffer (3)]],
+        uint index [[thread_position_in_grid]])
 {
   uint chunks_per_row = n_cols / 16;
   if (ulong (index) >= ulong (n_rows) * chunks_per_row)
@@ -213,35 +214,20 @@ expand_q4k (device const uchar *weights [[buffer (0)]],
   uint row = index / chunks_per_row;
   uint e = (index % chunks_per_row) * 16;
   half4 values[4];
-  q4k_format::load16 (
-      weights + ulong (row) * (n_cols / 256) * q4k_format::block_bytes, e,
-      values);
+  F::load16 (weights
+                 + ulong (row) * (n_cols / F::block_weights) * F::block_bytes,
+             e, values);
   device half4 *dst = (device half4 *)(out + ulong (row) * n_cols + e);
   for (uint i = 0; i < 4; i++)
     dst[i] = values[i];
 }
 
-/* Expand one Q6_K matrix into contiguous half-precision rows.  */
-kernel void
-expand_q6k (device const uchar *weights [[buffer (0)]],
-            device half *out [[buffer (1)]],
-            constant uint &n_rows [[buffer (2)]],
-            constant uint &n_cols [[buffer (3)]],
-            uint index [[thread_position_in_grid]])
-{
-  uint chunks_per_row = n_cols / 16;
-  if (ulong (index) >= ulong (n_rows) * chunks_per_row)
-    return;
-  uint row = index / chunks_per_row;
-  uint e = (index % chunks_per_row) * 16;
-  half4 values[4];
-  q6k_format::load16 (
-      weights + ulong (row) * (n_cols / 256) * q6k_format::block_bytes, e,
-      values);
-  device half4 *dst = (device half4 *)(out + ulong (row) * n_cols + e);
-  for (uint i = 0; i < 4; i++)
-    dst[i] = values[i];
-}
+template [[host_name (
+    "expand_q4_0")]] kernel decltype (expand<q4_0_format>) expand<q4_0_format>;
+template [[host_name (
+    "expand_q4k")]] kernel decltype (expand<q4k_format>) expand<q4k_format>;
+template [[host_name (
+    "expand_q6k")]] kernel decltype (expand<q6k_format>) expand<q6k_format>;
 
 /* Return the bytes of one row of N_COLS weights of format F.  */
 template <typename F>
