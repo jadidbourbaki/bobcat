@@ -125,8 +125,10 @@ fn run(options: &Options) -> Result<(), bobcat::Error> {
 
     // The first run warms the shader cache and the page cache and does not count.
     if !options.latency_only {
+        // Every run reuses one loaded model, the way an application serves requests.
+        let mut gpu = Lfm2Metal::new(&model, &mut metal, n_ctx, kv_half)?;
         for rep in 0..=options.reps {
-            let mut gpu = Lfm2Metal::new(&model, &mut metal, n_ctx, kv_half)?;
+            gpu.reset()?;
             let start = Instant::now();
             gpu.prefill(&random_prompt, None, None)?;
             let prefill = start.elapsed().as_secs_f64();
@@ -195,8 +197,9 @@ fn run(options: &Options) -> Result<(), bobcat::Error> {
         let mut per_output = Vec::new();
         let mut end_to_end = Vec::new();
         let mut inter_chunk = Vec::new();
+        let mut gpu = Lfm2Metal::new(&model, &mut metal, n_ctx, kv_half)?;
         for rep in 0..=options.reps {
-            let mut gpu = Lfm2Metal::new(&model, &mut metal, n_ctx, kv_half)?;
+            gpu.reset()?;
             let start = Instant::now();
             gpu.prefill(&prompt, None, None)?;
             let mut emissions = Vec::new();
