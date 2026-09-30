@@ -79,6 +79,11 @@ const ATTENTION_CHUNK: u32 = 64;
 /// A 64-query batch cuts 512-query scratch by eight times. The 4096-token screen held GPU time.
 const ATTENTION_QUERY_BATCH: u32 = 64;
 
+/// Must match `FLASH_QUERIES`, `FLASH_SIMDGROUPS`, and `FLASH_HEAD_DIM` in `common.metal`.
+const FLASH_QUERIES: u32 = 32;
+const FLASH_SIMDGROUPS: usize = 4;
+const FLASH_HEAD_DIM: u32 = 64;
+
 /// Must match `MATMUL_ROWS`, `MATMUL_TOKENS`, and `MATMUL_SIMDGROUPS` in `common.metal`.
 const MATMUL_ROWS: u32 = 64;
 const MATMUL_TOKENS: u32 = 32;
@@ -420,6 +425,9 @@ enum Kernel {
         half: bool,
     },
     AttentionCombine,
+    AttentionFlash {
+        half: bool,
+    },
     ShortConv,
     ShortConvBatch,
     ShortConvHistory,
@@ -442,6 +450,7 @@ impl Kernel {
             Self::ConvertHalf => "convert_half",
             Self::AttentionChunk { .. } => "attention_chunk",
             Self::AttentionCombine => "attention_combine",
+            Self::AttentionFlash { .. } => "attention_flash",
             Self::ShortConv => "short_conv",
             Self::ShortConvBatch => "short_conv_batch",
             Self::ShortConvHistory => "short_conv_history",
@@ -555,6 +564,8 @@ struct Pipelines {
     /// Indexed by whether the caches hold half precision.
     attention_chunk: [Pipeline; 2],
     attention_combine: Pipeline,
+    /// Indexed by whether the caches hold half precision.
+    attention_flash: [Pipeline; 2],
     short_conv: Pipeline,
     short_conv_batch: Pipeline,
     short_conv_history: Pipeline,
@@ -582,6 +593,7 @@ impl Pipelines {
             convert_half: plain("convert_half")?,
             attention_chunk: [plain("attention_chunk_f32")?, plain("attention_chunk_f16")?],
             attention_combine: plain("attention_combine")?,
+            attention_flash: [plain("attention_flash_f32")?, plain("attention_flash_f16")?],
             short_conv: plain("short_conv")?,
             short_conv_batch: plain("short_conv_batch")?,
             short_conv_history: plain("short_conv_history")?,
@@ -608,6 +620,7 @@ impl Pipelines {
             Kernel::ConvertHalf => &self.convert_half,
             Kernel::AttentionChunk { half } => &self.attention_chunk[usize::from(half)],
             Kernel::AttentionCombine => &self.attention_combine,
+            Kernel::AttentionFlash { half } => &self.attention_flash[usize::from(half)],
             Kernel::ShortConv => &self.short_conv,
             Kernel::ShortConvBatch => &self.short_conv_batch,
             Kernel::ShortConvHistory => &self.short_conv_history,
@@ -1120,7 +1133,7 @@ impl Metal {
         self.launch(&Launch {
             kernel: Kernel::MatvecSwiglu(format),
             args: &args,
-            dispatch: matvec_swiglu_dispatch(format, n_rows, n_cols),
+            dispatch: matvec_dispatch(format, n_rows, n_cols),
             n_rows,
             n_cols,
             weight_bytes: to_u64(matrix_bytes).saturating_mul(2),
@@ -1247,6 +1260,49 @@ impl Metal {
         n_queries: u32,
         n_ctx: u32,
     ) -> Result<(), Error> {
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let cache_element = if kv_half { HALF_BYTES } else { FLOAT_BYTES };
+        if n_queries >= FLASH_QUERIES && head_dim == FLASH_HEAD_DIM {
+            let query_bytes = product(&[
+                to_usize(n_queries),
+                to_usize(n_heads),
+                to_usize(head_dim),
+                FLOAT_BYTES,
+            ]);
+            let cache_bytes = product(&[
+                to_usize(first_pos.saturating_add(n_queries)),
+                to_usize(n_kv_heads),
+                to_usize(head_dim),
+                cache_element,
+            ]);
+            let args = [
+                buffer(q, query_bytes),
+                buffer(k_cache, cache_bytes),
+                buffer(v_cache, cache_bytes),
+                buffer(out, query_bytes),
+                Arg::U32(n_heads),
+                Arg::U32(n_kv_heads),
+                Arg::U32(head_dim),
+                Arg::U32(first_pos),
+                Arg::U32(n_queries),
+                Arg::F32(scale),
+            ];
+            return self.launch(&Launch {
+                kernel: Kernel::AttentionFlash { half: kv_half },
+                args: &args,
+                dispatch: Dispatch::Threadgroups(
+                    [
+                        to_usize(n_queries.div_ceil(FLASH_QUERIES)),
+                        to_usize(n_heads),
+                        1,
+                    ],
+                    [FLASH_SIMDGROUPS * SIMD_WIDTH, 1, 1],
+                ),
+                n_rows: 0,
+                n_cols: 0,
+                weight_bytes: 0,
+            });
+        }
         let total_queries = n_queries;
         let query_stride = product(&[to_usize(n_heads), to_usize(head_dim), FLOAT_BYTES]);
         for query_start in (0..total_queries).step_by(to_usize(ATTENTION_QUERY_BATCH)) {
@@ -1255,12 +1311,10 @@ impl Metal {
             let q = q.buffer.at(q.offset.saturating_add(offset));
             let out = out.buffer.at(out.offset.saturating_add(offset));
             let first_pos = first_pos.saturating_add(query_start);
-            let scale = 1.0 / (head_dim as f32).sqrt();
             let n_keys = first_pos.saturating_add(n_queries);
             // The last query sees the most keys, so its chunks cover every query.
             let n_chunks = n_keys.div_ceil(ATTENTION_CHUNK);
             let max_chunks = n_ctx.div_ceil(ATTENTION_CHUNK);
-            let cache_element = if kv_half { HALF_BYTES } else { FLOAT_BYTES };
             let query_bytes = product(&[
                 to_usize(n_queries),
                 to_usize(n_heads),
@@ -1770,30 +1824,16 @@ fn check_range(
     }
 }
 
-/// Return the dispatch of a matrix-vector launch over `n_rows` rows of `n_cols` weights of
-/// `format`.
+/// Return the dispatch of a plain or SwiGLU matrix-vector launch over `n_rows` rows of `n_cols`
+/// weights of `format`.
 ///
-/// The Q8_0 and Q4_0 kernels split the columns of each threadgroup's rows among its simdgroups,
-/// and wider rows get more simdgroups. The K-quant kernels give each simdgroup whole rows.
+/// Every kernel splits the columns of each threadgroup's rows among its simdgroups. The Q4_0 and
+/// K-quant kernels give each threadgroup `K_QUANT_ROWS_PER_SIMDGROUP` rows. The Q8_0 and F16
+/// kernels give wider rows more simdgroups.
 fn matvec_dispatch(format: Format, n_rows: u32, n_cols: u32) -> Dispatch {
-    // The Q4_0 kernel shares the K-quant kernels' layout. A threadgroup's simdgroups share its
-    // rows and split the columns.
     if matches!(format, Format::Q4_0 | Format::Q4K | Format::Q6K) {
         return Dispatch::Threadgroups(
             [to_usize(n_rows.div_ceil(K_QUANT_ROWS_PER_SIMDGROUP)), 1, 1],
-            [SIMD_WIDTH * to_usize(K_QUANT_SIMDGROUPS), 1, 1],
-        );
-    }
-    matvec_rows_dispatch(n_rows, n_cols)
-}
-
-/// Return the dispatch of a SwiGLU matrix-vector launch, whose K-quant kernels give each
-/// simdgroup rows of its own.
-fn matvec_swiglu_dispatch(format: Format, n_rows: u32, n_cols: u32) -> Dispatch {
-    if matches!(format, Format::Q4_0 | Format::Q4K | Format::Q6K) {
-        let rows_per_threadgroup = K_QUANT_SIMDGROUPS * K_QUANT_ROWS_PER_SIMDGROUP;
-        return Dispatch::Threadgroups(
-            [to_usize(n_rows.div_ceil(rows_per_threadgroup)), 1, 1],
             [SIMD_WIDTH * to_usize(K_QUANT_SIMDGROUPS), 1, 1],
         );
     }

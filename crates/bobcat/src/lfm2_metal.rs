@@ -830,12 +830,10 @@ fn check_supported(model: &Model) -> Result<(), Error> {
 }
 
 /// Report whether a full prefill batch expands matrices of `data_type` into half precision before
-/// multiplying, which lets the multiply use the Metal 4 tensor path.
+/// multiplying, which lets the multiply use the Metal 4 tensor path. Q4_0 multiplies faster from
+/// its blocks with half inputs.
 fn expands(data_type: TensorType) -> bool {
-    matches!(
-        data_type,
-        TensorType::Q4_0 | TensorType::Q4K | TensorType::Q6K
-    )
+    matches!(data_type, TensorType::Q4K | TensorType::Q6K)
 }
 
 /// Return the kernel format of `matrix`.

@@ -473,16 +473,20 @@ matvec_k_swiglu (device const uchar *gate [[buffer (0)]],
                  uint simdgroups [[simdgroups_per_threadgroup]],
                  uint lane [[thread_index_in_simdgroup]])
 {
-  uint first_row = (threadgroup_index * simdgroups + simdgroup_index)
-                   * K_ROWS_PER_SIMDGROUP;
+  /* The simdgroups share the threadgroup's rows and split the columns,
+     as in matvec_k.  PARTIALS holds each simdgroup's gate sums, then its
+     up sums, then its sum of squares.  */
+  threadgroup float partials[(2 * K_ROWS_PER_SIMDGROUP + 1) * MAX_SIMDGROUPS];
+  uint first_row = threadgroup_index * K_ROWS_PER_SIMDGROUP;
   uint n_blocks = n_cols / K::block_weights;
   ulong row_bytes = ulong (n_blocks) * K::block_bytes;
   float gate_sums[K_ROWS_PER_SIMDGROUP] = { 0.0f };
   float up_sums[K_ROWS_PER_SIMDGROUP] = { 0.0f };
   float sum_squares = 0.0f;
 
-  for (uint block = K::first_block (lane); block < n_blocks;
-       block += K::blocks_per_pass)
+  for (uint block
+       = K::first_block (lane) + simdgroup_index * K::blocks_per_pass;
+       block < n_blocks; block += K::blocks_per_pass * simdgroups)
     {
       typename K::inputs in;
       K::load (x, norm_weight, block, lane, in, sum_squares);
@@ -495,17 +499,47 @@ matvec_k_swiglu (device const uchar *gate [[buffer (0)]],
           }
     }
 
-  float scale = 1.0f;
-  if (fuse_norm)
-    scale = precise::rsqrt (simd_sum (sum_squares) / float (n_cols) + eps);
   for (uint r = 0; r < K_ROWS_PER_SIMDGROUP; r++)
     {
-      uint row = first_row + r;
-      float g = simd_sum (gate_sums[r]) * scale;
-      float u = simd_sum (up_sums[r]) * scale;
-      if (lane == 0 && row < n_rows)
-        y[row] = g / (1.0f + precise::exp (-g)) * u;
+      float g = simd_sum (gate_sums[r]);
+      float u = simd_sum (up_sums[r]);
+      if (lane == 0)
+        {
+          partials[r * MAX_SIMDGROUPS + simdgroup_index] = g;
+          partials[(K_ROWS_PER_SIMDGROUP + r) * MAX_SIMDGROUPS
+                   + simdgroup_index] = u;
+        }
     }
+  float squares = simd_sum (sum_squares);
+  if (lane == 0)
+    partials[2 * K_ROWS_PER_SIMDGROUP * MAX_SIMDGROUPS + simdgroup_index]
+        = squares;
+  threadgroup_barrier (mem_flags::mem_threadgroup);
+  if (simdgroup_index != 0 || lane >= K_ROWS_PER_SIMDGROUP)
+    return;
+
+  float scale = 1.0f;
+  if (fuse_norm)
+    {
+      float total_squares = 0.0f;
+      for (uint s = 0; s < simdgroups; s++)
+        total_squares
+            += partials[2 * K_ROWS_PER_SIMDGROUP * MAX_SIMDGROUPS + s];
+      scale = precise::rsqrt (total_squares / float (n_cols) + eps);
+    }
+  uint row = first_row + lane;
+  if (row >= n_rows)
+    return;
+  float g = 0.0f;
+  float u = 0.0f;
+  for (uint s = 0; s < simdgroups; s++)
+    {
+      g += partials[lane * MAX_SIMDGROUPS + s];
+      u += partials[(K_ROWS_PER_SIMDGROUP + lane) * MAX_SIMDGROUPS + s];
+    }
+  g *= scale;
+  u *= scale;
+  y[row] = g / (1.0f + precise::exp (-g)) * u;
 }
 
 template [[host_name (

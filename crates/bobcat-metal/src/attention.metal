@@ -126,6 +126,214 @@ template [[host_name (
     "attention_chunk_f16")]] kernel decltype (attention_chunk<half>)
     attention_chunk<half>;
 
+/* Attend with FLASH_QUERIES queries of one query head over every key they
+   see, in one pass with the online softmax of FlashAttention.  Query I
+   of the N_QUERIES at Q sits at position FIRST_POS + I, sees the keys at
+   positions 0 through FIRST_POS + I, and writes its result to OUT in the
+   layout of Q.  Simdgroup matrices compute the scores of 8 queries by
+   FLASH_KEYS keys and their weighted sum of values.  A diagonal matrix of
+   per-query factors rescales the running sums whenever a query's largest
+   score grows.  The caches hold elements of type T.  */
+template <typename T>
+kernel void
+attention_flash (device const float *q [[buffer (0)]],
+                 device const T *k_cache [[buffer (1)]],
+                 device const T *v_cache [[buffer (2)]],
+                 device float *out [[buffer (3)]],
+                 constant uint &n_heads [[buffer (4)]],
+                 constant uint &n_kv_heads [[buffer (5)]],
+                 constant uint &head_dim [[buffer (6)]],
+                 constant uint &first_pos [[buffer (7)]],
+                 constant uint &n_queries [[buffer (8)]],
+                 constant float &scale [[buffer (9)]],
+                 uint2 position [[threadgroup_position_in_grid]],
+                 uint tid [[thread_index_in_threadgroup]],
+                 uint simdgroup_index [[simdgroup_index_in_threadgroup]],
+                 uint lane [[thread_index_in_simdgroup]])
+{
+  /* The query tile holds the queries before the key loop and the results
+     after it, so it shares storage with the key and value tiles.  Less
+     threadgroup memory lets more threadgroups share a GPU core.  */
+  constexpr uint query_bytes = FLASH_QUERIES * FLASH_HEAD_DIM * sizeof (float);
+  constexpr uint key_bytes = FLASH_KEYS * FLASH_HEAD_DIM * sizeof (T);
+  threadgroup uchar
+      tiles[query_bytes > 2 * key_bytes ? query_bytes : 2 * key_bytes];
+  threadgroup float *query_tile = (threadgroup float *)tiles;
+  threadgroup T *key_tile = (threadgroup T *)tiles;
+  threadgroup T *value_tile = (threadgroup T *)(tiles + key_bytes);
+  threadgroup float score_tiles[FLASH_SIMDGROUPS * 8 * FLASH_KEYS];
+  threadgroup float diagonals[FLASH_SIMDGROUPS * 64];
+
+  uint first_query = position.x * FLASH_QUERIES;
+  uint head = position.y;
+  uint kv_head = head / (n_heads / n_kv_heads);
+  uint q_stride = n_heads * head_dim;
+  uint kv_dim = n_kv_heads * head_dim;
+  uint n_rows = min (uint (FLASH_QUERIES), n_queries - first_query);
+  uint threads = FLASH_SIMDGROUPS * SIMD_WIDTH;
+  /* Each thread loads 4 consecutive elements of a row.  The host passes
+     only head sizes that are powers of two, so the threads split evenly
+     over the rows.  */
+  uint row_vectors = head_dim / 4;
+  uint load_key = tid / row_vectors;
+  uint load_column = 4 * (tid % row_vectors);
+  uint load_keys = threads / row_vectors;
+
+  /* Rows past the last query hold zeros, and their results are
+     discarded.  */
+  for (uint row = load_key; row < FLASH_QUERIES; row += load_keys)
+    {
+      float4 value = 0.0f;
+      if (row < n_rows)
+        value = *(device const float4 *)(q + (first_query + row) * q_stride
+                                         + head * head_dim + load_column)
+                * scale;
+      *(threadgroup float4 *)(query_tile + row * head_dim + load_column)
+          = value;
+    }
+  threadgroup float *diagonal = diagonals + simdgroup_index * 64;
+  for (uint i = lane; i < 64; i += SIMD_WIDTH)
+    diagonal[i] = 0.0f;
+  threadgroup_barrier (mem_flags::mem_threadgroup);
+
+  /* A constant bound lets the compiler unroll the loops over the head,
+     which keeps the arrays of simdgroup matrices in registers.  */
+  constexpr uint d_blocks = FLASH_HEAD_DIM / 8;
+  threadgroup float *own_queries = query_tile + simdgroup_index * 8 * head_dim;
+  simdgroup_float8x8 queries[d_blocks];
+  simdgroup_float8x8 sums[d_blocks];
+  for (uint d = 0; d < d_blocks; d++)
+    {
+      simdgroup_load (queries[d], own_queries + d * 8, head_dim);
+      sums[d] = make_filled_simdgroup_matrix<float, 8, 8> (0.0f);
+    }
+
+  /* Four lanes share each of the simdgroup's 8 queries, with 8 keys of
+     the block each.  */
+  uint row = lane / 4;
+  uint part = lane % 4;
+  uint query_pos = first_pos + first_query + simdgroup_index * 8 + row;
+  threadgroup float *scores = score_tiles + simdgroup_index * 8 * FLASH_KEYS;
+  threadgroup float *row_scores = scores + row * FLASH_KEYS + part * 8;
+  float best = -INFINITY;
+  float total = 0.0f;
+  uint n_keys = first_pos + first_query + n_rows;
+  for (uint start = 0; start < n_keys; start += FLASH_KEYS)
+    {
+      uint count = min (uint (FLASH_KEYS), n_keys - start);
+      threadgroup_barrier (mem_flags::mem_threadgroup);
+      for (uint key = load_key; key < FLASH_KEYS; key += load_keys)
+        {
+          uint element = key * head_dim + load_column;
+          ulong source = ulong (start + key) * kv_dim + kv_head * head_dim
+                         + load_column;
+          bool valid = key < count;
+          *(threadgroup vec<T, 4> *)(key_tile + element)
+              = valid ? *(device const vec<T, 4> *)(k_cache + source)
+                      : vec<T, 4> (0);
+          *(threadgroup vec<T, 4> *)(value_tile + element)
+              = valid ? *(device const vec<T, 4> *)(v_cache + source)
+                      : vec<T, 4> (0);
+        }
+      threadgroup_barrier (mem_flags::mem_threadgroup);
+
+      for (uint c = 0; c < FLASH_KEYS / 8; c++)
+        {
+          simdgroup_float8x8 block
+              = make_filled_simdgroup_matrix<float, 8, 8> (0.0f);
+          for (uint d = 0; d < d_blocks; d++)
+            {
+              simdgroup_matrix<T, 8, 8> keys;
+              simdgroup_load (keys, key_tile + c * 8 * head_dim + d * 8,
+                              head_dim, ulong2 (0, 0), true);
+              simdgroup_multiply_accumulate (block, queries[d], keys, block);
+            }
+          simdgroup_store (block, scores + c * 8, FLASH_KEYS);
+        }
+      simdgroup_barrier (mem_flags::mem_threadgroup);
+
+      float values[8];
+      float block_best = -INFINITY;
+      for (uint j = 0; j < 8; j++)
+        {
+          uint key = start + part * 8 + j;
+          values[j]
+              = key <= query_pos && key < n_keys ? row_scores[j] : -INFINITY;
+          block_best = max (block_best, values[j]);
+        }
+      block_best = max (block_best, simd_shuffle_xor (block_best, 1));
+      block_best = max (block_best, simd_shuffle_xor (block_best, 2));
+      /* Key 0 is in every query's first block, so NEW_BEST is finite.  */
+      float new_best = max (best, block_best);
+      float rescale = precise::exp (best - new_best);
+      float block_total = 0.0f;
+      for (uint j = 0; j < 8; j++)
+        {
+          float e = precise::exp (values[j] - new_best);
+          row_scores[j] = e;
+          block_total += e;
+        }
+      block_total += simd_shuffle_xor (block_total, 1);
+      block_total += simd_shuffle_xor (block_total, 2);
+      total = total * rescale + block_total;
+      best = new_best;
+      if (part == 0)
+        diagonal[row * 9] = rescale;
+      simdgroup_barrier (mem_flags::mem_threadgroup);
+
+      simdgroup_float8x8 factors;
+      simdgroup_load (factors, diagonal, 8);
+      for (uint d = 0; d < d_blocks; d++)
+        {
+          simdgroup_float8x8 scaled;
+          simdgroup_multiply (scaled, factors, sums[d]);
+          sums[d] = scaled;
+        }
+      for (uint c = 0; c < FLASH_KEYS / 8; c++)
+        {
+          simdgroup_float8x8 weights;
+          simdgroup_load (weights, scores + c * 8, FLASH_KEYS);
+          for (uint d = 0; d < d_blocks; d++)
+            {
+              simdgroup_matrix<T, 8, 8> block;
+              simdgroup_load (block, value_tile + c * 8 * head_dim + d * 8,
+                              head_dim);
+              simdgroup_multiply_accumulate (sums[d], weights, block, sums[d]);
+            }
+        }
+    }
+
+  /* Each simdgroup reuses its own rows of the query tile for its
+     normalized results, once every simdgroup has read the last value
+     tile.  */
+  if (part == 0)
+    diagonal[row * 9] = 1.0f / total;
+  threadgroup_barrier (mem_flags::mem_threadgroup);
+  simdgroup_float8x8 factors;
+  simdgroup_load (factors, diagonal, 8);
+  for (uint d = 0; d < d_blocks; d++)
+    {
+      simdgroup_float8x8 result;
+      simdgroup_multiply (result, factors, sums[d]);
+      simdgroup_store (result, own_queries + d * 8, head_dim);
+    }
+  simdgroup_barrier (mem_flags::mem_threadgroup);
+  for (uint i = lane; i < 8 * head_dim; i += SIMD_WIDTH)
+    {
+      uint tile_row = simdgroup_index * 8 + i / head_dim;
+      if (tile_row < n_rows)
+        out[(first_query + tile_row) * q_stride + head * head_dim
+            + i % head_dim] = own_queries[i];
+    }
+}
+
+template [[host_name (
+    "attention_flash_f32")]] kernel decltype (attention_flash<float>)
+    attention_flash<float>;
+template [[host_name (
+    "attention_flash_f16")]] kernel decltype (attention_flash<half>)
+    attention_flash<half>;
+
 /* Combine the chunk results of attention_chunk in SCRATCH into the
    result of each query head of each query at OUT, as the second of two
    passes.  Query I sits at position FIRST_POS + I.  Each chunk's sums

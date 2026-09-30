@@ -62,15 +62,23 @@ struct q4_0_format
              float4 (w[4], w[5], w[6], w[7]) };
   }
 
+  /* Return weights E through E + 15 of ROW, where 16 divides E, which
+     are one nibble of each of the block's 16 quant bytes.  Each product
+     of the scale and a quant fits in half precision with one rounding,
+     as in load8.  */
   static void
   load16 (device const uchar *row, uint e, thread half4 *out)
   {
-    weights8 first = load8 (row, e);
-    weights8 second = load8 (row, e + 8);
-    out[0] = half4 (first.low);
-    out[1] = half4 (first.high);
-    out[2] = half4 (second.low);
-    out[3] = half4 (second.high);
+    device const uchar *block = row + (e / 32) * block_bytes;
+    device const packed_uchar4 *quants
+        = (device const packed_uchar4 *)(block + 2);
+    half d = *(device const half *)block;
+    uint shift = e % 32 < 16 ? 0 : 4;
+    for (uint i = 0; i < 4; i++)
+      {
+        uchar4 q = uchar4 (quants[i]);
+        out[i] = d * half4 (short4 ((q >> shift) & 15) - 8);
+      }
   }
 };
 

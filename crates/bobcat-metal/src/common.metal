@@ -45,6 +45,13 @@ enum
   ATTENTION_CHUNK = 64,
   ATTENTION_MAX_GROUP = 4,
   ATTENTION_MAX_HEAD_DIM = 128,
+  /* A threadgroup of attention_flash covers FLASH_QUERIES queries of one
+     head with four simdgroups of 8 queries each, over FLASH_KEYS keys at
+     a time, for heads of FLASH_HEAD_DIM.  */
+  FLASH_QUERIES = 32,
+  FLASH_KEYS = 32,
+  FLASH_SIMDGROUPS = 4,
+  FLASH_HEAD_DIM = 64,
   /* A matmul threadgroup computes MATMUL_ROWS rows by MATMUL_TOKENS
      tokens with four simdgroups, each owning 32 rows by 16 tokens.  */
   MATMUL_ROWS = 64,

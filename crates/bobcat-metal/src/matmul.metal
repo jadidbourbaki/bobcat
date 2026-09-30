@@ -195,8 +195,10 @@ matmul_q8_0 (device const uchar *weights [[buffer (0)]],
    N_COLS weights, by each of the N_TOKENS rows of N_COLS floats at X,
    with the tiles, function constants, and stores of matmul_q8_0.  Each
    pass of the main loop dequantizes one 32-weight group of every row of
-   the tile.  */
-template <typename F>
+   the tile.  The input tile holds elements of type S.  Half inputs made
+   LFM2.5-2.6B QAD-Q4_0 prefill about 6 ms faster than half weights
+   expanded for the tensor path on M4 Pro, and slowed Q4_K_M.  */
+template <typename F, typename S = float>
 kernel void
 matmul_q (device const uchar *weights [[buffer (0)]],
           device const float *x [[buffer (1)]], device float *y [[buffer (2)]],
@@ -212,8 +214,8 @@ matmul_q (device const uchar *weights [[buffer (0)]],
   threadgroup uchar scratch[MATMUL_ROWS * QK8_0 * sizeof (half)
                             + MATMUL_TOKENS * QK8_0 * sizeof (float)];
   threadgroup half *weight_tile = (threadgroup half *)scratch;
-  threadgroup float *input_tile
-      = (threadgroup float *)(scratch + MATMUL_ROWS * QK8_0 * sizeof (half));
+  threadgroup S *input_tile
+      = (threadgroup S *)(scratch + MATMUL_ROWS * QK8_0 * sizeof (half));
   threadgroup float *out_tile = (threadgroup float *)scratch;
 
   uint tid = thread_position.x;
@@ -234,10 +236,10 @@ matmul_q (device const uchar *weights [[buffer (0)]],
 
   ushort weight_base
       = 64 * (weight_row / 8) + weight_row % 8 + 64 * 8 * (2 * weight_half);
-  threadgroup float4 *input_slot
-      = (threadgroup float4 *)(input_tile
-                               + 64 * (4 * input_part + input_token / 8)
-                               + 8 * (input_token % 8));
+  threadgroup vec<S, 4> *input_slot
+      = (threadgroup vec<S, 4> *)(input_tile
+                                  + 64 * (4 * input_part + input_token / 8)
+                                  + 8 * (input_token % 8));
   device const uchar *row_weights = weights + row * row_bytes;
   device const float4 *token_inputs
       = (device const float4 *)(x + ulong (token) * n_cols
@@ -258,8 +260,8 @@ matmul_q (device const uchar *weights [[buffer (0)]],
       half4 w[4];
       F::load16 (row_weights, e, w);
       device const float4 *xs = token_inputs + g * (QK8_0 / 4);
-      float4 in0 = xs[0];
-      float4 in1 = xs[1];
+      vec<S, 4> in0 = vec<S, 4> (xs[0]);
+      vec<S, 4> in1 = vec<S, 4> (xs[1]);
       threadgroup_barrier (mem_flags::mem_threadgroup);
 
       for (ushort v = 0; v < 4; v++)
@@ -277,7 +279,7 @@ matmul_q (device const uchar *weights [[buffer (0)]],
       for (ushort k = 0; k < QK8_0 / 8; k++)
         {
           simdgroup_half8x8 a[4];
-          simdgroup_float8x8 bm[2];
+          simdgroup_matrix<S, 8, 8> bm[2];
           simdgroup_barrier (mem_flags::mem_none);
 #pragma unroll
           for (ushort i = 0; i < 4; i++)
@@ -301,20 +303,17 @@ matmul_q (device const uchar *weights [[buffer (0)]],
 
   uint row_offset = 8 * row_block_base;
   uint token_offset = 8 * token_block_base;
-  if constexpr (is_same<F, f16_format>::value)
+  bool full = first_row + MATMUL_ROWS <= n_rows
+              && first_token + MATMUL_TOKENS <= n_tokens;
+  if (full && !accumulate && !swiglu_store)
     {
-      bool full = first_row + MATMUL_ROWS <= n_rows
-                  && first_token + MATMUL_TOKENS <= n_tokens;
-      if (full && !accumulate && !swiglu_store)
-        {
-          device float *out = y + ulong (first_token + token_offset) * n_rows
-                              + first_row + row_offset;
-          for (uint j = 0; j < 2; j++)
-            for (uint i = 0; i < 4; i++)
-              simdgroup_store (acc[4 * j + i],
-                               out + ulong (8 * j) * n_rows + 8 * i, n_rows);
-          return;
-        }
+      device float *out = y + ulong (first_token + token_offset) * n_rows
+                          + first_row + row_offset;
+      for (uint j = 0; j < 2; j++)
+        for (uint i = 0; i < 4; i++)
+          simdgroup_store (acc[4 * j + i],
+                           out + ulong (8 * j) * n_rows + 8 * i, n_rows);
+      return;
     }
   for (uint j = 0; j < 2; j++)
     for (uint i = 0; i < 4; i++)
@@ -346,8 +345,9 @@ matmul_q (device const uchar *weights [[buffer (0)]],
     }
 }
 
-template [[host_name ("matmul_q4_0")]] kernel decltype (matmul_q<q4_0_format>)
-    matmul_q<q4_0_format>;
+template
+    [[host_name ("matmul_q4_0")]] kernel decltype (matmul_q<q4_0_format, half>)
+        matmul_q<q4_0_format, half>;
 template [[host_name ("matmul_f16")]] kernel decltype (matmul_q<f16_format>)
     matmul_q<f16_format>;
 template [[host_name ("matmul_q4k")]] kernel decltype (matmul_q<q4k_format>)

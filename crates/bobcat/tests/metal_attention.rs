@@ -20,6 +20,7 @@ fn attention_query_batches_preserve_causal_tails() -> Result<(), Box<dyn Error>>
         (0_u32, 7_u32, 4_u32, 1_u32, 32_u32),
         (63, 7, 4, 2, 64),
         (64, 73, 4, 1, 128),
+        (63, 70, 4, 2, 64),
         (129, 5, 2, 2, 32),
     ] {
         for half_cache in [false, true] {
