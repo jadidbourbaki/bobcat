@@ -961,17 +961,35 @@ impl<'r> Recorder<'r> {
         let h = b.hidden.floats(0);
         let options = self.normalized(norm);
 
-        self.matvec(&conv.in_proj, h, b.bcx.floats(0), options)?;
-        self.metal.barrier();
-        self.metal.short_conv(
-            b.bcx.floats(0),
-            b.weights(&conv.taps.tensor),
-            b.conv_state.floats(history),
-            b.conv_out.floats(0),
-            hp.n_embd,
-            hp.conv_kernel,
-            1,
-        )?;
+        let in_format = format(&conv.in_proj)?;
+        if in_format.fuses_conv() {
+            // One launch computes the projection and the convolution, which saves a launch and
+            // the barrier between them on every convolution layer.
+            self.metal.matvec_conv(
+                in_format,
+                b.weights(&conv.in_proj.tensor),
+                conv.in_proj.n_cols,
+                h,
+                options.norm,
+                b.weights(&conv.taps.tensor),
+                b.conv_state.floats(history),
+                b.conv_out.floats(0),
+                hp.n_embd,
+                hp.conv_kernel,
+            )?;
+        } else {
+            self.matvec(&conv.in_proj, h, b.bcx.floats(0), options)?;
+            self.metal.barrier();
+            self.metal.short_conv(
+                b.bcx.floats(0),
+                b.weights(&conv.taps.tensor),
+                b.conv_state.floats(history),
+                b.conv_out.floats(0),
+                hp.n_embd,
+                hp.conv_kernel,
+                1,
+            )?;
+        }
         self.metal.barrier();
         self.matvec(&conv.out_proj, b.conv_out.floats(0), h, ADD_TO_RESIDUAL)?;
         self.metal.barrier();

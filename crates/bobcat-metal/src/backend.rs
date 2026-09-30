@@ -185,6 +185,9 @@ pub enum Error {
         /// The buffer's length.
         len: usize,
     },
+    /// The format has no kernel that fuses a short convolution into its input projection.
+    #[error("{0:?} matrices have no fused short convolution kernel")]
+    NoFusedConv(Format),
     /// The format has no kernel that expands it into half precision.
     #[error("{0:?} matrices cannot expand into half precision")]
     NoExpansion(Format),
@@ -327,6 +330,23 @@ impl Format {
         }
     }
 
+    /// Report whether [`Metal::matvec_conv`] runs matrices of this format, which fuses a short
+    /// convolution into its input projection.
+    pub fn fuses_conv(self) -> bool {
+        self.conv_name().is_some()
+    }
+
+    /// Return the kernel that fuses a short convolution into its input projection for this format,
+    /// if the format has one.
+    fn conv_name(self) -> Option<&'static str> {
+        match self {
+            Self::Q4_0 => Some("matvec_conv_q4_0"),
+            Self::Q4K => Some("matvec_conv_q4k"),
+            Self::Q6K => Some("matvec_conv_q6k"),
+            Self::F16 | Self::Q8_0 => None,
+        }
+    }
+
     /// Return the kernel that expands a matrix of this format into half precision, if the format
     /// has one.
     fn expand_name(self) -> Option<&'static str> {
@@ -387,6 +407,10 @@ enum Kernel {
         accumulate: bool,
     },
     MatvecSwiglu(Format),
+    MatvecConv {
+        format: Format,
+        norm: bool,
+    },
     RmsNorm,
     NormRope {
         half: bool,
@@ -412,6 +436,7 @@ impl Kernel {
         match self {
             Self::Matvec { format, .. } => format.kernel_names()[0],
             Self::MatvecSwiglu(format) => format.kernel_names()[1],
+            Self::MatvecConv { format, .. } => format.conv_name().unwrap_or("matvec_conv"),
             Self::RmsNorm => "rms_norm",
             Self::NormRope { .. } => "norm_rope",
             Self::ConvertHalf => "convert_half",
@@ -448,6 +473,8 @@ struct FormatPipelines {
     /// Indexed by whether the launch fuses the norm and whether it accumulates.
     matvec: [[Pipeline; 2]; 2],
     matvec_swiglu: Pipeline,
+    /// Indexed by whether the launch fuses the norm, for the formats that fuse a convolution.
+    matvec_conv: Option<[Pipeline; 2]>,
     /// Indexed by [`Store`].
     matmul: [Pipeline; 3],
     embed: Pipeline,
@@ -484,12 +511,26 @@ impl FormatPipelines {
             accumulate: false,
             swiglu_store: false,
         };
+        let conv = |name, fuse_norm| {
+            let constants = Constants {
+                rows_per_threadgroup: 0,
+                fuse_norm,
+                accumulate: false,
+                swiglu_store: false,
+            };
+            make_pipeline(compiler, library, name, Some(constants))
+        };
+        let matvec_conv = match format.conv_name() {
+            Some(name) => Some([conv(name, false)?, conv(name, true)?]),
+            None => None,
+        };
         Ok(Self {
             matvec: [
                 [matvec(false, false)?, matvec(false, true)?],
                 [matvec(true, false)?, matvec(true, true)?],
             ],
             matvec_swiglu: make_pipeline(compiler, library, swiglu_name, Some(swiglu))?,
+            matvec_conv,
             matmul: [
                 matmul(false, false)?,
                 matmul(true, false)?,
@@ -557,6 +598,11 @@ impl Pipelines {
                 accumulate,
             } => &self.formats[format.index()].matvec[usize::from(norm)][usize::from(accumulate)],
             Kernel::MatvecSwiglu(format) => &self.formats[format.index()].matvec_swiglu,
+            Kernel::MatvecConv { format, norm } => &self.formats[format.index()]
+                .matvec_conv
+                .as_ref()
+                .expect("Metal::matvec_conv launches only formats that fuse a convolution")
+                [usize::from(norm)],
             Kernel::RmsNorm => &self.rms_norm,
             Kernel::NormRope { half } => &self.norm_rope[usize::from(half)],
             Kernel::ConvertHalf => &self.convert_half,
@@ -1286,6 +1332,67 @@ impl Metal {
             }
         }
         Ok(())
+    }
+
+    /// Record the multiply of one token's `n_cols` floats at `x` by the input projection of a
+    /// gated short convolution, followed by the convolution itself.
+    ///
+    /// The projection at `weights` has `3 * n_embd` rows of `format`, which yield the gates and
+    /// the input that [`Metal::short_conv`] reads from its `bcx`. The launch applies `norm` to
+    /// `x` first when given, and it updates `history` and writes `out` as
+    /// [`Metal::short_conv`] does for one token. Only formats that [`Format::fuses_conv`] run.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the launch binds every buffer it reads"
+    )]
+    pub fn matvec_conv(
+        &mut self,
+        format: Format,
+        weights: View<'_>,
+        n_cols: u32,
+        x: View<'_>,
+        norm: Option<Norm<'_>>,
+        taps: View<'_>,
+        history: View<'_>,
+        out: View<'_>,
+        n_embd: u32,
+        kernel_size: u32,
+    ) -> Result<(), Error> {
+        if !format.fuses_conv() {
+            return Err(Error::NoFusedConv(format));
+        }
+        let sizes = ConvSizes::new(n_embd, kernel_size, 1);
+        let n_rows = n_embd.saturating_mul(3);
+        let cols = to_usize(n_cols);
+        let matrix_bytes = format.matrix_bytes(to_usize(n_rows), cols);
+        let mut args = vec![
+            buffer(weights, matrix_bytes),
+            buffer(x, product(&[cols, FLOAT_BYTES])),
+            buffer(taps, sizes.taps),
+            buffer(history, sizes.history),
+            buffer(out, sizes.out),
+            Arg::U32(n_embd),
+            Arg::U32(n_cols),
+            Arg::U32(kernel_size),
+        ];
+        if let Some(norm) = norm {
+            args.push(buffer(norm.weight, product(&[cols, FLOAT_BYTES])));
+            args.push(Arg::F32(norm.eps));
+        }
+        self.launch(&Launch {
+            kernel: Kernel::MatvecConv {
+                format,
+                norm: norm.is_some(),
+            },
+            args: &args,
+            dispatch: Dispatch::Threadgroups(
+                [to_usize(n_embd), 1, 1],
+                [SIMD_WIDTH * to_usize(K_QUANT_SIMDGROUPS), 1, 1],
+            ),
+            n_rows,
+            n_cols,
+            weight_bytes: to_u64(matrix_bytes),
+        })
     }
 
     /// Record the gated short convolution of `n_tokens` tokens, each with `3 * n_embd` floats at

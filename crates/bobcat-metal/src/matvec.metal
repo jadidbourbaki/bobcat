@@ -364,6 +364,96 @@ template [[host_name (
 template [[host_name ("matvec_q4_0")]] kernel decltype (matvec_k<q4_0_lanes>)
     matvec_k<q4_0_lanes>;
 
+/* Multiply the input projection WEIGHTS of a gated short convolution,
+   which has 3 N_EMBD rows of N_COLS weights of format K, by the N_COLS
+   floats at X, and run the convolution on the results, as short_conv
+   does for one token.  Rows CH, N_EMBD + CH, and 2 N_EMBD + CH hold the
+   gates B and C and the input X of channel CH.
+
+   Threadgroup CH computes channel CH, with its simdgroups splitting the
+   columns as in matvec_k.  Its first lane then convolves B times X with
+   the channel's TAPS and HISTORY, updates HISTORY, and stores C times
+   the result at OUT, so the convolution needs no launch of its own.  */
+template <typename K>
+kernel void
+matvec_conv (device const uchar *weights [[buffer (0)]],
+             device const float *x [[buffer (1)]],
+             device const float *taps [[buffer (2)]],
+             device float *history [[buffer (3)]],
+             device float *out [[buffer (4)]],
+             constant uint &n_embd [[buffer (5)]],
+             constant uint &n_cols [[buffer (6)]],
+             constant uint &kernel_size [[buffer (7)]],
+             device const float *norm_weight
+             [[buffer (8), function_constant (fuse_norm)]],
+             constant float &eps [[buffer (9), function_constant (fuse_norm)]],
+             uint ch [[threadgroup_position_in_grid]],
+             uint simdgroup_index [[simdgroup_index_in_threadgroup]],
+             uint simdgroups [[simdgroups_per_threadgroup]],
+             uint lane [[thread_index_in_simdgroup]])
+{
+  threadgroup float partials[4 * MAX_SIMDGROUPS];
+  uint n_blocks = n_cols / K::block_weights;
+  ulong row_bytes = ulong (n_blocks) * K::block_bytes;
+  float sums[3] = { 0.0f };
+  float sum_squares = 0.0f;
+
+  for (uint block
+       = K::first_block (lane) + simdgroup_index * K::blocks_per_pass;
+       block < n_blocks; block += K::blocks_per_pass * simdgroups)
+    {
+      typename K::inputs in;
+      K::load (x, norm_weight, block, lane, in, sum_squares);
+      for (uint r = 0; r < 3; r++)
+        sums[r] += K::dot_part (weights + ulong (r * n_embd + ch) * row_bytes,
+                                block, lane, in);
+    }
+
+  for (uint r = 0; r < 3; r++)
+    {
+      float part = simd_sum (sums[r]);
+      if (lane == 0)
+        partials[r * MAX_SIMDGROUPS + simdgroup_index] = part;
+    }
+  float squares = simd_sum (sum_squares);
+  if (lane == 0)
+    partials[3 * MAX_SIMDGROUPS + simdgroup_index] = squares;
+  threadgroup_barrier (mem_flags::mem_threadgroup);
+  if (simdgroup_index != 0 || lane != 0 || ch >= n_embd)
+    return;
+
+  float bcx[4] = { 0.0f };
+  for (uint r = 0; r < 4; r++)
+    for (uint s = 0; s < simdgroups; s++)
+      bcx[r] += partials[r * MAX_SIMDGROUPS + s];
+  float scale = 1.0f;
+  if (fuse_norm)
+    scale = precise::rsqrt (bcx[3] / float (n_cols) + eps);
+  float b = bcx[0] * scale;
+  float c = bcx[1] * scale;
+  float input = bcx[2] * scale;
+
+  device const float *channel_taps = taps + ch * kernel_size;
+  float bx = b * input;
+  float sum = channel_taps[kernel_size - 1] * bx;
+  for (uint k = 0; k + 1 < kernel_size; k++)
+    sum += channel_taps[k] * history[k * n_embd + ch];
+  for (uint k = 0; k + 2 < kernel_size; k++)
+    history[k * n_embd + ch] = history[(k + 1) * n_embd + ch];
+  history[(kernel_size - 2) * n_embd + ch] = bx;
+  out[ch] = c * sum;
+}
+
+template [[host_name (
+    "matvec_conv_q4_0")]] kernel decltype (matvec_conv<q4_0_lanes>)
+    matvec_conv<q4_0_lanes>;
+template
+    [[host_name ("matvec_conv_q4k")]] kernel decltype (matvec_conv<q4k_lanes>)
+        matvec_conv<q4k_lanes>;
+template
+    [[host_name ("matvec_conv_q6k")]] kernel decltype (matvec_conv<q6k_lanes>)
+        matvec_conv<q6k_lanes>;
+
 /* The SwiGLU pair of matvec_k, as matvec_q8_0_swiglu is of
    matvec_q8_0.  */
 template <typename K>
