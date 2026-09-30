@@ -302,15 +302,20 @@ matvec_k (device const uchar *weights [[buffer (0)]],
           uint simdgroups [[simdgroups_per_threadgroup]],
           uint lane [[thread_index_in_simdgroup]])
 {
-  uint first_row = (threadgroup_index * simdgroups + simdgroup_index)
-                   * K_ROWS_PER_SIMDGROUP;
+  /* The threadgroup's simdgroups share its K_ROWS_PER_SIMDGROUP rows and
+     split the columns, taking the super-block passes in turn.  Short
+     matrices of long rows then launch enough threadgroups to fill the
+     GPU.  */
+  threadgroup float partials[(K_ROWS_PER_SIMDGROUP + 1) * MAX_SIMDGROUPS];
+  uint first_row = threadgroup_index * K_ROWS_PER_SIMDGROUP;
   uint n_blocks = n_cols / K::block_weights;
   ulong row_bytes = ulong (n_blocks) * K::block_bytes;
   float sums[K_ROWS_PER_SIMDGROUP] = { 0.0f };
   float sum_squares = 0.0f;
 
-  for (uint block = K::first_block (lane); block < n_blocks;
-       block += K::blocks_per_pass)
+  for (uint block
+       = K::first_block (lane) + simdgroup_index * K::blocks_per_pass;
+       block < n_blocks; block += K::blocks_per_pass * simdgroups)
     {
       typename K::inputs in;
       K::load (x, norm_weight, block, lane, in, sum_squares);
@@ -320,16 +325,36 @@ matvec_k (device const uchar *weights [[buffer (0)]],
                                   lane, in);
     }
 
-  float scale = 1.0f;
-  if (fuse_norm)
-    scale = precise::rsqrt (simd_sum (sum_squares) / float (n_cols) + eps);
   for (uint r = 0; r < K_ROWS_PER_SIMDGROUP; r++)
     {
-      uint row = first_row + r;
-      float total = simd_sum (sums[r]) * scale;
-      if (lane == 0 && row < n_rows)
-        y[row] = accumulate ? y[row] + total : total;
+      float part = simd_sum (sums[r]);
+      if (lane == 0)
+        partials[r * MAX_SIMDGROUPS + simdgroup_index] = part;
     }
+  float squares = simd_sum (sum_squares);
+  if (lane == 0)
+    partials[K_ROWS_PER_SIMDGROUP * MAX_SIMDGROUPS + simdgroup_index]
+        = squares;
+  threadgroup_barrier (mem_flags::mem_threadgroup);
+  if (simdgroup_index != 0 || lane >= K_ROWS_PER_SIMDGROUP)
+    return;
+
+  float scale = 1.0f;
+  if (fuse_norm)
+    {
+      float total_squares = 0.0f;
+      for (uint s = 0; s < simdgroups; s++)
+        total_squares += partials[K_ROWS_PER_SIMDGROUP * MAX_SIMDGROUPS + s];
+      scale = precise::rsqrt (total_squares / float (n_cols) + eps);
+    }
+  uint row = first_row + lane;
+  if (row >= n_rows)
+    return;
+  float total = 0.0f;
+  for (uint s = 0; s < simdgroups; s++)
+    total += partials[lane * MAX_SIMDGROUPS + s];
+  total *= scale;
+  y[row] = accumulate ? y[row] + total : total;
 }
 
 template [[host_name (

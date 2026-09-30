@@ -1074,7 +1074,7 @@ impl Metal {
         self.launch(&Launch {
             kernel: Kernel::MatvecSwiglu(format),
             args: &args,
-            dispatch: matvec_dispatch(format, n_rows, n_cols),
+            dispatch: matvec_swiglu_dispatch(format, n_rows, n_cols),
             n_rows,
             n_cols,
             weight_bytes: to_u64(matrix_bytes).saturating_mul(2),
@@ -1669,7 +1669,20 @@ fn check_range(
 /// The Q8_0 and Q4_0 kernels split the columns of each threadgroup's rows among its simdgroups,
 /// and wider rows get more simdgroups. The K-quant kernels give each simdgroup whole rows.
 fn matvec_dispatch(format: Format, n_rows: u32, n_cols: u32) -> Dispatch {
-    // The Q4_0 kernel shares the K-quant kernels' layout of whole rows per simdgroup.
+    // The Q4_0 kernel shares the K-quant kernels' layout. A threadgroup's simdgroups share its
+    // rows and split the columns.
+    if matches!(format, Format::Q4_0 | Format::Q4K | Format::Q6K) {
+        return Dispatch::Threadgroups(
+            [to_usize(n_rows.div_ceil(K_QUANT_ROWS_PER_SIMDGROUP)), 1, 1],
+            [SIMD_WIDTH * to_usize(K_QUANT_SIMDGROUPS), 1, 1],
+        );
+    }
+    matvec_rows_dispatch(n_rows, n_cols)
+}
+
+/// Return the dispatch of a SwiGLU matrix-vector launch, whose K-quant kernels give each
+/// simdgroup rows of its own.
+fn matvec_swiglu_dispatch(format: Format, n_rows: u32, n_cols: u32) -> Dispatch {
     if matches!(format, Format::Q4_0 | Format::Q4K | Format::Q6K) {
         let rows_per_threadgroup = K_QUANT_SIMDGROUPS * K_QUANT_ROWS_PER_SIMDGROUP;
         return Dispatch::Threadgroups(
@@ -1677,6 +1690,12 @@ fn matvec_dispatch(format: Format, n_rows: u32, n_cols: u32) -> Dispatch {
             [SIMD_WIDTH * to_usize(K_QUANT_SIMDGROUPS), 1, 1],
         );
     }
+    matvec_rows_dispatch(n_rows, n_cols)
+}
+
+/// Return the dispatch of the Q8_0 and F16 matrix-vector kernels, which split each
+/// threadgroup's rows among its simdgroups by columns.
+fn matvec_rows_dispatch(n_rows: u32, n_cols: u32) -> Dispatch {
     let threadgroups = n_rows.div_ceil(MATVEC_Q8_0_ROWS_PER_THREADGROUP);
     let simdgroups = if n_cols >= MATVEC_Q8_0_WIDE_COLS {
         MATVEC_Q8_0_WIDE_SIMDGROUPS
