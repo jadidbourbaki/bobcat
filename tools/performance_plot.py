@@ -49,12 +49,12 @@ matplotlib.rcParams.update(
         "patch.linewidth": 0.8,
     }
 )
-# A figure 6.4 inches wide displays at 614 px in a browser, the width of a GitHub README column.
-# The panels stack, so each spans the full width and the engine names fit level under the bars.
-FIGURE_SIZE_INCHES = (6.4, 4.4)
+# A figure 4.8 inches wide displays at 461 px in a browser. The panels stack, and at this width
+# the engine names still fit level under the bars without wide gaps between them.
+FIGURE_SIZE_INCHES = (4.8, 4.4)
 PNG_DPI = 300
-# Each bar fills 0.35 of the space between two engines, so full-width panels keep slim bars.
-BAR_WIDTH = 0.35
+# Each bar fills 0.55 of the space between two engines.
+BAR_WIDTH = 0.55
 BAR_EDGE_COLOR = "#000000"
 # bobcat's bars are filled black, and every other engine's bars are open.
 BOBCAT_FACE_COLOR = "#000000"

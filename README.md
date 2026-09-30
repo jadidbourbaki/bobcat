@@ -47,7 +47,9 @@ bobcat respond -m lfm2.5:2.6b "Name three primes."
 
 ## Performance results
 
-![Prompt processing and generation throughput of bobcat, llama.cpp, mlx-lm, mistral.rs, and candle on LFM2.5-2.6B](docs/performance/lfm2.5-2.6b.svg)
+<p align="center">
+  <img src="docs/performance/lfm2.5-2.6b.svg" alt="Prompt processing and generation throughput of bobcat, llama.cpp, mlx-lm, mistral.rs, and candle on LFM2.5-2.6B">
+</p>
 
 LFM2.5-2.6B on an M4 Pro, with llama-bench's pp512 and tg128 tests. The
 raw runs are in [`docs/performance`](docs/performance).
