@@ -49,9 +49,9 @@ matplotlib.rcParams.update(
         "patch.linewidth": 0.8,
     }
 )
-# A figure 3.3 inches wide displays at 317 px in a browser. The panels stack, so the bars stay
-# slim with narrow gaps, and 9 point engine names just fit level under them.
-FIGURE_SIZE_INCHES = (3.3, 4.4)
+# Two panels of 3.3 inches side by side display at 634 px in a browser. At that panel width the
+# bars stay slim with narrow gaps, and 9 point engine names just fit level under them.
+FIGURE_SIZE_INCHES = (6.6, 2.4)
 ENGINE_FONT_SIZE = 9
 PNG_DPI = 300
 # Each bar fills 0.48 of the space between two engines.
@@ -151,7 +151,7 @@ def main() -> None:
     summary = summarize(runs)
 
     figure = Figure(figsize=FIGURE_SIZE_INCHES, facecolor=SURFACE_COLOR)
-    panels = figure.subplots(len(METRICS), 1)
+    panels = figure.subplots(1, len(METRICS))
     for axes, metric in zip(panels, METRICS, strict=True):
         draw_panel(axes, summary, metric)
     # A browser draws the SVG text in its own serif, which can run a few pixels past the STIX
