@@ -26,12 +26,16 @@ check:
     cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
     cargo test --workspace --locked
+    cd tools && uv run ruff format --check .
+    cd tools && uv run ruff check .
+    cd tools && uv run ty check .
 
-# Format the Rust sources, the manifests, and the Metal kernels.
+# Format the Rust sources, the manifests, the Metal kernels, and the Python tools.
 fmt:
     cargo fmt --all
     cargo sort --workspace
     clang-format -i {{kernels}}
+    cd tools && uv run ruff format .
 
 # Measure GPU bandwidth, bobcat, and the llama.cpp, mlx-lm, mistral.rs, and candle baselines.
 bench:

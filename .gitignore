@@ -5,4 +5,5 @@ target/
 .venv/
 __pycache__/
 .ruff_cache/
+.ty_cache/
 .DS_Store

@@ -272,11 +272,7 @@ def face(expression: str) -> list[list[str]]:
 def rim(grid: list[list[str]]) -> list[str]:
     """Return `grid` padded by one pixel, with a light rim around every drawn pixel."""
     height, width = len(grid), len(grid[0])
-    padded = (
-        [["."] * (width + 2)]
-        + [["."] + row + ["."] for row in grid]
-        + [["."] * (width + 2)]
-    )
+    padded = [["."] * (width + 2)] + [["."] + row + ["."] for row in grid] + [["."] * (width + 2)]
     out = [row[:] for row in padded]
     for y in range(height + 2):
         for x in range(width + 2):
@@ -307,8 +303,7 @@ def rects(grid: list[str], only: set[tuple[int, int]] | None = None) -> list[str
                 end += 1
             if shade in PALETTE and kept(x, y):
                 out.append(
-                    f'<rect x="{x}" y="{y}" width="{end - x}" height="1" '
-                    f'fill="{PALETTE[shade]}"/>'
+                    f'<rect x="{x}" y="{y}" width="{end - x}" height="1" fill="{PALETTE[shade]}"/>'
                 )
             x = end
     return out
@@ -384,8 +379,8 @@ def banner(scale: int) -> str:
         grid = rim(banner_canvas(face(expression), word))
         changed = {
             (x, y)
-            for y, (a, b) in enumerate(zip(base, grid))
-            for x, (p, q) in enumerate(zip(a, b))
+            for y, (a, b) in enumerate(zip(base, grid, strict=True))
+            for x, (p, q) in enumerate(zip(a, b, strict=True))
             if p != q and q != "."
         }
         times = ["0"]

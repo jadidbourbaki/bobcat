@@ -34,18 +34,12 @@ DEFAULT_PROMPT = "The capital of France is"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Dump reference activations for bobcat's tests."
-    )
+    parser = argparse.ArgumentParser(description="Dump reference activations for bobcat's tests.")
     parser.add_argument("--model", required=True, help="Hugging Face repo or path")
-    parser.add_argument(
-        "--gguf", type=pathlib.Path, help="load the weights from this GGUF file"
-    )
+    parser.add_argument("--gguf", type=pathlib.Path, help="load the weights from this GGUF file")
     parser.add_argument("--out", required=True, type=pathlib.Path)
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
-    parser.add_argument(
-        "--generate", type=int, default=16, help="greedy tokens to generate"
-    )
+    parser.add_argument("--generate", type=int, default=16, help="greedy tokens to generate")
     return parser.parse_args()
 
 

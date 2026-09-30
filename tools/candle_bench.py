@@ -81,9 +81,7 @@ def run_once(args: argparse.Namespace, prompt: str) -> tuple[float, float]:
     if prefill is None or decode is None:
         raise RuntimeError(f"unexpected output from {args.binary}:\n{result.stdout}")
     if int(prefill.group(1)) != args.prompt or int(decode.group(1)) != args.generate:
-        raise RuntimeError(
-            f"ran {prefill.group(1)} prompt and {decode.group(1)} generated tokens"
-        )
+        raise RuntimeError(f"ran {prefill.group(1)} prompt and {decode.group(1)} generated tokens")
     return float(prefill.group(2)), float(decode.group(2))
 
 
@@ -96,8 +94,7 @@ def main() -> None:
     runs = [run_once(args, prompt) for _ in range(args.reps)]
 
     print(
-        f"{args.model}, {args.prompt} prompt and {args.generate} generated tokens, "
-        f"{args.reps} runs"
+        f"{args.model}, {args.prompt} prompt and {args.generate} generated tokens, {args.reps} runs"
     )
     for label, rates in (
         ("prefill", [r[0] for r in runs]),

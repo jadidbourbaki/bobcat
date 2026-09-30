@@ -533,15 +533,11 @@ numbers when it is proposed for commit.
 
 ## Python tools
 
-Python appears only in `tools/`, for reference dumps and benchmark
-scripts. The engine never depends on Python.
-
-- **uv** manages environments and dependencies. Pin every direct
-  dependency with `==` and commit `uv.lock`.
-- **ruff** lints and formats. **ty** type-checks.
-- Type every function signature.
-- Raise exceptions on failure and catch narrowly. A script that hits
-  a bad state stops with a traceback.
+Python appears only in `tools/`, for reference dumps, benchmark
+scripts, figures, and the mascot. The engine never depends on Python.
+`tools/` is one uv project managed with uv, ruff, and ty.
+`tools/AGENTS.md` holds the Python rules, and `just check` enforces
+them.
 
 ## Don't reinvent the wheel
 
