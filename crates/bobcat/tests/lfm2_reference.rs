@@ -145,6 +145,59 @@ fn reset_matches_a_fresh_state() -> TestResult {
     Ok(())
 }
 
+/// A restored state must continue as the checkpointed one did, both straight into generation and
+/// through more prompt, after later tokens changed the convolution history, the logits, and the
+/// cache positions past the checkpoint.
+#[cfg(target_os = "macos")]
+#[test]
+fn restore_continues_from_the_checkpoint() -> TestResult {
+    let path = models_dir().join("LFM2.5-350M-Q8_0.gguf");
+    if !path.exists() {
+        eprintln!("skip: {} is missing", path.display());
+        return Ok(());
+    }
+    let model = Model::load(path)?;
+    let mut metal = match bobcat::metal::Metal::open() {
+        Ok(metal) => metal,
+        Err(error) => {
+            eprintln!("skip: {error}");
+            return Ok(());
+        }
+    };
+    let prefix = [1_u32, 2000, 3000, 4000];
+    let suffix = [5000_u32, 6000, 7000];
+    let mut fresh_logits = vec![0.0; model.hyperparameters().n_vocab as usize];
+    let mut restored_logits = fresh_logits.clone();
+    {
+        let mut gpu = bobcat::Lfm2Metal::new(&model, &mut metal, 64, true)?;
+        gpu.prefill(
+            &[prefix.as_slice(), &suffix].concat(),
+            Some(&mut fresh_logits),
+            None,
+        )?;
+    }
+
+    let mut gpu = bobcat::Lfm2Metal::new(&model, &mut metal, 64, true)?;
+    gpu.prefill(&prefix, None, None)?;
+    let checkpoint = gpu.checkpoint()?;
+    let mut first = [0; 8];
+    gpu.generate(&mut first)?;
+    gpu.prefill(&[900, 901, 902], None, None)?;
+    gpu.restore(&checkpoint)?;
+    let mut second = [0; 8];
+    gpu.generate(&mut second)?;
+    assert_eq!(first, second, "generation after a restore");
+
+    gpu.restore(&checkpoint)?;
+    gpu.prefill(&suffix, Some(&mut restored_logits), None)?;
+    let error = relative_error(&restored_logits, &fresh_logits);
+    assert!(error < TOLERANCE, "restored state error {error}");
+
+    gpu.reset()?;
+    assert!(gpu.restore(&checkpoint).is_err(), "restore after a reset");
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn q8_0_metal_f32_kv() -> TestResult {

@@ -74,6 +74,19 @@ impl Buffers {
     }
 }
 
+/// The state of a sequence after some tokens, which [`Lfm2Metal::restore`] returns to.
+///
+/// A checkpoint copies the convolution history and the latest logits, which generation starts
+/// from. The KV cache stays on the GPU, so a checkpoint stays valid until a reset or a call
+/// writes the cache positions before its end.
+#[derive(Debug, Clone)]
+pub struct Checkpoint {
+    resets: u64,
+    n_past: u32,
+    conv_state: Vec<f32>,
+    logits: Vec<f32>,
+}
+
 /// The GPU state of one LFM2 decode: the weights, the caches, and the scratch buffers.
 ///
 /// The scratch buffers hold one row per token of a prefill batch, and decode uses the first row.
@@ -83,6 +96,8 @@ pub struct Lfm2Metal<'a> {
     metal: &'a mut Metal,
     n_ctx: u32,
     n_past: u32,
+    /// The number of resets so far, which tells a restore whether a checkpoint predates a reset.
+    resets: u64,
     batch: u32,
     trace_rows: u32,
     kv_half: bool,
@@ -178,6 +193,7 @@ impl<'a> Lfm2Metal<'a> {
             metal,
             n_ctx,
             n_past: 0,
+            resets: 0,
             batch,
             trace_rows: 1,
             kv_half,
@@ -212,7 +228,55 @@ impl<'a> Lfm2Metal<'a> {
         self.metal
             .write(self.buffers.conv_state.at(0), &vec![0.0_f32; conv_floats])?;
         self.n_past = 0;
+        self.resets += 1;
         Ok(())
+    }
+
+    /// Return the sequence state after every token run so far, for [`Lfm2Metal::restore`].
+    pub fn checkpoint(&self) -> Result<Checkpoint, Error> {
+        let mut conv_state = vec![0.0_f32; self.conv_floats()];
+        self.metal
+            .read(self.buffers.conv_state.at(0), &mut conv_state)?;
+        let mut logits = vec![0.0_f32; to_usize(self.model.hyperparameters().n_vocab)];
+        self.metal.read(self.buffers.logits.at(0), &mut logits)?;
+        Ok(Checkpoint {
+            resets: self.resets,
+            n_past: self.n_past,
+            conv_state,
+            logits,
+        })
+    }
+
+    /// Return to the sequence state of `checkpoint`, so the next call continues from its tokens.
+    ///
+    /// The checkpoint must come from this decode, with no reset since and no call that wrote the
+    /// positions before its end. Positions past the checkpoint's tokens still hold later keys and
+    /// values, and attention reads none of them.
+    pub fn restore(&mut self, checkpoint: &Checkpoint) -> Result<(), Error> {
+        if checkpoint.resets != self.resets {
+            return Err(Error::Argument("the checkpoint predates a reset"));
+        }
+        let n_vocab = to_usize(self.model.hyperparameters().n_vocab);
+        if checkpoint.conv_state.len() != self.conv_floats()
+            || checkpoint.logits.len() != n_vocab
+            || checkpoint.n_past > self.n_ctx
+        {
+            return Err(Error::Argument(
+                "the checkpoint comes from a different model or context",
+            ));
+        }
+        self.metal
+            .write(self.buffers.conv_state.at(0), &checkpoint.conv_state)?;
+        self.metal
+            .write(self.buffers.logits.at(0), &checkpoint.logits)?;
+        self.n_past = checkpoint.n_past;
+        Ok(())
+    }
+
+    /// Return the number of floats of convolution history across all layers.
+    fn conv_floats(&self) -> usize {
+        let hp = self.model.hyperparameters();
+        to_usize(hp.n_conv_layers) * to_usize(hp.conv_kernel - 1) * to_usize(hp.n_embd)
     }
 
     /// Return a recorder of work on the buffers.

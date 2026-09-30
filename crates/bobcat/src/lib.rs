@@ -17,4 +17,4 @@ pub use bobcat_metal as metal;
 pub use error::Error;
 pub use lfm2::{Hyperparameters, Model, Sampling, State, Trace};
 #[cfg(target_os = "macos")]
-pub use lfm2_metal::Lfm2Metal;
+pub use lfm2_metal::{Checkpoint, Lfm2Metal};
