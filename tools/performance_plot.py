@@ -49,9 +49,9 @@ matplotlib.rcParams.update(
         "patch.linewidth": 0.8,
     }
 )
-# Two panels 3.2 inches wide each display at 614 px in a browser, the width of a GitHub README
-# column.
-FIGURE_SIZE_INCHES = (6.4, 2.6)
+# A figure 6.4 inches wide displays at 614 px in a browser, the width of a GitHub README column.
+# The panels stack, so each spans the full width and the engine names fit level under the bars.
+FIGURE_SIZE_INCHES = (6.4, 4.4)
 PNG_DPI = 300
 BAR_WIDTH = 0.6
 BAR_EDGE_COLOR = "#000000"
@@ -122,7 +122,7 @@ def draw_panel(axes: Axes, summary: pl.DataFrame, metric: str) -> None:
         zorder=3,
     )
     axes.set_xticks(positions)
-    axes.set_xticklabels(engines, rotation=30, ha="right", rotation_mode="anchor")
+    axes.set_xticklabels(engines)
     axes.set_ylabel(METRICS[metric], color=TEXT_COLOR)
     # Bars start at 0 on a linear axis, so a bar half as tall shows half the rate.
     axes.set_ylim(bottom=0)
@@ -149,7 +149,7 @@ def main() -> None:
     summary = summarize(runs)
 
     figure = Figure(figsize=FIGURE_SIZE_INCHES, facecolor=SURFACE_COLOR)
-    panels = figure.subplots(1, len(METRICS))
+    panels = figure.subplots(len(METRICS), 1)
     for axes, metric in zip(panels, METRICS, strict=True):
         draw_panel(axes, summary, metric)
     # A browser draws the SVG text in its own serif, which can run a few pixels past the STIX
