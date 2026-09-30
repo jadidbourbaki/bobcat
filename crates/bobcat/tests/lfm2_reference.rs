@@ -204,6 +204,62 @@ fn restore_continues_from_the_checkpoint() -> TestResult {
     Ok(())
 }
 
+/// Early token selection must preserve generation, checkpoints, and the remaining context.
+#[cfg(target_os = "macos")]
+#[test]
+fn greedy_selection_preserves_sequence_state() -> TestResult {
+    for filename in ["LFM2.5-350M-Q8_0.gguf", "LFM2.5-350M-Q4_K_M.gguf"] {
+        let path = models_dir().join(filename);
+        if !path.exists() {
+            eprintln!("skip: {} is missing", path.display());
+            continue;
+        }
+        let model = Model::load(path)?;
+        let mut metal = match bobcat::metal::Metal::open() {
+            Ok(metal) => metal,
+            Err(error) => {
+                eprintln!("skip: {error}");
+                return Ok(());
+            }
+        };
+        for kv_half in [true, false] {
+            let prompt = [1, 2000, 3000, 4000];
+            let mut gpu = bobcat::Lfm2Metal::new(&model, &mut metal, 20, kv_half)?;
+            assert!(gpu.greedy_token().is_err(), "selection before a prompt");
+            gpu.prefill(&prompt, None, None)?;
+            let checkpoint = gpu.checkpoint()?;
+            let mut expected = [0; 16];
+            gpu.generate(&mut expected)?;
+            // Selection can inspect logits at full capacity because it consumes no position.
+            let next = gpu.greedy_token()?;
+            assert!(
+                gpu.generate(&mut [0]).is_err(),
+                "generation at full capacity"
+            );
+            assert_eq!(gpu.greedy_token()?, next);
+            for chunk_size in [1, 3, 8] {
+                gpu.restore(&checkpoint)?;
+                let mut streamed = [0; 16];
+                streamed[0] = gpu.greedy_token()?;
+                assert_eq!(gpu.greedy_token()?, streamed[0], "repeated selection");
+                gpu.generate_next(&mut [])?;
+                assert_eq!(gpu.greedy_token()?, streamed[0], "empty continuation");
+                for chunk in streamed[1..].chunks_mut(chunk_size) {
+                    gpu.generate_next(chunk)?;
+                }
+                assert_eq!(streamed, expected, "early selection changes generation");
+                let mut final_consumed = [0];
+                gpu.generate(&mut final_consumed)?;
+                assert_eq!(final_consumed[0], expected[15]);
+                assert_eq!(gpu.greedy_token()?, next, "selection advances the sequence");
+            }
+            gpu.reset()?;
+            assert!(gpu.greedy_token().is_err(), "selection after reset");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn q8_0_metal_f32_kv() -> TestResult {

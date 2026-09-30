@@ -23,6 +23,7 @@ check:
     cargo fmt --all --check
     cargo sort --workspace --check
     clang-format --dry-run -Werror {{kernels}}
+    clang-format --dry-run -Werror tools/llama_latency.cpp
     cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
     cargo test --workspace --locked
@@ -35,6 +36,7 @@ fmt:
     cargo fmt --all
     cargo sort --workspace
     clang-format -i {{kernels}}
+    clang-format -i tools/llama_latency.cpp
     cd tools && uv run ruff format .
 
 # Measure GPU bandwidth, bobcat, and the llama.cpp, mlx-lm, mistral.rs, and candle baselines.
@@ -65,6 +67,13 @@ bench-cpu:
 bench-latency model="models/LFM2.5-2.6B-Q4_K_M.gguf":
     cargo build --release --locked -p bobcat-bench
     target/release/bobcat-bench --latency --reps 20 {{model}}
+
+# Measure warmed llama.cpp latency with the same prompt token, batch, and half KV cache.
+bench-llama-latency model="models/LFM2.5-2.6B-Q4_K_M.gguf" prompt="512" generate="128" reps="5":
+    mkdir -p target
+    clang++ -std=c++17 -O3 -Wall -Wextra -Werror -Ibench/llama.cpp/include -Ibench/llama.cpp/ggml/include tools/llama_latency.cpp -Lbench/llama.cpp/build-metal/bin "-Wl,-rpath,{{justfile_directory()}}/bench/llama.cpp/build-metal/bin" -lllama -o target/llama-latency
+    @echo "llama.cpp $(git -C bench/llama.cpp rev-parse --short HEAD), Metal, flash attention, F16 KV, 512 batch, 10 threads" >&2
+    target/llama-latency "{{model}}" "{{prompt}}" "{{generate}}" "{{reps}}"
 
 # Remove the build output.
 clean:

@@ -16,8 +16,6 @@ use clap::{Parser, ValueEnum};
 /// holds.
 #[cfg(target_os = "macos")]
 const PROMPT_TOKEN: u32 = 1000;
-#[cfg(target_os = "macos")]
-const DECODE_CHUNK: usize = 8;
 
 /// The element type of the KV cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -52,9 +50,15 @@ struct Options {
     /// Break prefill and decode GPU time down by kernel.
     #[arg(short = 'P', long)]
     profile: bool,
-    /// Measure warmed greedy streaming latency, then emit in eight-token chunks.
+    /// Measure warmed greedy streaming latency.
     #[arg(long)]
     latency: bool,
+    /// Skip throughput measurements when measuring streaming latency.
+    #[arg(long, requires = "latency")]
+    latency_only: bool,
+    /// Output tokens per streaming call after the first token.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=1024))]
+    stream_chunk: u32,
     /// Prefill matrix kernel selection for A/B comparisons.
     #[arg(long, value_enum, default_value_t = Matmul::Auto)]
     matmul: Matmul,
@@ -90,11 +94,9 @@ fn run(options: &Options) -> Result<(), bobcat::Error> {
     use bobcat::metal::Metal;
     use bobcat::{Lfm2Metal, Model};
 
-    if options.latency
-        && options.generate <= u32::try_from(DECODE_CHUNK).expect("chunk size fits u32")
-    {
+    if options.latency && options.generate < 2 {
         return Err(bobcat::Error::Argument(
-            "latency needs more than eight generated tokens",
+            "latency needs at least two generated tokens",
         ));
     }
 
@@ -113,50 +115,52 @@ fn run(options: &Options) -> Result<(), bobcat::Error> {
     let (mut decode_seconds, mut encode_seconds, mut gpu_seconds) = (0.0, 0.0, 0.0);
 
     // The first run warms the shader cache and the page cache and does not count.
-    for rep in 0..=options.reps {
-        let mut gpu = Lfm2Metal::new(&model, &mut metal, n_ctx, kv_half)?;
-        let start = Instant::now();
-        gpu.prefill(&prompt, None, None)?;
-        let prefill = start.elapsed().as_secs_f64();
+    if !options.latency_only {
+        for rep in 0..=options.reps {
+            let mut gpu = Lfm2Metal::new(&model, &mut metal, n_ctx, kv_half)?;
+            let start = Instant::now();
+            gpu.prefill(&prompt, None, None)?;
+            let prefill = start.elapsed().as_secs_f64();
 
-        // Decode runs pipelined, the way an application generates text.
-        let start = Instant::now();
-        gpu.generate(&mut generated)?;
-        let decode = start.elapsed().as_secs_f64();
+            // Decode runs pipelined, the way an application generates text.
+            let start = Instant::now();
+            gpu.generate(&mut generated)?;
+            let decode = start.elapsed().as_secs_f64();
 
-        if rep > 0 {
-            prefill_rates.push(f64::from(options.prompt) / prefill);
-            decode_rates.push(f64::from(options.generate) / decode);
-            decode_seconds += decode;
-            encode_seconds += gpu.last_encode_seconds();
-            gpu_seconds += gpu.last_gpu_seconds();
+            if rep > 0 {
+                prefill_rates.push(f64::from(options.prompt) / prefill);
+                decode_rates.push(f64::from(options.generate) / decode);
+                decode_seconds += decode;
+                encode_seconds += gpu.last_encode_seconds();
+                gpu_seconds += gpu.last_gpu_seconds();
+            }
         }
-    }
 
-    println!(
-        "{}, {} prompt and {} generated tokens, {} runs",
-        options.model.display(),
-        options.prompt,
-        options.generate,
-        options.reps
-    );
-    println!("command submission: Metal 4");
-    if metal.uses_tensor_matmul() {
-        println!("prefill matrix path: Metal 4 tensors for expanded half weights");
-    }
-    print_rates("prefill", &prefill_rates);
-    print_rates("decode", &decode_rates);
-    // Encoding overlaps the GPU in pipelined decode. The GPU sits idle for whatever part of each
-    // token its own work does not cover.
-    let per_token = 1e3 / f64::from(options.generate * options.reps);
-    println!(
-        "decode per token: {:.3} ms total, {:.3} ms GPU busy, {:.3} ms GPU idle, {:.3} ms CPU \
+        println!(
+            "{}, {} prompt and {} generated tokens, {} runs",
+            options.model.display(),
+            options.prompt,
+            options.generate,
+            options.reps
+        );
+        println!("command submission: Metal 4");
+        if metal.uses_tensor_matmul() {
+            println!("prefill matrix path: Metal 4 tensors for expanded half weights");
+        }
+        print_rates("prefill", &prefill_rates);
+        print_rates("decode", &decode_rates);
+        // Encoding overlaps the GPU in pipelined decode. The GPU sits idle for whatever part of each
+        // token its own work does not cover.
+        let per_token = 1e3 / f64::from(options.generate * options.reps);
+        println!(
+            "decode per token: {:.3} ms total, {:.3} ms GPU busy, {:.3} ms GPU idle, {:.3} ms CPU \
          encoding",
-        decode_seconds * per_token,
-        gpu_seconds * per_token,
-        (decode_seconds - gpu_seconds) * per_token,
-        encode_seconds * per_token
-    );
+            decode_seconds * per_token,
+            gpu_seconds * per_token,
+            (decode_seconds - gpu_seconds) * per_token,
+            encode_seconds * per_token
+        );
+    }
 
     if options.profile {
         // Prefill runs in one batched call, then decode steps one token at a time, with
@@ -175,6 +179,9 @@ fn run(options: &Options) -> Result<(), bobcat::Error> {
         print_profile(gpu.metal(), "decode", options.generate);
     }
     if options.latency {
+        println!(
+            "engine,run,prompt_tokens,generated_tokens,stream_chunk,ttft_ms,tpot_ms,end_to_end_ms,token_hash"
+        );
         let mut first = Vec::new();
         let mut per_output = Vec::new();
         let mut end_to_end = Vec::new();
@@ -184,11 +191,10 @@ fn run(options: &Options) -> Result<(), bobcat::Error> {
             let start = Instant::now();
             gpu.prefill(&prompt, None, None)?;
             let mut emissions = Vec::new();
-            // A caller can observe the first token only after the first generate call returns.
-            gpu.generate(&mut generated[..1])?;
+            generated[0] = gpu.greedy_token()?;
             emissions.push(start.elapsed().as_secs_f64() * 1e3);
-            for chunk in generated[1..].chunks_mut(DECODE_CHUNK) {
-                gpu.generate(chunk)?;
+            for chunk in generated[1..].chunks_mut(options.stream_chunk as usize) {
+                gpu.generate_next(chunk)?;
                 emissions.push(start.elapsed().as_secs_f64() * 1e3);
             }
             if rep > 0 {
@@ -198,10 +204,21 @@ fn run(options: &Options) -> Result<(), bobcat::Error> {
                 end_to_end.push(total);
                 per_output.push((total - ttft) / f64::from(options.generate - 1));
                 inter_chunk.extend(emissions.windows(2).map(|pair| pair[1] - pair[0]));
+                let hash = generated.iter().fold(0_u64, |hash, &token| {
+                    hash.wrapping_mul(1_000_003).wrapping_add(u64::from(token))
+                });
+                println!(
+                    "bobcat,{rep},{},{},{},{ttft:.6},{:.6},{total:.6},{hash}",
+                    options.prompt,
+                    options.generate,
+                    options.stream_chunk,
+                    (total - ttft) / f64::from(options.generate - 1)
+                );
             }
         }
         println!(
-            "\nstreaming latency, warmed model, pre-tokenized prompt, first token then greedy chunks of up to eight:"
+            "\nstreaming latency, warmed model, pre-tokenized prompt, first token then greedy chunks of up to {}:",
+            options.stream_chunk
         );
         print_milliseconds("TTFT", &first);
         print_milliseconds("TPOT", &per_output);
@@ -217,9 +234,21 @@ fn print_milliseconds(label: &str, values: &[f64]) {
     let mut sorted = values.to_vec();
     sorted.sort_by(f64::total_cmp);
     let mean = sorted.iter().sum::<f64>() / sorted.len() as f64;
+    let deviation = if sorted.len() > 1 {
+        (sorted
+            .iter()
+            .map(|value| (value - mean).powi(2))
+            .sum::<f64>()
+            / (sorted.len() - 1) as f64)
+            .sqrt()
+    } else {
+        0.0
+    };
     let p50 = sorted[sorted.len().div_ceil(2) - 1];
     let p95 = sorted[(sorted.len() * 95).div_ceil(100) - 1];
-    println!("{label:<12} mean {mean:8.3} ms, p50 {p50:8.3} ms, p95 {p95:8.3} ms");
+    println!(
+        "{label:<12} mean {mean:8.3} ms, sd {deviation:8.3} ms, p50 {p50:8.3} ms, p95 {p95:8.3} ms"
+    );
 }
 
 /// Print the mean and sample standard deviation of `rates` under `label`.
@@ -284,4 +313,26 @@ fn print_profile(metal: &bobcat::metal::Metal, label: &str, n_units: u32) {
         "",
         total * 1e3 / units
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::Options;
+
+    #[test]
+    fn latency_only_requires_latency() {
+        assert!(Options::try_parse_from(["bobcat-bench", "model.gguf", "--latency-only"]).is_err());
+    }
+
+    #[test]
+    fn streaming_chunk_rejects_empty_and_oversized_calls() {
+        for chunk in ["0", "1025"] {
+            assert!(
+                Options::try_parse_from(["bobcat-bench", "model.gguf", "--stream-chunk", chunk])
+                    .is_err()
+            );
+        }
+    }
 }

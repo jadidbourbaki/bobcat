@@ -58,6 +58,7 @@ struct Buffers {
     scores: Buffer,
     ffn: Buffer,
     logits: Buffer,
+    greedy_token: Buffer,
     tokens: Buffer,
     trace_embedding: Buffer,
     trace_layers: Buffer,
@@ -184,6 +185,7 @@ impl<'a> Lfm2Metal<'a> {
             ))?,
             ffn: floats(rows * to_usize(hp.n_ff))?,
             logits: floats(to_usize(hp.n_vocab))?,
+            greedy_token: metal.new_buffer(TOKEN_BYTES)?,
             tokens: metal.new_buffer(to_usize(n_ctx) * TOKEN_BYTES)?,
             trace_embedding: floats(n_embd)?,
             trace_layers: floats(to_usize(hp.n_layers) * n_embd)?,
@@ -352,6 +354,34 @@ impl<'a> Lfm2Metal<'a> {
         Ok(())
     }
 
+    /// Select the most likely token from the latest GPU logits without advancing the sequence.
+    ///
+    /// The preceding call must have produced logits. Repeated selections return the same token.
+    /// A caller can emit this token immediately, then use [`Self::generate_next`] to consume it
+    /// and select subsequent output. Selection leaves checkpoints and context capacity unchanged.
+    pub fn greedy_token(&mut self) -> Result<u32, Error> {
+        if self.n_past == 0 {
+            return Err(Error::Argument("generation needs a prompt first"));
+        }
+        let start = Instant::now();
+        self.metal.begin()?;
+        let recorded = self.metal.argmax(
+            self.buffers.logits.floats(0),
+            self.buffers.greedy_token.at(0),
+            self.model.hyperparameters().n_vocab,
+        );
+        if let Err(error) = recorded {
+            self.metal.discard();
+            return Err(error.into());
+        }
+        self.last_encode_seconds = start.elapsed().as_secs_f64();
+        self.last_gpu_seconds = self.metal.end()?;
+        let mut token = [0_u32];
+        self.metal
+            .read(self.buffers.greedy_token.at(0), &mut token)?;
+        Ok(token[0])
+    }
+
     /// Decode `out.len()` tokens greedily into `out`.
     ///
     /// The first token is the argmax of the logits of the previous call, which must have
@@ -359,6 +389,20 @@ impl<'a> Lfm2Metal<'a> {
     /// every token itself, and the CPU submits several steps ahead, so the GPU never waits for
     /// the CPU.
     pub fn generate(&mut self, out: &mut [u32]) -> Result<(), Error> {
+        self.generate_inner(out, false)
+    }
+
+    /// Consume the current greedy token and return the next `out.len()` greedy selections.
+    ///
+    /// Call [`Self::greedy_token`] to emit the first token before using this method. Each
+    /// returned token follows one forward pass. The final selection shares the last forward
+    /// pass's GPU submission and remains unconsumed until the next call. An empty slice leaves
+    /// the sequence unchanged.
+    pub fn generate_next(&mut self, out: &mut [u32]) -> Result<(), Error> {
+        self.generate_inner(out, true)
+    }
+
+    fn generate_inner(&mut self, out: &mut [u32], select_next: bool) -> Result<(), Error> {
         let n = u32::try_from(out.len()).map_err(|_| Error::Argument("too many tokens"))?;
         let remaining = self.n_ctx - self.n_past;
         if self.n_past == 0 {
@@ -396,7 +440,20 @@ impl<'a> Lfm2Metal<'a> {
                 result = Err(error.into());
                 break;
             }
-            let recorded = self.recorder().record_generated_step(pos, n_vocab);
+            let recorded = self
+                .recorder()
+                .record_generated_step(pos, n_vocab)
+                .and_then(|()| {
+                    if select_next && i + 1 == n {
+                        self.metal.barrier();
+                        self.metal.argmax(
+                            self.buffers.logits.at(0),
+                            self.buffers.greedy_token.at(0),
+                            n_vocab,
+                        )?;
+                    }
+                    Ok(())
+                });
             if let Err(error) = recorded {
                 self.metal.discard();
                 result = Err(error);
@@ -426,6 +483,12 @@ impl<'a> Lfm2Metal<'a> {
         result?;
 
         self.metal.read(self.buffers.token(self.n_past), out)?;
+        if select_next && !out.is_empty() {
+            out.rotate_left(1);
+            let last = out.len() - 1;
+            self.metal
+                .read(self.buffers.greedy_token.at(0), &mut out[last..])?;
+        }
         self.n_past += n;
         self.last_encode_seconds = encode_seconds;
         self.last_gpu_seconds = gpu_seconds;
