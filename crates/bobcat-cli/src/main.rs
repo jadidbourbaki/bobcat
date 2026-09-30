@@ -286,7 +286,7 @@ fn start<'a>(
     ))
 }
 
-/// Write the timing of `reply` to stderr: the time to the first token and the decode speed.
+/// Write the time to the first token and the decode speed of `reply` to stderr.
 #[cfg(target_os = "macos")]
 fn report(reply: &engine::Reply) -> Result<(), Error> {
     let first_token_ms = reply.first_token.as_secs_f64() * 1000.0;

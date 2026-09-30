@@ -1,4 +1,5 @@
-//! A conversation in the terminal: the messages so far on top of an [`Engine`].
+//! A conversation in the terminal, which keeps the messages so far and replies through an
+//! [`Engine`].
 
 use std::sync::atomic::AtomicBool;
 

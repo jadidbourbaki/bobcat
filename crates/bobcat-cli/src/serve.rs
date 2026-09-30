@@ -1,5 +1,5 @@
-//! `bobcat serve`: an HTTP server that answers OpenAI Chat Completions and Anthropic Messages
-//! requests with one model.
+//! The HTTP server of `bobcat serve`, which answers OpenAI Chat Completions and Anthropic
+//! Messages requests with one model.
 //!
 //! One worker thread owns the model and the GPU and answers requests one at a time. The HTTP
 //! handlers translate each request into the engine's messages, queue it for the worker, and send
@@ -36,6 +36,7 @@ pub(crate) struct Options {
     pub(crate) context: u32,
     /// The most tokens in one reply when a request names no limit.
     pub(crate) max_tokens: usize,
+    /// The address and port to listen on.
     pub(crate) address: SocketAddr,
 }
 
@@ -606,7 +607,7 @@ fn parse_anthropic(request: &Value) -> Result<Parsed, String> {
         .as_array()
         .ok_or("messages must be a list")?;
     for message in list {
-        // Claude Code sends system messages inside the list as well as in `system`.
+        // A request may carry system messages inside the list as well as in `system`.
         let role = match message["role"].as_str() {
             Some("system") => Role::System,
             Some("user") => Role::User,
