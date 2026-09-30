@@ -1526,7 +1526,7 @@ impl Metal {
     ) -> Result<(), Error> {
         let ticket = self.commands.recording_ticket()?;
         let writer = readback.writers.get_mut(slot).ok_or(Error::Access {
-            offset: slot * size_of::<u32>(),
+            offset: slot.saturating_mul(size_of::<u32>()),
             needed: size_of::<u32>(),
             len: readback.buffer.len,
         })?;
@@ -1542,7 +1542,7 @@ impl Metal {
     pub fn read_readback(&self, readback: &Readback, slot: usize) -> Result<u32, Error> {
         let Some(Some(writer)) = readback.writers.get(slot).copied() else {
             return Err(Error::Access {
-                offset: slot * size_of::<u32>(),
+                offset: slot.saturating_mul(size_of::<u32>()),
                 needed: size_of::<u32>(),
                 len: readback.buffer.len,
             });
@@ -1556,16 +1556,20 @@ impl Metal {
         )?;
         // SAFETY: `cpu_address` checked that the four bytes at `source` lie inside the buffer.
         // Only `argmax_readback` binds the readback buffer, and it records each command buffer
-        // that writes the slot. That command buffer finished, and any later writer would have
-        // replaced it, so no command buffer in flight writes these bytes.
+        // that writes the slot. The recorded writer has finished. A later writer replaces its
+        // ticket before submission, so no command buffer in flight writes these bytes.
         let bits = unsafe { source.cast::<u32>().read_unaligned() };
         Ok(bits)
     }
 
     /// Return readback storage of `slots` token slots.
     pub fn new_readback(&self, slots: usize) -> Result<Readback, Error> {
+        let bytes = slots
+            .max(1)
+            .checked_mul(size_of::<u32>())
+            .ok_or(Error::Allocation(usize::MAX))?;
         Ok(Readback {
-            buffer: self.new_buffer(slots.max(1) * size_of::<u32>())?,
+            buffer: self.new_buffer(bytes)?,
             writers: vec![None; slots],
         })
     }

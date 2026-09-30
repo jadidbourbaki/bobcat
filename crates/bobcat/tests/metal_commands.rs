@@ -20,6 +20,27 @@ fn queued_commands_preserve_constants_and_dropped_buffers() -> Result<(), Box<dy
     let temporary = metal.new_buffer(32)?;
     let output = metal.new_buffer(32)?;
     metal.write(input.at(0), &[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])?;
+    assert!(matches!(
+        metal.new_readback(usize::MAX),
+        Err(MetalError::Allocation(_))
+    ));
+    let mut readback = metal.new_readback(1)?;
+    for slot in [0, 1, usize::MAX] {
+        assert!(matches!(
+            metal.read_readback(&readback, slot),
+            Err(MetalError::Access { .. })
+        ));
+    }
+    metal.begin()?;
+    assert!(matches!(
+        metal.argmax_readback(input.at(0), temporary.at(0), &mut readback, usize::MAX, 8),
+        Err(MetalError::Access { .. })
+    ));
+    metal.discard();
+    metal.begin()?;
+    metal.argmax_readback(input.at(0), temporary.at(0), &mut readback, 0, 8)?;
+    metal.end()?;
+    assert_eq!(metal.read_readback(&readback, 0)?, 7);
     metal.begin()?;
     metal.copy(input.at(0), temporary.at(0), 8)?;
     metal.commit()?;
