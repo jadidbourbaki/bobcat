@@ -22,6 +22,11 @@ jobs:
         run: |
           brew install just clang-format
           cargo install --locked cargo-sort
+      # `just check` runs ruff and ty over the Python tools through uv.
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: tools/uv.lock
       # The tests that need a model file or a Metal device print `skip:`
       # and pass when the runner lacks them.
       - name: Check
