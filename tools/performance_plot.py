@@ -49,12 +49,13 @@ matplotlib.rcParams.update(
         "patch.linewidth": 0.8,
     }
 )
-# A figure 4.8 inches wide displays at 461 px in a browser. The panels stack, and at this width
-# the engine names still fit level under the bars without wide gaps between them.
-FIGURE_SIZE_INCHES = (4.8, 4.4)
+# A figure 3.8 inches wide displays at 365 px in a browser. The panels stack, so the bars stay
+# slim with narrow gaps, and 9 point engine names fit level under them.
+FIGURE_SIZE_INCHES = (3.8, 4.4)
+ENGINE_FONT_SIZE = 9
 PNG_DPI = 300
-# Each bar fills 0.55 of the space between two engines.
-BAR_WIDTH = 0.55
+# Each bar fills 0.4 of the space between two engines.
+BAR_WIDTH = 0.4
 BAR_EDGE_COLOR = "#000000"
 # bobcat's bars are filled black, and every other engine's bars are open.
 BOBCAT_FACE_COLOR = "#000000"
@@ -123,7 +124,7 @@ def draw_panel(axes: Axes, summary: pl.DataFrame, metric: str) -> None:
         zorder=3,
     )
     axes.set_xticks(positions)
-    axes.set_xticklabels(engines)
+    axes.set_xticklabels(engines, fontsize=ENGINE_FONT_SIZE)
     axes.set_ylabel(METRICS[metric], color=TEXT_COLOR)
     # Bars start at 0 on a linear axis, so a bar half as tall shows half the rate.
     axes.set_ylim(bottom=0)
