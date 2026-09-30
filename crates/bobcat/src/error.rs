@@ -26,9 +26,9 @@ pub enum Error {
     },
     /// A metadata entry the model needs is missing or has the wrong type.
     #[error("missing or invalid {0}")]
-    Metadata(&'static str),
+    Metadata(String),
     /// The file holds a model of another architecture.
-    #[error("architecture {0} is not lfm2")]
+    #[error("architecture {0} is neither lfm2 nor lfm2moe")]
     Architecture(String),
     /// The hyperparameters contradict each other.
     #[error("inconsistent hyperparameters")]

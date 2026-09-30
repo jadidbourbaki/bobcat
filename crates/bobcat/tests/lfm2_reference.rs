@@ -47,6 +47,12 @@ fn q4_k_m_scalar() -> TestResult {
     check_scalar("LFM2.5-350M-Q4_K_M.gguf", "LFM2.5-350M-Q4_K_M")
 }
 
+/// LFM2.5-8B-A1B routes each token through 4 of 32 experts in all but its first two layers.
+#[test]
+fn moe_q4_k_m_scalar() -> TestResult {
+    check_scalar("LFM2.5-8B-A1B-Q4_K_M.gguf", "LFM2.5-8B-A1B-Q4_K_M")
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn q8_0_metal() -> TestResult {

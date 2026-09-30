@@ -11,7 +11,9 @@ use bobcat_metal::{
 };
 
 use crate::error::Error;
-use crate::lfm2::{Attention, Conv, Layer, Matrix, Mixer, Model, Trace, Vector, to_usize};
+use crate::lfm2::{
+    Attention, Conv, Dense, Ffn, Layer, Matrix, Mixer, Model, Trace, Vector, to_usize,
+};
 use crate::storage::Storage;
 
 /// Each lane of the attention kernel holds a whole number of elements of a head, and a
@@ -554,9 +556,28 @@ impl<'a> Lfm2Metal<'a> {
     }
 }
 
+/// Return the dense feed-forward block of `layer`.
+fn dense(layer: &Layer) -> &Dense {
+    match &layer.ffn {
+        Ffn::Dense(dense) => dense,
+        Ffn::Moe(_) => {
+            unreachable!("check_supported rejects models with mixture-of-experts layers")
+        }
+    }
+}
+
 /// Check that the Metal kernels can run `model`.
 fn check_supported(model: &Model) -> Result<(), Error> {
     let hp = model.hyperparameters();
+    if model
+        .layers
+        .iter()
+        .any(|layer| matches!(layer.ffn, Ffn::Moe(_)))
+    {
+        return Err(Error::MetalUnsupported(
+            "dense feed-forward blocks".to_owned(),
+        ));
+    }
     for matrix in [&model.token_embd, &model.output]
         .into_iter()
         .chain(model.layers.iter().flat_map(Layer::matrices))
@@ -565,11 +586,12 @@ fn check_supported(model: &Model) -> Result<(), Error> {
     }
     // The fused SwiGLU launch reads the gate and up matrices with one kernel.
     for layer in &model.layers {
-        if format(&layer.ffn_gate)? != format(&layer.ffn_up)? {
+        let dense = dense(layer);
+        if format(&dense.gate)? != format(&dense.up)? {
             return Err(Error::MetalUnsupported(format!(
                 "gate and up matrices of one type, got {:?} and {:?}",
-                layer.ffn_gate.tensor.data_type(),
-                layer.ffn_up.tensor.data_type()
+                dense.gate.tensor.data_type(),
+                dense.up.tensor.data_type()
             )));
         }
     }
@@ -892,12 +914,13 @@ impl<'r> Recorder<'r> {
                 Mixer::Conv(conv) => self.conv(conv, layer.cache_index, &layer.attn_norm)?,
             }
 
+            let ffn_block = dense(layer);
             self.metal.matvec_swiglu(
-                format(&layer.ffn_gate)?,
-                b.weights(&layer.ffn_gate.tensor),
-                b.weights(&layer.ffn_up.tensor),
-                layer.ffn_gate.n_rows,
-                layer.ffn_gate.n_cols,
+                format(&ffn_block.gate)?,
+                b.weights(&ffn_block.gate.tensor),
+                b.weights(&ffn_block.up.tensor),
+                ffn_block.gate.n_rows,
+                ffn_block.gate.n_cols,
                 h,
                 Norm {
                     weight: b.weights(&layer.ffn_norm.tensor),
@@ -906,7 +929,7 @@ impl<'r> Recorder<'r> {
                 ffn,
             )?;
             self.metal.barrier();
-            self.matvec(&layer.ffn_down, ffn, h, ADD_TO_RESIDUAL)?;
+            self.matvec(&ffn_block.down, ffn, h, ADD_TO_RESIDUAL)?;
             self.metal.barrier();
 
             if traced {
@@ -1079,11 +1102,12 @@ impl<'r> Recorder<'r> {
             self.metal.barrier();
             // The up projection's store combines with the gate projection already in the
             // buffer, which applies the SwiGLU.
-            self.matmul(&layer.ffn_gate, normed, ffn, n, Store::Overwrite)?;
+            let ffn_block = dense(layer);
+            self.matmul(&ffn_block.gate, normed, ffn, n, Store::Overwrite)?;
             self.metal.barrier();
-            self.matmul(&layer.ffn_up, normed, ffn, n, Store::Swiglu)?;
+            self.matmul(&ffn_block.up, normed, ffn, n, Store::Swiglu)?;
             self.metal.barrier();
-            self.matmul(&layer.ffn_down, ffn, h, n, Store::Accumulate)?;
+            self.matmul(&ffn_block.down, ffn, h, n, Store::Accumulate)?;
             self.metal.barrier();
 
             if let Some(stride) = trace_layer_stride {

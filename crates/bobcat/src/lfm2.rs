@@ -13,8 +13,6 @@ use crate::error::Error;
 use crate::scalar;
 use crate::storage::Storage;
 
-const HEAD_COUNT_KV: &str = "lfm2.attention.head_count_kv";
-
 /// The hyperparameters of an LFM2 model.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hyperparameters {
@@ -26,8 +24,14 @@ pub struct Hyperparameters {
     pub n_conv_layers: u32,
     /// The width of the residual stream.
     pub n_embd: u32,
-    /// The width of the feed-forward block.
+    /// The width of the dense feed-forward blocks.
     pub n_ff: u32,
+    /// The number of experts in each mixture-of-experts layer, or zero in a dense model.
+    pub n_experts: u32,
+    /// The number of experts that run on each token.
+    pub n_experts_used: u32,
+    /// The width of each expert's feed-forward block.
+    pub n_ff_expert: u32,
     /// The number of query heads.
     pub n_heads: u32,
     /// The number of key and value heads.
@@ -106,6 +110,38 @@ pub(crate) enum Mixer {
     Conv(Conv),
 }
 
+/// The tensors of a SwiGLU feed-forward block.
+#[derive(Debug, Clone)]
+pub(crate) struct Dense {
+    pub(crate) gate: Matrix,
+    pub(crate) up: Matrix,
+    pub(crate) down: Matrix,
+}
+
+/// The tensors of a mixture-of-experts feed-forward block.
+///
+/// Each expert is a SwiGLU block of width `n_ff_expert`. The file stacks the experts' matrices,
+/// so expert `e` owns rows `e * n_ff_expert` onward of `gate` and `up`, and rows `e * n_embd`
+/// onward of `down`.
+#[derive(Debug, Clone)]
+pub(crate) struct Moe {
+    /// The router, one row of logits weights per expert.
+    pub(crate) router: Matrix,
+    /// A bias per expert that steers which experts the router picks and leaves their weights
+    /// unchanged.
+    pub(crate) expert_bias: Vector,
+    pub(crate) gate: Matrix,
+    pub(crate) up: Matrix,
+    pub(crate) down: Matrix,
+}
+
+/// The feed-forward block of a layer.
+#[derive(Debug, Clone)]
+pub(crate) enum Ffn {
+    Dense(Dense),
+    Moe(Moe),
+}
+
 /// The tensors of one LFM2 layer.
 #[derive(Debug, Clone)]
 pub(crate) struct Layer {
@@ -114,9 +150,7 @@ pub(crate) struct Layer {
     pub(crate) cache_index: u32,
     pub(crate) attn_norm: Vector,
     pub(crate) ffn_norm: Vector,
-    pub(crate) ffn_gate: Matrix,
-    pub(crate) ffn_up: Matrix,
-    pub(crate) ffn_down: Matrix,
+    pub(crate) ffn: Ffn,
 }
 
 impl Layer {
@@ -128,7 +162,10 @@ impl Layer {
             }
             Mixer::Conv(conv) => vec![&conv.in_proj, &conv.out_proj],
         };
-        matrices.extend([&self.ffn_gate, &self.ffn_up, &self.ffn_down]);
+        match &self.ffn {
+            Ffn::Dense(dense) => matrices.extend([&dense.gate, &dense.up, &dense.down]),
+            Ffn::Moe(moe) => matrices.extend([&moe.router, &moe.gate, &moe.up, &moe.down]),
+        }
         matrices
     }
 }
@@ -156,11 +193,16 @@ impl Model {
             path: path.to_owned(),
             source,
         })?;
-        let mut hyperparameters = load_hyperparameters(&gguf)?;
+        let (mut hyperparameters, n_dense_layers) = load_hyperparameters(&gguf)?;
 
         let mut layers = Vec::with_capacity(to_usize(hyperparameters.n_layers));
         for il in 0..hyperparameters.n_layers {
-            layers.push(load_layer(&gguf, &mut hyperparameters, il)?);
+            layers.push(load_layer(
+                &gguf,
+                &mut hyperparameters,
+                il,
+                il < n_dense_layers,
+            )?);
         }
 
         let n_embd = u64::from(hyperparameters.n_embd);
@@ -220,10 +262,17 @@ impl Model {
             .map(|matrix| u64::from(matrix.n_rows) * u64::from(matrix.n_cols))
             .sum();
         let repeat_penalty = if n_weights > 2_000_000_000 { 1.1 } else { 1.05 };
+        // The card of LFM2.5-8B-A1B gives a temperature of 0.2, a top-k of 80, and a penalty of
+        // 1.05.
+        let (temperature, top_k, repeat_penalty) = if self.hyperparameters.n_experts > 0 {
+            (0.2, 80, 1.05)
+        } else {
+            (0.1, 50, repeat_penalty)
+        };
         let gguf = &self.gguf;
         Sampling {
-            temperature: gguf.f32("general.sampling.temp").unwrap_or(0.1),
-            top_k: gguf.u32("general.sampling.top_k").unwrap_or(50),
+            temperature: gguf.f32("general.sampling.temp").unwrap_or(temperature),
+            top_k: gguf.u32("general.sampling.top_k").unwrap_or(top_k),
             top_p: gguf.f32("general.sampling.top_p").unwrap_or(1.0),
             min_p: gguf.f32("general.sampling.min_p").unwrap_or(0.0),
             repeat_penalty: gguf
@@ -315,12 +364,10 @@ impl Model {
                 hp.norm_eps,
                 &mut state.normed,
             );
-            self.matvec(&layer.ffn_gate, &state.normed, &mut state.gate);
-            self.matvec(&layer.ffn_up, &state.normed, &mut state.up);
-            for (gate, &up) in state.gate.iter_mut().zip(&state.up) {
-                *gate = scalar::silu(*gate) * up;
+            match &layer.ffn {
+                Ffn::Dense(dense) => self.dense_block(dense, state),
+                Ffn::Moe(moe) => self.moe_block(moe, state),
             }
-            self.matvec(&layer.ffn_down, &state.gate, &mut state.block_out);
             add_in_place(&mut state.hidden, &state.block_out);
 
             if let Some(trace) = trace.as_deref_mut() {
@@ -343,6 +390,52 @@ impl Model {
 
         state.n_past += 1;
         Ok(())
+    }
+
+    /// Multiply rows `first_row` onward of `matrix` by `x`, one row for each element of `y`.
+    fn matvec_rows(&self, matrix: &Matrix, first_row: usize, x: &[f32], y: &mut [f32]) {
+        let data_type = matrix.tensor.data_type();
+        let start = first_row * scalar::row_bytes(data_type, to_usize(matrix.n_cols));
+        scalar::matvec(data_type, &self.data(&matrix.tensor)[start..], x, y);
+    }
+
+    /// Run the SwiGLU block `dense` on `state.normed` and store the result in `state.block_out`.
+    fn dense_block(&self, dense: &Dense, state: &mut State) {
+        self.matvec(&dense.gate, &state.normed, &mut state.gate);
+        self.matvec(&dense.up, &state.normed, &mut state.up);
+        swiglu(&mut state.gate, &state.up);
+        self.matvec(&dense.down, &state.gate, &mut state.block_out);
+    }
+
+    /// Run the mixture of experts `moe` on `state.normed` and store the result in
+    /// `state.block_out`.
+    fn moe_block(&self, moe: &Moe, state: &mut State) {
+        let hp = &self.hyperparameters;
+        let n_embd = to_usize(hp.n_embd);
+        let n_ff = to_usize(hp.n_ff_expert);
+        let n_used = to_usize(hp.n_experts_used);
+        self.matvec(&moe.router, &state.normed, &mut state.router);
+        route(
+            &mut state.router,
+            &moe.expert_bias.values,
+            n_used,
+            &mut state.experts,
+        );
+
+        state.block_out.fill(0.0);
+        let gate = &mut state.gate[..n_ff];
+        let up = &mut state.up[..n_ff];
+        for &expert in &state.experts[..n_used] {
+            let expert = to_usize(expert);
+            self.matvec_rows(&moe.gate, expert * n_ff, &state.normed, gate);
+            self.matvec_rows(&moe.up, expert * n_ff, &state.normed, up);
+            swiglu(gate, up);
+            self.matvec_rows(&moe.down, expert * n_embd, gate, &mut state.expert_out);
+            let weight = state.router[expert];
+            for (out, &value) in state.block_out.iter_mut().zip(&state.expert_out) {
+                *out += weight * value;
+            }
+        }
     }
 
     /// Run the gated short convolution `conv` on `state.normed` and store the result in
@@ -487,6 +580,11 @@ pub struct State {
     scores: Vec<f32>,
     gate: Vec<f32>,
     up: Vec<f32>,
+    /// The router's scores, then the weights of the picked experts.
+    router: Vec<f32>,
+    /// Every expert, the picked ones first.
+    experts: Vec<u32>,
+    expert_out: Vec<f32>,
 }
 
 impl State {
@@ -501,6 +599,8 @@ impl State {
         let q_dim = to_usize(hp.n_heads) * to_usize(hp.head_dim);
         let cache = to_usize(hp.n_attention_layers) * to_usize(n_ctx) * kv_dim;
         let conv = to_usize(hp.n_conv_layers) * to_usize(hp.conv_kernel - 1) * n_embd;
+        // The gate and up buffers serve the dense blocks and each expert in turn.
+        let n_ff = to_usize(hp.n_ff.max(hp.n_ff_expert));
         Ok(Self {
             n_ctx,
             n_past: 0,
@@ -517,8 +617,11 @@ impl State {
             v: vec![0.0; kv_dim],
             attn: vec![0.0; q_dim],
             scores: vec![0.0; to_usize(n_ctx)],
-            gate: vec![0.0; to_usize(hp.n_ff)],
-            up: vec![0.0; to_usize(hp.n_ff)],
+            gate: vec![0.0; n_ff],
+            up: vec![0.0; n_ff],
+            router: vec![0.0; to_usize(hp.n_experts)],
+            experts: vec![0; to_usize(hp.n_experts)],
+            expert_out: vec![0.0; n_embd],
         })
     }
 }
@@ -558,6 +661,40 @@ impl Trace {
     }
 }
 
+/// Replace `gate` with the SiLU of `gate` times `up`, element by element.
+fn swiglu(gate: &mut [f32], up: &[f32]) {
+    for (gate, &up) in gate.iter_mut().zip(up) {
+        *gate = scalar::silu(*gate) * up;
+    }
+}
+
+/// Choose the `n_used` experts of one token from the router logits in `scores`, as LFM2's
+/// router does.
+///
+/// The router scores each expert with the sigmoid of its logit and picks the experts whose score
+/// plus `bias` is largest. `experts` receives every expert, the picked ones first. Each picked
+/// expert's entry of `scores` becomes its weight: its score divided by the sum of the picked
+/// scores.
+fn route(scores: &mut [f32], bias: &[f32], n_used: usize, experts: &mut [u32]) {
+    for score in scores.iter_mut() {
+        *score = 1.0 / (1.0 + (-*score).exp());
+    }
+    for (index, expert) in (0..).zip(experts.iter_mut()) {
+        *expert = index;
+    }
+    let biased = |expert: u32| scores[to_usize(expert)] + bias[to_usize(expert)];
+    // A stable sort gives ties to the lower expert, as a top-k scan does.
+    experts.sort_by(|&a, &b| biased(b).total_cmp(&biased(a)));
+
+    let picked = &experts[..n_used];
+    let sum: f32 = picked.iter().map(|&expert| scores[to_usize(expert)]).sum();
+    // transformers adds 1e-6 to the sum before dividing.
+    let norm = sum + 1e-6;
+    for &expert in picked {
+        scores[to_usize(expert)] /= norm;
+    }
+}
+
 /// Add `delta` to `h` element by element.
 fn add_in_place(h: &mut [f32], delta: &[f32]) {
     for (h, &d) in h.iter_mut().zip(delta) {
@@ -572,34 +709,55 @@ pub(crate) fn to_usize(n: u32) -> usize {
 }
 
 /// Return the integer metadata value `key` of `gguf`.
-fn require_u32(gguf: &Gguf<Storage>, key: &'static str) -> Result<u32, Error> {
-    gguf.u32(key).ok_or(Error::Metadata(key))
+fn require_u32(gguf: &Gguf<Storage>, key: &str) -> Result<u32, Error> {
+    gguf.u32(key).ok_or_else(|| Error::Metadata(key.to_owned()))
 }
 
 /// Return the floating-point metadata value `key` of `gguf`.
-fn require_f32(gguf: &Gguf<Storage>, key: &'static str) -> Result<f32, Error> {
-    gguf.f32(key).ok_or(Error::Metadata(key))
+fn require_f32(gguf: &Gguf<Storage>, key: &str) -> Result<f32, Error> {
+    gguf.f32(key).ok_or_else(|| Error::Metadata(key.to_owned()))
 }
 
-/// Read the hyperparameters of an LFM2 model from the metadata of `gguf`. The vocabulary size
-/// and the layer counts stay zero until the tensors are loaded.
-fn load_hyperparameters(gguf: &Gguf<Storage>) -> Result<Hyperparameters, Error> {
+/// Read the hyperparameters of an LFM2 model from the metadata of `gguf`, and return them with
+/// the number of leading layers that keep a dense feed-forward block. The vocabulary size and the
+/// layer counts stay zero until the tensors are loaded.
+fn load_hyperparameters(gguf: &Gguf<Storage>) -> Result<(Hyperparameters, u32), Error> {
     let architecture = gguf
         .string("general.architecture")
-        .ok_or(Error::Metadata("general.architecture"))?;
-    if architecture != b"lfm2" {
-        return Err(Error::Architecture(
-            String::from_utf8_lossy(architecture).into_owned(),
-        ));
-    }
+        .ok_or_else(|| Error::Metadata("general.architecture".to_owned()))?;
+    let moe = match architecture {
+        b"lfm2" => false,
+        b"lfm2moe" => true,
+        _ => {
+            return Err(Error::Architecture(
+                String::from_utf8_lossy(architecture).into_owned(),
+            ));
+        }
+    };
+    let key = |suffix: &str| metadata_key(moe, suffix);
 
-    let n_layers = require_u32(gguf, "lfm2.block_count")?;
-    let n_embd = require_u32(gguf, "lfm2.embedding_length")?;
-    let n_ff = require_u32(gguf, "lfm2.feed_forward_length")?;
-    let n_heads = require_u32(gguf, "lfm2.attention.head_count")?;
-    let conv_kernel = require_u32(gguf, "lfm2.shortconv.l_cache")?;
-    let rope_theta = require_f32(gguf, "lfm2.rope.freq_base")?;
-    let norm_eps = require_f32(gguf, "lfm2.attention.layer_norm_rms_epsilon")?;
+    let n_layers = require_u32(gguf, &key("block_count"))?;
+    let n_embd = require_u32(gguf, &key("embedding_length"))?;
+    let n_ff = require_u32(gguf, &key("feed_forward_length"))?;
+    let n_heads = require_u32(gguf, &key("attention.head_count"))?;
+    let conv_kernel = require_u32(gguf, &key("shortconv.l_cache"))?;
+    let rope_theta = require_f32(gguf, &key("rope.freq_base"))?;
+    let norm_eps = require_f32(gguf, &key("attention.layer_norm_rms_epsilon"))?;
+    let (n_experts, n_experts_used, n_ff_expert, n_dense_layers) = if moe {
+        // The router of LFM2's experts is a sigmoid, which GGUF numbers 2.
+        let gating = key("expert_gating_func");
+        if require_u32(gguf, &gating)? != 2 {
+            return Err(Error::Metadata(gating));
+        }
+        (
+            require_u32(gguf, &key("expert_count"))?,
+            require_u32(gguf, &key("expert_used_count"))?,
+            require_u32(gguf, &key("expert_feed_forward_length"))?,
+            gguf.u32(&key("leading_dense_block_count")).unwrap_or(0),
+        )
+    } else {
+        (0, 0, 0, n_layers)
+    };
 
     if n_layers == 0
         || n_embd == 0
@@ -607,6 +765,7 @@ fn load_hyperparameters(gguf: &Gguf<Storage>) -> Result<Hyperparameters, Error> 
         || n_heads == 0
         || !n_embd.is_multiple_of(n_heads)
         || conv_kernel < 2
+        || (moe && (n_experts_used == 0 || n_experts_used > n_experts || n_ff_expert == 0))
     {
         return Err(Error::Hyperparameters);
     }
@@ -615,12 +774,15 @@ fn load_hyperparameters(gguf: &Gguf<Storage>) -> Result<Hyperparameters, Error> 
         return Err(Error::OddHeadDim(head_dim));
     }
 
-    Ok(Hyperparameters {
+    let hyperparameters = Hyperparameters {
         n_layers,
         n_attention_layers: 0,
         n_conv_layers: 0,
         n_embd,
         n_ff,
+        n_experts,
+        n_experts_used,
+        n_ff_expert,
         n_heads,
         n_kv_heads: 0,
         head_dim,
@@ -628,19 +790,31 @@ fn load_hyperparameters(gguf: &Gguf<Storage>) -> Result<Hyperparameters, Error> 
         conv_kernel,
         rope_theta,
         norm_eps,
-    })
+    };
+    Ok((hyperparameters, n_dense_layers))
 }
 
-/// Return the number of KV heads of layer `layer`. The file holds one count per layer, and a
-/// convolution layer has a count of zero. A single count applies to every layer.
-fn layer_kv_heads(gguf: &Gguf<Storage>, n_layers: u32, layer: u32) -> Result<u32, Error> {
-    if gguf.array_len(HEAD_COUNT_KV) == Some(u64::from(n_layers))
-        && let Some(count) = gguf.array_u32(HEAD_COUNT_KV, u64::from(layer))
+/// Return the metadata key `suffix` of an LFM2 file, whose keys start with the architecture name.
+fn metadata_key(moe: bool, suffix: &str) -> String {
+    let architecture = if moe { "lfm2moe" } else { "lfm2" };
+    format!("{architecture}.{suffix}")
+}
+
+/// Return the number of KV heads of layer `layer` from the metadata entry `key`. The file holds
+/// one count per layer, and a convolution layer has a count of zero. A single count applies to
+/// every layer.
+fn layer_kv_heads(
+    gguf: &Gguf<Storage>,
+    key: &str,
+    n_layers: u32,
+    layer: u32,
+) -> Result<u32, Error> {
+    if gguf.array_len(key) == Some(u64::from(n_layers))
+        && let Some(count) = gguf.array_u32(key, u64::from(layer))
     {
         return Ok(count);
     }
-    gguf.u32(HEAD_COUNT_KV)
-        .ok_or(Error::Metadata(HEAD_COUNT_KV))
+    gguf.u32(key).ok_or_else(|| Error::Metadata(key.to_owned()))
 }
 
 /// Find the tensor `name` in `gguf` and check that its shape is `want`.
@@ -680,6 +854,29 @@ fn require_matrix(
     })
 }
 
+/// Find the stacked expert matrices `name` in `gguf`, `n_experts` matrices of `n_rows` rows of
+/// `n_cols` elements, and return them as one matrix of `n_experts * n_rows` rows.
+fn require_experts(
+    gguf: &Gguf<Storage>,
+    name: &str,
+    n_cols: u64,
+    n_rows: u64,
+    n_experts: u64,
+) -> Result<Matrix, Error> {
+    let tensor = require_tensor(gguf, name, &[n_cols, n_rows, n_experts])?;
+    let all_rows = n_rows
+        .checked_mul(n_experts)
+        .and_then(|rows| u32::try_from(rows).ok());
+    let (Some(n_rows), Ok(n_cols)) = (all_rows, u32::try_from(n_cols)) else {
+        return Err(Error::Hyperparameters);
+    };
+    Ok(Matrix {
+        tensor: tensor.clone(),
+        n_rows,
+        n_cols,
+    })
+}
+
 /// Find the F32 tensor `name` in `gguf`, which must have the shape `want`, and copy out its
 /// values.
 fn require_vector(gguf: &Gguf<Storage>, name: &str, want: &[u64]) -> Result<Vector, Error> {
@@ -700,22 +897,40 @@ fn require_vector(gguf: &Gguf<Storage>, name: &str, want: &[u64]) -> Result<Vect
 }
 
 /// Find and check the tensors of layer `il` in `gguf`, counting the layer in `hyperparameters`.
+/// The layer's feed-forward block is dense when `dense` is true and a mixture of experts
+/// otherwise.
 fn load_layer(
     gguf: &Gguf<Storage>,
     hyperparameters: &mut Hyperparameters,
     il: u32,
+    dense: bool,
 ) -> Result<Layer, Error> {
     let hp = &*hyperparameters;
     let n_embd = u64::from(hp.n_embd);
-    let n_ff = u64::from(hp.n_ff);
     let name = |suffix: &str| format!("blk.{il}.{suffix}.weight");
-    let n_kv_heads = layer_kv_heads(gguf, hp.n_layers, il)?;
+    let kv_key = metadata_key(hp.n_experts > 0, "attention.head_count_kv");
+    let n_kv_heads = layer_kv_heads(gguf, &kv_key, hp.n_layers, il)?;
 
     let attn_norm = require_vector(gguf, &name("attn_norm"), &[n_embd])?;
     let ffn_norm = require_vector(gguf, &name("ffn_norm"), &[n_embd])?;
-    let ffn_gate = require_matrix(gguf, &name("ffn_gate"), n_embd, n_ff)?;
-    let ffn_up = require_matrix(gguf, &name("ffn_up"), n_embd, n_ff)?;
-    let ffn_down = require_matrix(gguf, &name("ffn_down"), n_ff, n_embd)?;
+    let ffn = if dense {
+        let n_ff = u64::from(hp.n_ff);
+        Ffn::Dense(Dense {
+            gate: require_matrix(gguf, &name("ffn_gate"), n_embd, n_ff)?,
+            up: require_matrix(gguf, &name("ffn_up"), n_embd, n_ff)?,
+            down: require_matrix(gguf, &name("ffn_down"), n_ff, n_embd)?,
+        })
+    } else {
+        let n_experts = u64::from(hp.n_experts);
+        let n_ff_expert = u64::from(hp.n_ff_expert);
+        Ffn::Moe(Moe {
+            router: require_matrix(gguf, &name("ffn_gate_inp"), n_embd, n_experts)?,
+            expert_bias: require_vector(gguf, &format!("blk.{il}.exp_probs_b.bias"), &[n_experts])?,
+            gate: require_experts(gguf, &name("ffn_gate_exps"), n_embd, n_ff_expert, n_experts)?,
+            up: require_experts(gguf, &name("ffn_up_exps"), n_embd, n_ff_expert, n_experts)?,
+            down: require_experts(gguf, &name("ffn_down_exps"), n_ff_expert, n_embd, n_experts)?,
+        })
+    };
 
     let (mixer, cache_index) = if n_kv_heads == 0 {
         let taps = require_vector(
@@ -767,8 +982,6 @@ fn load_layer(
         cache_index,
         attn_norm,
         ffn_norm,
-        ffn_gate,
-        ffn_up,
-        ffn_down,
+        ffn,
     })
 }
