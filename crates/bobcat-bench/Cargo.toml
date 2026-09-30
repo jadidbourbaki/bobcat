@@ -27,6 +27,7 @@ path = "src/bin/cpu_bw.rs"
 [dependencies]
 bobcat = { workspace = true }
 clap = { workspace = true }
+fastrand = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = { workspace = true }

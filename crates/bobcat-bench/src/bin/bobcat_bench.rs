@@ -109,6 +109,15 @@ fn run(options: &Options) -> Result<(), bobcat::Error> {
     let kv_half = options.kv == KvType::F16;
     let n_ctx = options.prompt + options.generate;
     let prompt = vec![PROMPT_TOKEN; options.prompt as usize];
+    // Throughput runs fill the prompt as llama-bench does: BOS, then random tokens from a fixed
+    // seed. The latency runs keep the repeated token that their llama.cpp counterpart uses, so
+    // the two engines' token hashes compare.
+    let mut rng = fastrand::Rng::with_seed(42);
+    let n_vocab = model.hyperparameters().n_vocab;
+    let bos = model.gguf().u32("tokenizer.ggml.bos_token_id").unwrap_or(1);
+    let random_prompt: Vec<u32> = (0..options.prompt)
+        .map(|i| if i == 0 { bos } else { rng.u32(..n_vocab) })
+        .collect();
     let mut generated = vec![0; options.generate as usize];
     let mut prefill_rates = Vec::new();
     let mut decode_rates = Vec::new();
@@ -119,7 +128,7 @@ fn run(options: &Options) -> Result<(), bobcat::Error> {
         for rep in 0..=options.reps {
             let mut gpu = Lfm2Metal::new(&model, &mut metal, n_ctx, kv_half)?;
             let start = Instant::now();
-            gpu.prefill(&prompt, None, None)?;
+            gpu.prefill(&random_prompt, None, None)?;
             let prefill = start.elapsed().as_secs_f64();
 
             // Decode runs pipelined, the way an application generates text.
