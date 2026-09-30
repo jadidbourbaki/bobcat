@@ -60,6 +60,10 @@ struct Options {
     /// Matrix kernel selection for A/B comparisons.
     #[arg(long, value_enum, default_value_t = Matmul::Auto)]
     matmul: Matmul,
+    /// Measure the decode matrix-vector kernel instead, one token per launch. With `--store
+    /// swiglu`, each launch multiplies a gate and an up matrix with the input normalization fused.
+    #[arg(long, conflicts_with_all = ["expand", "matmul", "tokens"])]
+    matvec: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -122,6 +126,9 @@ fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
         .checked_mul(cols / block_weights)
         .and_then(|blocks| blocks.checked_mul(block_bytes))
         .ok_or("weight size overflow")?;
+    if options.matvec {
+        return run_matvec(options, format, weight_bytes);
+    }
     let input_len = tokens.checked_mul(cols).ok_or("input size overflow")?;
     let output_len = tokens.checked_mul(rows).ok_or("output size overflow")?;
     let metal = &mut match options.matmul {
@@ -197,6 +204,93 @@ fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
         mean * 1e3,
         deviation * 1e3,
         n * f64::from(options.tokens) / samples.iter().sum::<f64>()
+    );
+    Ok(())
+}
+
+/// Measure the decode matrix-vector kernel of `format` on `weight_bytes` of weights.
+///
+/// Each run multiplies enough copies of the matrix to fill 512 MB, one launch per copy with a
+/// barrier between launches, as the model's dependent steps have. The copies keep the weights
+/// out of the GPU's caches, so the rate is the rate a model reads its weights at.
+#[cfg(target_os = "macos")]
+fn run_matvec(
+    options: &Options,
+    format: bobcat::metal::Format,
+    weight_bytes: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use bobcat::metal::{MatvecOptions, Metal, Norm};
+
+    const TOTAL_BYTES: usize = 512 << 20;
+    let swiglu = matches!(options.store, StoreMode::Swiglu);
+    // A SwiGLU launch reads a gate matrix and an up matrix.
+    let launch_bytes = if swiglu {
+        2 * weight_bytes
+    } else {
+        weight_bytes
+    };
+    let copies = TOTAL_BYTES.div_ceil(launch_bytes);
+    let rows = options.rows as usize;
+    let cols = options.cols as usize;
+    let metal = &mut Metal::open()?;
+    let weights = metal.new_buffer(copies * launch_bytes)?;
+    let input = metal.new_buffer(cols * 4)?;
+    let norm_weight = metal.new_buffer(cols * 4)?;
+    let output = metal.new_buffer(rows * 4)?;
+    // Nonzero bytes make every page of the weights real memory.
+    metal.write(weights.at(0), &vec![0x11_u8; copies * launch_bytes])?;
+    metal.write(input.at(0), &vec![1.0_f32; cols])?;
+    metal.write(norm_weight.at(0), &vec![1.0_f32; cols])?;
+
+    let mut samples = Vec::with_capacity(options.reps as usize);
+    for rep in 0..=options.reps {
+        metal.begin()?;
+        for copy in 0..copies {
+            let start = copy * launch_bytes;
+            if swiglu {
+                metal.matvec_swiglu(
+                    format,
+                    weights.at(start),
+                    weights.at(start + weight_bytes),
+                    options.rows,
+                    options.cols,
+                    input.at(0),
+                    Norm {
+                        weight: norm_weight.at(0),
+                        eps: 1e-5,
+                    },
+                    output.at(0),
+                )?;
+            } else {
+                metal.matvec(
+                    format,
+                    weights.at(start),
+                    options.rows,
+                    options.cols,
+                    input.at(0),
+                    output.at(0),
+                    MatvecOptions::default(),
+                )?;
+            }
+            metal.barrier();
+        }
+        let seconds = metal.end()?;
+        if rep > 0 {
+            samples.push(seconds / copies as f64);
+        }
+    }
+    let n = f64::from(options.reps);
+    let mean = samples.iter().sum::<f64>() / n;
+    println!(
+        "matvec {:?} {:?} {}x{}, {} copies, {} runs: {:.1} us per launch, {:.1} GB/s",
+        options.format,
+        options.store,
+        options.rows,
+        options.cols,
+        copies,
+        options.reps,
+        mean * 1e6,
+        launch_bytes as f64 / mean / 1e9
     );
     Ok(())
 }
