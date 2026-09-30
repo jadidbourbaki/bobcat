@@ -76,6 +76,8 @@ const ELEMENTWISE_THREADS: usize = 256;
 
 /// Must match `ATTENTION_CHUNK` in `common.metal`.
 const ATTENTION_CHUNK: u32 = 64;
+/// A 64-query batch cuts 512-query scratch by eight times. The 4096-token screen held GPU time.
+const ATTENTION_QUERY_BATCH: u32 = 64;
 
 /// Must match `MATMUL_ROWS`, `MATMUL_TOKENS`, and `MATMUL_SIMDGROUPS` in `common.metal`.
 const MATMUL_ROWS: u32 = 64;
@@ -1151,77 +1153,91 @@ impl Metal {
         n_queries: u32,
         n_ctx: u32,
     ) -> Result<(), Error> {
-        let scale = 1.0 / (head_dim as f32).sqrt();
-        let n_keys = first_pos.saturating_add(n_queries);
-        // The last query sees the most keys, so its chunks cover every query.
-        let n_chunks = n_keys.div_ceil(ATTENTION_CHUNK);
-        let max_chunks = n_ctx.div_ceil(ATTENTION_CHUNK);
-        let cache_element = if kv_half { HALF_BYTES } else { FLOAT_BYTES };
-        let query_bytes = product(&[
-            to_usize(n_queries),
-            to_usize(n_heads),
-            to_usize(head_dim),
-            FLOAT_BYTES,
-        ]);
-        let cache_bytes = product(&[
-            to_usize(n_keys),
-            to_usize(n_kv_heads),
-            to_usize(head_dim),
-            cache_element,
-        ]);
-        let scratch_bytes = product(&[
-            attention_scratch_floats(n_heads, head_dim, n_ctx, n_queries),
-            FLOAT_BYTES,
-        ]);
+        let total_queries = n_queries;
+        let query_stride = product(&[to_usize(n_heads), to_usize(head_dim), FLOAT_BYTES]);
+        for query_start in (0..total_queries).step_by(to_usize(ATTENTION_QUERY_BATCH)) {
+            let n_queries = (total_queries - query_start).min(ATTENTION_QUERY_BATCH);
+            let offset = to_usize(query_start).saturating_mul(query_stride);
+            let q = q.buffer.at(q.offset.saturating_add(offset));
+            let out = out.buffer.at(out.offset.saturating_add(offset));
+            let first_pos = first_pos.saturating_add(query_start);
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let n_keys = first_pos.saturating_add(n_queries);
+            // The last query sees the most keys, so its chunks cover every query.
+            let n_chunks = n_keys.div_ceil(ATTENTION_CHUNK);
+            let max_chunks = n_ctx.div_ceil(ATTENTION_CHUNK);
+            let cache_element = if kv_half { HALF_BYTES } else { FLOAT_BYTES };
+            let query_bytes = product(&[
+                to_usize(n_queries),
+                to_usize(n_heads),
+                to_usize(head_dim),
+                FLOAT_BYTES,
+            ]);
+            let cache_bytes = product(&[
+                to_usize(n_keys),
+                to_usize(n_kv_heads),
+                to_usize(head_dim),
+                cache_element,
+            ]);
+            let scratch_bytes = product(&[
+                attention_scratch_floats(n_heads, head_dim, n_ctx, n_queries),
+                FLOAT_BYTES,
+            ]);
 
-        let chunk_args = [
-            buffer(q, query_bytes),
-            buffer(k_cache, cache_bytes),
-            buffer(v_cache, cache_bytes),
-            buffer(scratch, scratch_bytes),
-            Arg::U32(n_heads),
-            Arg::U32(n_kv_heads),
-            Arg::U32(head_dim),
-            Arg::U32(first_pos),
-            Arg::U32(max_chunks),
-            Arg::F32(scale),
-        ];
-        self.launch(&Launch {
-            kernel: Kernel::AttentionChunk { half: kv_half },
-            args: &chunk_args,
-            dispatch: Dispatch::Threadgroups(
-                [
-                    to_usize(n_kv_heads),
-                    to_usize(n_chunks),
-                    to_usize(n_queries),
-                ],
-                [to_usize(ATTENTION_CHUNK), 1, 1],
-            ),
-            n_rows: 0,
-            n_cols: 0,
-            weight_bytes: 0,
-        })?;
-        self.barrier();
+            let chunk_args = [
+                buffer(q, query_bytes),
+                buffer(k_cache, cache_bytes),
+                buffer(v_cache, cache_bytes),
+                buffer(scratch, scratch_bytes),
+                Arg::U32(n_heads),
+                Arg::U32(n_kv_heads),
+                Arg::U32(head_dim),
+                Arg::U32(first_pos),
+                Arg::U32(max_chunks),
+                Arg::F32(scale),
+            ];
+            self.launch(&Launch {
+                kernel: Kernel::AttentionChunk { half: kv_half },
+                args: &chunk_args,
+                dispatch: Dispatch::Threadgroups(
+                    [
+                        to_usize(n_kv_heads),
+                        to_usize(n_chunks),
+                        to_usize(n_queries),
+                    ],
+                    [to_usize(ATTENTION_CHUNK), 1, 1],
+                ),
+                n_rows: 0,
+                n_cols: 0,
+                weight_bytes: 0,
+            })?;
+            self.barrier();
 
-        let combine_args = [
-            buffer(scratch, scratch_bytes),
-            buffer(out, query_bytes),
-            Arg::U32(n_heads),
-            Arg::U32(head_dim),
-            Arg::U32(first_pos),
-            Arg::U32(max_chunks),
-        ];
-        self.launch(&Launch {
-            kernel: Kernel::AttentionCombine,
-            args: &combine_args,
-            dispatch: Dispatch::Threadgroups(
-                [to_usize(n_heads), to_usize(n_queries), 1],
-                [to_usize(head_dim), 1, 1],
-            ),
-            n_rows: 0,
-            n_cols: 0,
-            weight_bytes: 0,
-        })
+            let combine_args = [
+                buffer(scratch, scratch_bytes),
+                buffer(out, query_bytes),
+                Arg::U32(n_heads),
+                Arg::U32(head_dim),
+                Arg::U32(first_pos),
+                Arg::U32(max_chunks),
+            ];
+            self.launch(&Launch {
+                kernel: Kernel::AttentionCombine,
+                args: &combine_args,
+                dispatch: Dispatch::Threadgroups(
+                    [to_usize(n_heads), to_usize(n_queries), 1],
+                    [to_usize(head_dim), 1, 1],
+                ),
+                n_rows: 0,
+                n_cols: 0,
+                weight_bytes: 0,
+            })?;
+            // The next query batch overwrites scratch only after this batch's combine reads it.
+            if query_start + n_queries < total_queries {
+                self.barrier();
+            }
+        }
+        Ok(())
     }
 
     /// Record the gated short convolution of `n_tokens` tokens, each with `3 * n_embd` floats at
@@ -1494,12 +1510,13 @@ impl Metal {
 }
 
 /// Return the floats of scratch [`Metal::attention`] needs for `n_queries` queries of `n_heads`
-/// heads of `head_dim` floats over up to `n_ctx` positions.
+/// heads of `head_dim` floats over up to `n_ctx` positions. Query batches share this scratch,
+/// so its size stops growing after 64 queries.
 pub fn attention_scratch_floats(n_heads: u32, head_dim: u32, n_ctx: u32, n_queries: u32) -> usize {
     // Each chunk of each head of each query keeps a weighted sum of values, a largest score, and
     // a sum of exponentials.
     product(&[
-        to_usize(n_queries),
+        to_usize(n_queries.min(ATTENTION_QUERY_BATCH)),
         to_usize(n_heads),
         to_usize(n_ctx.div_ceil(ATTENTION_CHUNK)),
         to_usize(head_dim).saturating_add(2),
