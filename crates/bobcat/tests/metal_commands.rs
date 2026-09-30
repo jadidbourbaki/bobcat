@@ -3,8 +3,60 @@
 #![cfg(target_os = "macos")]
 
 use std::error::Error;
+use std::sync::Barrier;
+use std::thread;
 
 use bobcat::metal::{Error as MetalError, Metal};
+
+#[test]
+fn concurrent_backends_compile_and_submit_independently() -> Result<(), Box<dyn Error>> {
+    let probe = match Metal::open() {
+        Ok(metal) => metal,
+        Err(error @ (MetalError::NoDevice | MetalError::Metal4Unsupported)) => {
+            eprintln!("skip: {error}");
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    drop(probe);
+    // Eight workers repeatedly open both pipeline sets to exercise the macOS 26 compiler race.
+    let barrier = Barrier::new(8);
+    thread::scope(|scope| {
+        let workers: Vec<_> = (0..8)
+            .map(|worker| {
+                let barrier = &barrier;
+                scope.spawn(move || -> Result<(), MetalError> {
+                    barrier.wait();
+                    for iteration in 0..4 {
+                        let mut metal = if (worker + iteration) % 2 == 0 {
+                            Metal::open_simd_matmul()?
+                        } else {
+                            Metal::open_tensor_matmul()?
+                        };
+                        let input = metal.new_buffer(32)?;
+                        let output = metal.new_buffer(32)?;
+                        let expected = [worker as f32 + iteration as f32; 8];
+                        metal.write(input.at(0), &expected)?;
+                        metal.begin()?;
+                        metal.copy(input.at(0), output.at(0), 8)?;
+                        metal.end()?;
+                        let mut got = [0.0_f32; 8];
+                        metal.read(output.at(0), &mut got)?;
+                        assert_eq!(got.map(f32::to_bits), expected.map(f32::to_bits));
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker
+                .join()
+                .expect("the Metal initialization worker must finish")?;
+        }
+        Ok::<_, MetalError>(())
+    })?;
+    Ok(())
+}
 
 #[test]
 fn queued_commands_preserve_constants_and_dropped_buffers() -> Result<(), Box<dyn Error>> {

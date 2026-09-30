@@ -11,8 +11,8 @@
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use block2::RcBlock;
 use memmap2::Mmap;
@@ -94,6 +94,24 @@ const HALF_BYTES: usize = 2;
 static NEXT_BACKEND_ID: AtomicU64 = AtomicU64::new(1);
 
 type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
+
+/// Share the default GPU's compiler across backends. Concurrent compiler instances can corrupt
+/// AGX state on macOS 26.5, as documented by Mesa's `KK_WORKAROUND_11` and Apple FB22683138.
+fn shared_compiler(
+    device: &ProtocolObject<dyn MTLDevice>,
+) -> Result<Retained<ProtocolObject<dyn MTL4Compiler>>, Error> {
+    static COMPILER: OnceLock<Result<Retained<ProtocolObject<dyn MTL4Compiler>>, String>> =
+        OnceLock::new();
+    COMPILER
+        .get_or_init(|| {
+            device
+                .newCompilerWithDescriptor_error(&MTL4CompilerDescriptor::new())
+                .map_err(|error| describe(&error))
+        })
+        .as_ref()
+        .cloned()
+        .map_err(|message| Error::Compile(message.clone()))
+}
 
 /// Why a Metal operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -745,9 +763,7 @@ impl Metal {
             if !device.supportsFamily(MTLGPUFamily::Metal4) {
                 return Err(Error::Metal4Unsupported);
             }
-            let compiler = device
-                .newCompilerWithDescriptor_error(&MTL4CompilerDescriptor::new())
-                .map_err(|error| Error::Compile(describe(&error)))?;
+            let compiler = shared_compiler(&device)?;
             let library = compile_library(&compiler, SOURCE)?;
             let commands = Commands::new(&device)?;
             let pipelines = Pipelines::new(&compiler, &library)?;
@@ -1708,4 +1724,49 @@ fn page_size() -> Option<usize> {
     // SAFETY: `sysconf` has no preconditions.
     let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     usize::try_from(size).ok().filter(|&size| size > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Barrier;
+    use std::thread;
+
+    use super::*;
+
+    #[test]
+    fn concurrent_initialization_shares_the_device_compiler() -> Result<(), Error> {
+        let Some(device) = MTLCreateSystemDefaultDevice() else {
+            eprintln!("skip: no Metal device");
+            return Ok(());
+        };
+        if !device.supportsFamily(MTLGPUFamily::Metal4) {
+            eprintln!("skip: Metal 4 is unavailable");
+            return Ok(());
+        }
+        let barrier = Barrier::new(8);
+        let compilers = thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    let device = &device;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        shared_compiler(device)
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("the compiler worker must finish"))
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+        for compiler in &compilers[1..] {
+            assert!(std::ptr::eq(
+                &raw const *compilers[0],
+                &raw const **compiler
+            ));
+            assert_eq!(compiler.device().registryID(), device.registryID());
+        }
+        Ok(())
+    }
 }
