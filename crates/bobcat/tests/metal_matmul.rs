@@ -102,8 +102,121 @@ fn check_shape(
 }
 
 #[test]
+fn tensor_q4k_prefill_matches_standard_layers_and_tokens() -> Result<(), Box<dyn Error>> {
+    check_tensor_prefill("LFM2.5-350M-Q4_K_M.gguf")
+}
+
+#[test]
+fn tensor_2_6b_prefill_matches_standard_layers_and_tokens() -> Result<(), Box<dyn Error>> {
+    check_tensor_prefill("LFM2.5-2.6B-Q4_K_M.gguf")
+}
+
+fn check_tensor_prefill(model_file: &str) -> Result<(), Box<dyn Error>> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../models")
+        .join(model_file);
+    if !path.exists() {
+        eprintln!("skip: {} is missing", path.display());
+        return Ok(());
+    }
+    let mut tensor = match Metal::open_tensor_matmul() {
+        Ok(metal) => metal,
+        Err(error @ (bobcat::metal::Error::NoDevice | bobcat::metal::Error::Metal4Unsupported)) => {
+            eprintln!("skip: {error}");
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let model = bobcat::Model::load(path)?;
+    let hp = model.hyperparameters();
+    let mut standard = Metal::open_simd_matmul()?;
+    let mut want_trace = bobcat::Trace::new(hp, 512);
+    let mut got_trace = bobcat::Trace::new(hp, 512);
+    let mut want_logits = vec![0.0; hp.n_vocab as usize];
+    let mut got_logits = want_logits.clone();
+    let mut want_tokens = [0; 16];
+    let mut got_tokens = want_tokens;
+    for (metal, trace, logits, tokens) in [
+        (
+            &mut standard,
+            &mut want_trace,
+            &mut want_logits,
+            &mut want_tokens,
+        ),
+        (
+            &mut tensor,
+            &mut got_trace,
+            &mut got_logits,
+            &mut got_tokens,
+        ),
+    ] {
+        let mut gpu = bobcat::Lfm2Metal::new(&model, metal, 528, true)?;
+        gpu.prefill(&vec![1000; 512], Some(logits), Some(trace))?;
+        gpu.generate(tokens)?;
+    }
+    for (got, want) in got_trace
+        .layers
+        .chunks_exact(hp.n_embd as usize)
+        .zip(want_trace.layers.chunks_exact(hp.n_embd as usize))
+        .chain(std::iter::once((
+            got_logits.as_slice(),
+            want_logits.as_slice(),
+        )))
+    {
+        let scale = want.iter().copied().map(f32::abs).fold(0.0, f32::max);
+        let error = got
+            .iter()
+            .zip(want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        // The reference-model tests allow the same error with half-precision KV caches.
+        assert!(
+            error <= 5e-3 * scale,
+            "tensor prefill error {error} / {scale}"
+        );
+    }
+    assert_eq!(
+        got_tokens, want_tokens,
+        "tensor prefill changes greedy continuation"
+    );
+    Ok(())
+}
+
+#[test]
+fn tensor_f16_matrix_tiles_match_scalar() -> Result<(), Box<dyn Error>> {
+    let mut metal = match Metal::open_tensor_matmul() {
+        Ok(metal) => metal,
+        Err(error @ (bobcat::metal::Error::NoDevice | bobcat::metal::Error::Metal4Unsupported)) => {
+            eprintln!("skip: {error}");
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    for (rows, cols, tokens) in [
+        (64, 64, 64),
+        (70, 96, 65),
+        (5, 32, 3),
+        (70, 2048, 65),
+        (70, 10752, 65),
+    ] {
+        for store in [Store::Overwrite, Store::Accumulate, Store::Swiglu] {
+            check_shape(
+                &mut metal,
+                TensorType::F16,
+                Format::F16,
+                rows,
+                cols,
+                tokens,
+                store,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn f16_matrix_tiles_match_scalar() -> Result<(), Box<dyn Error>> {
-    let mut metal = match Metal::open() {
+    let mut metal = match Metal::open_simd_matmul() {
         Ok(metal) => metal,
         Err(error) => {
             eprintln!("skip: {error}");

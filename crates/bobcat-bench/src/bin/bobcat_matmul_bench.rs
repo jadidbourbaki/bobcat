@@ -25,6 +25,13 @@ enum StoreMode {
     Swiglu,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Matmul {
+    Auto,
+    Simd,
+    Tensor,
+}
+
 /// Measure the GPU time of a repeated matrix multiplication.
 #[derive(Debug, Parser)]
 #[command(version)]
@@ -50,6 +57,9 @@ struct Options {
     /// Expand Q4_K or Q6_K weights to half precision before each matrix multiply.
     #[arg(long)]
     expand: bool,
+    /// Matrix kernel selection for A/B comparisons.
+    #[arg(long, value_enum, default_value_t = Matmul::Auto)]
+    matmul: Matmul,
 }
 
 #[cfg(target_os = "macos")]
@@ -90,6 +100,10 @@ fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
     if options.expand && !matches!(options.format, Quant::Q4k | Quant::Q6k) {
         return Err("--expand requires --format q4k or q6k".into());
     }
+    if options.matmul == Matmul::Tensor && !options.expand && !matches!(options.format, Quant::F16)
+    {
+        return Err("--matmul tensor requires --format f16 or --expand".into());
+    }
     let store = match options.store {
         StoreMode::Overwrite => Store::Overwrite,
         StoreMode::Accumulate => Store::Accumulate,
@@ -110,7 +124,11 @@ fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("weight size overflow")?;
     let input_len = tokens.checked_mul(cols).ok_or("input size overflow")?;
     let output_len = tokens.checked_mul(rows).ok_or("output size overflow")?;
-    let metal = &mut Metal::open()?;
+    let metal = &mut match options.matmul {
+        Matmul::Auto => Metal::open()?,
+        Matmul::Simd => Metal::open_simd_matmul()?,
+        Matmul::Tensor => Metal::open_tensor_matmul()?,
+    };
     let weights = metal.new_buffer(weight_bytes)?;
     let input = metal.new_buffer(input_len.checked_mul(4).ok_or("input size overflow")?)?;
     let output = metal.new_buffer(output_len.checked_mul(4).ok_or("output size overflow")?)?;
@@ -162,8 +180,14 @@ fn run(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         0.0
     };
+    println!("command submission: Metal 4");
     println!(
-        "{:?} {:?} {}x{} by {} tokens, {} runs: {:.3} ± {:.3} ms GPU, {:.1} tokens/s",
+        "{} {:?} {:?} {}x{} by {} tokens, {} runs: {:.3} ± {:.3} ms GPU, {:.1} tokens/s",
+        if metal.uses_tensor_matmul() && (options.expand || matches!(options.format, Quant::F16)) {
+            "Metal 4 tensor"
+        } else {
+            "SIMD-group"
+        },
         options.format,
         options.store,
         options.rows,

@@ -26,6 +26,14 @@ enum KvType {
     F32,
 }
 
+/// The matrix kernel selection for benchmark comparisons.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Matmul {
+    Auto,
+    Simd,
+    Tensor,
+}
+
 /// Measure bobcat's prefill and decode speed on the Metal GPU.
 #[derive(Debug, Parser)]
 #[command(version)]
@@ -47,6 +55,9 @@ struct Options {
     /// Measure warmed greedy streaming latency, then emit in eight-token chunks.
     #[arg(long)]
     latency: bool,
+    /// Prefill matrix kernel selection for A/B comparisons.
+    #[arg(long, value_enum, default_value_t = Matmul::Auto)]
+    matmul: Matmul,
     /// KV cache type.
     #[arg(short, long, value_enum, default_value_t = KvType::F16)]
     kv: KvType,
@@ -88,7 +99,11 @@ fn run(options: &Options) -> Result<(), bobcat::Error> {
     }
 
     let model = Model::load(&options.model)?;
-    let mut metal = Metal::open()?;
+    let mut metal = match options.matmul {
+        Matmul::Auto => Metal::open()?,
+        Matmul::Simd => Metal::open_simd_matmul()?,
+        Matmul::Tensor => Metal::open_tensor_matmul()?,
+    };
     let kv_half = options.kv == KvType::F16;
     let n_ctx = options.prompt + options.generate;
     let prompt = vec![PROMPT_TOKEN; options.prompt as usize];
@@ -125,6 +140,10 @@ fn run(options: &Options) -> Result<(), bobcat::Error> {
         options.generate,
         options.reps
     );
+    println!("command submission: Metal 4");
+    if metal.uses_tensor_matmul() {
+        println!("prefill matrix path: Metal 4 tensors for expanded half weights");
+    }
     print_rates("prefill", &prefill_rates);
     print_rates("decode", &decode_rates);
     // Encoding overlaps the GPU in pipelined decode. The GPU sits idle for whatever part of each

@@ -9,7 +9,6 @@
     reason = "Metal's API is Objective-C, reached through objc2-metal"
 )]
 
-use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -21,11 +20,20 @@ use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSError, NSString};
 use objc2_metal::{
-    MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
-    MTLCommandQueue, MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePipelineState,
-    MTLCreateSystemDefaultDevice, MTLDataType, MTLDevice, MTLDispatchType,
-    MTLFunctionConstantValues, MTLLibrary, MTLMathMode, MTLResourceOptions, MTLSize,
+    MTL4Compiler, MTL4CompilerDescriptor, MTL4ComputePipelineDescriptor, MTL4LibraryDescriptor,
+    MTL4LibraryFunctionDescriptor, MTL4SpecializedFunctionDescriptor, MTLBuffer, MTLCompileOptions,
+    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDataType, MTLDevice,
+    MTLFunctionConstantValues, MTLGPUFamily, MTLLanguageVersion, MTLLibrary, MTLMathMode,
+    MTLResourceOptions, MTLSize,
 };
+
+#[path = "commands.rs"]
+mod commands;
+
+#[path = "bandwidth.rs"]
+pub(super) mod bandwidth;
+
+use commands::Commands;
 
 /// The kernel source, embedded at build time. Shared definitions precede the operation kernels.
 const SOURCE: &str = concat!(
@@ -39,6 +47,11 @@ const SOURCE: &str = concat!(
 );
 
 const SIMD_WIDTH: usize = 32;
+/// On M4 Pro, 64-token tensor tiles lower 2.6B Q4_K TTFT by about 3%. Matches `TENSOR_TOKENS`.
+const TENSOR_MATMUL_TOKENS: u32 = 64;
+/// On M4 Pro, 32-row tiles improve 6144-row and square matrix timings by about 2%.
+/// Matches `TENSOR_ROWS` in `matmul_tensor.metal`.
+const TENSOR_MATMUL_ROWS: u32 = 32;
 
 /// A sweep of 1, 2, and 4 rows per threadgroup against 2, 4, and 8 simdgroups on an M4 Pro put
 /// two rows first on every model. Two simdgroups won on rows of 1024 columns, lifting
@@ -79,15 +92,19 @@ const HALF_BYTES: usize = 2;
 static NEXT_BACKEND_ID: AtomicU64 = AtomicU64::new(1);
 
 type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
-type CommandBuffer = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
-type Encoder = Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>;
 
 /// Why a Metal operation failed.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// The bandwidth probe received an empty buffer, grid, or repetition count.
+    #[error("invalid bandwidth settings: {0}")]
+    BandwidthInput(&'static str),
     /// The system has no Metal device.
     #[error("no Metal device")]
     NoDevice,
+    /// The device or operating system lacks Metal 4 support.
+    #[error("the Metal backend requires Apple silicon and macOS 26 or newer")]
+    Metal4Unsupported,
     /// The Metal compiler rejected the joined kernel source.
     #[error("cannot compile Metal kernels: {0}")]
     Compile(String),
@@ -111,6 +128,9 @@ pub enum Error {
     /// Metal refused to create a command buffer or encoder.
     #[error("cannot create a Metal command buffer")]
     CommandBuffer,
+    /// Metal refused to create argument tables or residency sets.
+    #[error("cannot initialize Metal 4 command resources: {0}")]
+    CommandSetup(String),
     /// A launch or commit came with no command buffer open.
     #[error("no command buffer is open")]
     NotRecording,
@@ -155,6 +175,7 @@ pub enum Error {
 pub struct Buffer {
     owner: u64,
     raw: Retained<ProtocolObject<dyn MTLBuffer>>,
+    address: u64,
     len: usize,
 }
 
@@ -391,7 +412,7 @@ struct FormatPipelines {
 
 impl FormatPipelines {
     fn new(
-        device: &ProtocolObject<dyn MTLDevice>,
+        compiler: &ProtocolObject<dyn MTL4Compiler>,
         library: &ProtocolObject<dyn MTLLibrary>,
         format: Format,
     ) -> Result<Self, Error> {
@@ -403,7 +424,7 @@ impl FormatPipelines {
                 accumulate,
                 swiglu_store: false,
             };
-            make_pipeline(device, library, matvec_name, Some(constants))
+            make_pipeline(compiler, library, matvec_name, Some(constants))
         };
         let matmul = |accumulate, swiglu_store| {
             let constants = Constants {
@@ -412,7 +433,7 @@ impl FormatPipelines {
                 accumulate,
                 swiglu_store,
             };
-            make_pipeline(device, library, matmul_name, Some(constants))
+            make_pipeline(compiler, library, matmul_name, Some(constants))
         };
         let swiglu = Constants {
             rows_per_threadgroup: MATVEC_Q8_0_ROWS_PER_THREADGROUP,
@@ -425,13 +446,13 @@ impl FormatPipelines {
                 [matvec(false, false)?, matvec(false, true)?],
                 [matvec(true, false)?, matvec(true, true)?],
             ],
-            matvec_swiglu: make_pipeline(device, library, swiglu_name, Some(swiglu))?,
+            matvec_swiglu: make_pipeline(compiler, library, swiglu_name, Some(swiglu))?,
             matmul: [
                 matmul(false, false)?,
                 matmul(true, false)?,
                 matmul(false, true)?,
             ],
-            embed: make_pipeline(device, library, embed_name, None)?,
+            embed: make_pipeline(compiler, library, embed_name, None)?,
         })
     }
 }
@@ -459,14 +480,14 @@ struct Pipelines {
 
 impl Pipelines {
     fn new(
-        device: &ProtocolObject<dyn MTLDevice>,
+        compiler: &ProtocolObject<dyn MTL4Compiler>,
         library: &ProtocolObject<dyn MTLLibrary>,
     ) -> Result<Self, Error> {
-        let plain = |name| make_pipeline(device, library, name, None);
+        let plain = |name| make_pipeline(compiler, library, name, None);
         Ok(Self {
             formats: Format::ALL
                 .into_iter()
-                .map(|format| FormatPipelines::new(device, library, format))
+                .map(|format| FormatPipelines::new(compiler, library, format))
                 .collect::<Result<_, _>>()?,
             expand_q4k: plain("expand_q4k")?,
             expand_q6k: plain("expand_q6k")?,
@@ -539,31 +560,51 @@ fn set_bool_constant(values: &MTLFunctionConstantValues, value: bool, index: usi
 
 /// Return a pipeline for the kernel `name` in `library`, specialized with `constants` when given.
 fn make_pipeline(
-    device: &ProtocolObject<dyn MTLDevice>,
+    compiler: &ProtocolObject<dyn MTL4Compiler>,
     library: &ProtocolObject<dyn MTLLibrary>,
     name: &'static str,
     constants: Option<Constants>,
 ) -> Result<Pipeline, Error> {
     let fail = |message| Error::Pipeline { name, message };
-    let ns_name = NSString::from_str(name);
-    let function = match constants {
+    let function = MTL4LibraryFunctionDescriptor::new();
+    function.setName(Some(&NSString::from_str(name)));
+    function.setLibrary(Some(library));
+    let descriptor = MTL4ComputePipelineDescriptor::new();
+    match constants {
         Some(constants) => {
             let values = MTLFunctionConstantValues::new();
             set_uint_constant(&values, constants.rows_per_threadgroup, 0);
             set_bool_constant(&values, constants.fuse_norm, 1);
             set_bool_constant(&values, constants.accumulate, 2);
             set_bool_constant(&values, constants.swiglu_store, 3);
-            library
-                .newFunctionWithName_constantValues_error(&ns_name, &values)
-                .map_err(|error| fail(describe(&error)))?
+            let specialized = MTL4SpecializedFunctionDescriptor::new();
+            specialized.setFunctionDescriptor(Some(&function));
+            specialized.setConstantValues(Some(&values));
+            descriptor.setComputeFunctionDescriptor(Some(&specialized));
         }
-        None => library
-            .newFunctionWithName(&ns_name)
-            .ok_or_else(|| fail("no such kernel".to_owned()))?,
-    };
-    device
-        .newComputePipelineStateWithFunction_error(&function)
+        None => descriptor.setComputeFunctionDescriptor(Some(&function)),
+    }
+    if name == "matmul_tensor_f16" {
+        descriptor.setRequiredThreadsPerThreadgroup(size([4 * SIMD_WIDTH, 1, 1]));
+    }
+    compiler
+        .newComputePipelineStateWithDescriptor_compilerTaskOptions_error(&descriptor, None)
         .map_err(|error| fail(describe(&error)))
+}
+
+fn compile_library(
+    compiler: &ProtocolObject<dyn MTL4Compiler>,
+    source: &str,
+) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>, Error> {
+    let options = MTLCompileOptions::new();
+    options.setMathMode(MTLMathMode::Safe);
+    options.setLanguageVersion(MTLLanguageVersion::Version4_0);
+    let descriptor = MTL4LibraryDescriptor::new();
+    descriptor.setSource(Some(&NSString::from_str(source)));
+    descriptor.setOptions(Some(&options));
+    compiler
+        .newLibraryWithDescriptor_error(&descriptor)
+        .map_err(|error| Error::Compile(describe(&error)))
 }
 
 /// One argument of a kernel launch, bound to the slot matching its position.
@@ -600,58 +641,104 @@ struct Launch<'a, 'b> {
     weight_bytes: u64,
 }
 
-/// The command buffer and encoder that launches record into.
-#[derive(Debug)]
-struct Recording {
-    command_buffer: CommandBuffer,
-    encoder: Encoder,
-}
-
 /// An open Metal device with bobcat's kernels compiled.
 #[derive(Debug)]
 pub struct Metal {
     id: u64,
     device: Retained<ProtocolObject<dyn MTLDevice>>,
-    queue: Retained<ProtocolObject<dyn objc2_metal::MTLCommandQueue>>,
+    compiler: Retained<ProtocolObject<dyn MTL4Compiler>>,
+    commands: Commands,
     pipelines: Pipelines,
-    recording: Option<Recording>,
-    /// Submitted command buffers not yet waited on, oldest first.
-    in_flight: VecDeque<CommandBuffer>,
-    /// The number of command buffers submitted.
-    committed: u64,
-    /// The number of command buffers waited on.
-    completed: u64,
+    tensor_matmul: bool,
     profiling: bool,
     profile: Vec<ProfileEntry>,
 }
 
 impl Metal {
+    /// Open the backend with Metal 4 tensor matrix products for half weights on every chip.
+    ///
+    /// The compiler returns an error when Metal Shading Language 4 is unavailable. Other
+    /// operations retain their ordinary pipelines. Float inputs and accumulation keep their
+    /// precision.
+    pub fn open_tensor_matmul() -> Result<Self, Error> {
+        let mut metal = Self::open_simd_matmul()?;
+        metal.enable_tensor_matmul()?;
+        Ok(metal)
+    }
+
+    fn enable_tensor_matmul(&mut self) -> Result<(), Error> {
+        if !self.device.supportsFamily(MTLGPUFamily::Metal4) {
+            return Err(Error::Metal4Unsupported);
+        }
+        let source = concat!(
+            include_str!("common.metal"),
+            include_str!("matmul_tensor.metal")
+        );
+        let library = compile_library(&self.compiler, source)?;
+        for (index, (accumulate, swiglu_store)) in [(false, false), (true, false), (false, true)]
+            .into_iter()
+            .enumerate()
+        {
+            self.pipelines.formats[Format::F16.index()].matmul[index] = make_pipeline(
+                &self.compiler,
+                &library,
+                "matmul_tensor_f16",
+                Some(Constants {
+                    rows_per_threadgroup: 0,
+                    fuse_norm: false,
+                    accumulate,
+                    swiglu_store,
+                }),
+            )?;
+        }
+        self.tensor_matmul = true;
+        Ok(())
+    }
+
     /// Open the default Metal device and compile bobcat's kernels.
     ///
-    /// The kernels compile in Metal's safe math mode, which needs macOS 15 or newer.
+    /// The backend requires Apple silicon and macOS 26 or newer. All launches use Metal 4
+    /// command submission. M4 Pro half-weight matrix products use strict tensor operations.
     pub fn open() -> Result<Self, Error> {
+        let mut metal = Self::open_simd_matmul()?;
+        // M4 Pro full-model Q4_K prefill improves TTFT by about 3% with strict tensor math.
+        if metal.device.name().to_string() == "Apple M4 Pro"
+            && metal.device.supportsFamily(MTLGPUFamily::Metal4)
+        {
+            metal.enable_tensor_matmul()?;
+        }
+        Ok(metal)
+    }
+
+    /// Open the backend with SIMD-group matrix kernels for baseline comparisons.
+    pub fn open_simd_matmul() -> Result<Self, Error> {
         autoreleasepool(|_| {
             let device = MTLCreateSystemDefaultDevice().ok_or(Error::NoDevice)?;
-            let options = MTLCompileOptions::new();
-            options.setMathMode(MTLMathMode::Safe);
-            let library = device
-                .newLibraryWithSource_options_error(&NSString::from_str(SOURCE), Some(&options))
+            if !device.supportsFamily(MTLGPUFamily::Metal4) {
+                return Err(Error::Metal4Unsupported);
+            }
+            let compiler = device
+                .newCompilerWithDescriptor_error(&MTL4CompilerDescriptor::new())
                 .map_err(|error| Error::Compile(describe(&error)))?;
-            let queue = device.newCommandQueue().ok_or(Error::Queue)?;
-            let pipelines = Pipelines::new(&device, &library)?;
+            let library = compile_library(&compiler, SOURCE)?;
+            let commands = Commands::new(&device)?;
+            let pipelines = Pipelines::new(&compiler, &library)?;
             Ok(Self {
                 id: NEXT_BACKEND_ID.fetch_add(1, Ordering::Relaxed),
                 device,
-                queue,
+                compiler,
+                commands,
                 pipelines,
-                recording: None,
-                in_flight: VecDeque::new(),
-                committed: 0,
-                completed: 0,
+                tensor_matmul: false,
                 profiling: false,
                 profile: Vec::new(),
             })
         })
+    }
+
+    /// Return whether half-weight matrix products use Metal 4 tensors.
+    pub fn uses_tensor_matmul(&self) -> bool {
+        self.tensor_matmul
     }
 
     /// Return a new zeroed buffer of `len` bytes.
@@ -666,6 +753,7 @@ impl Metal {
         unsafe { contents.write_bytes(0, raw.length()) };
         Ok(Buffer {
             owner: self.id,
+            address: raw.gpuAddress(),
             raw,
             len,
         })
@@ -703,6 +791,7 @@ impl Metal {
         .ok_or(Error::Wrap(len))?;
         Ok(Buffer {
             owner: self.id,
+            address: raw.gpuAddress(),
             raw,
             len,
         })
@@ -743,7 +832,7 @@ impl Metal {
         if buffer.owner != self.id {
             return Err(Error::ForeignBuffer);
         }
-        if !self.in_flight.is_empty() {
+        if self.commands.busy() {
             return Err(Error::Busy);
         }
         let access = Error::Access {
@@ -768,29 +857,12 @@ impl Metal {
     /// Start recording launches into a new command buffer. Launches may run at the same time
     /// until a barrier separates them.
     pub fn begin(&mut self) -> Result<(), Error> {
-        if self.recording.is_some() {
-            return Err(Error::AlreadyRecording);
-        }
-        // Command buffers and encoders arrive autoreleased. The pool frees the temporary
-        // references on every step of a long decode.
-        let recording = autoreleasepool(|_| {
-            let command_buffer = self.queue.commandBuffer()?;
-            let encoder = command_buffer
-                .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)?;
-            Some(Recording {
-                command_buffer,
-                encoder,
-            })
-        });
-        self.recording = Some(recording.ok_or(Error::CommandBuffer)?);
-        Ok(())
+        self.commands.begin()
     }
 
     /// Drop the open command buffer and its launches without running them.
     pub fn discard(&mut self) {
-        if let Some(recording) = self.recording.take() {
-            recording.encoder.endEncoding();
-        }
+        self.commands.discard();
     }
 
     /// Record a barrier. Every launch recorded after the barrier sees the results of every
@@ -798,50 +870,21 @@ impl Metal {
     pub fn barrier(&mut self) {
         // While profiling, each launch waits for its own command buffer, which orders the
         // launches already.
-        if !self.profiling
-            && let Some(recording) = &self.recording
-        {
-            recording
-                .encoder
-                .memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        if !self.profiling {
+            self.commands.barrier();
         }
     }
 
     /// Submit the recorded launches to the GPU without waiting and return a ticket to wait on.
     /// Command buffers run in the order they are submitted.
     pub fn commit(&mut self) -> Result<Ticket, Error> {
-        let recording = self.recording.take().ok_or(Error::NotRecording)?;
-        recording.encoder.endEncoding();
-        recording.command_buffer.commit();
-        self.in_flight.push_back(recording.command_buffer);
-        self.committed += 1;
-        Ok(Ticket(self.committed))
+        self.commands.commit()
     }
 
     /// Wait until the command buffer with `ticket` and every one submitted before it has
     /// finished. Return the GPU time in seconds of the command buffers waited on.
     pub fn wait(&mut self, ticket: Ticket) -> Result<f64, Error> {
-        let mut gpu_seconds = 0.0;
-        let mut failure = None;
-        // In-flight command buffers finish in submission order, so the oldest one comes next.
-        while self.completed < ticket.0
-            && let Some(command_buffer) = self.in_flight.pop_front()
-        {
-            command_buffer.waitUntilCompleted();
-            self.completed += 1;
-            if command_buffer.status() != MTLCommandBufferStatus::Completed {
-                failure = Some(
-                    command_buffer
-                        .error()
-                        .map_or_else(|| "unknown error".to_owned(), |error| describe(&error)),
-                );
-            }
-            gpu_seconds += command_buffer.GPUEndTime() - command_buffer.GPUStartTime();
-        }
-        match failure {
-            Some(message) => Err(Error::Execution(message)),
-            None => Ok(gpu_seconds),
-        }
+        self.commands.wait(ticket)
     }
 
     /// Run the recorded launches and wait for them. Return their GPU time in seconds.
@@ -876,44 +919,10 @@ impl Metal {
         }
 
         let pipeline = self.pipelines.get(launch.kernel);
-        let own = if self.profiling {
-            autoreleasepool(|_| {
-                let command_buffer = self.queue.commandBuffer()?;
-                let encoder = command_buffer.computeCommandEncoder()?;
-                Some(Recording {
-                    command_buffer,
-                    encoder,
-                })
-            })
-            .map(Some)
-            .ok_or(Error::CommandBuffer)?
-        } else {
-            None
-        };
-        let encoder = match (&own, &self.recording) {
-            (Some(recording), _) | (None, Some(recording)) => &recording.encoder,
-            (None, None) => return Err(Error::NotRecording),
-        };
-
-        encoder.setComputePipelineState(pipeline);
-        for (index, arg) in launch.args.iter().enumerate() {
-            bind(encoder, arg, index);
-        }
-        match launch.dispatch {
-            Dispatch::Threadgroups(grid, group) => {
-                encoder.dispatchThreadgroups_threadsPerThreadgroup(size(grid), size(group));
-            }
-            Dispatch::Threads(grid, group) => {
-                encoder.dispatchThreads_threadsPerThreadgroup(size(grid), size(group));
-            }
-        }
-
-        if let Some(recording) = own {
-            recording.encoder.endEncoding();
-            recording.command_buffer.commit();
-            recording.command_buffer.waitUntilCompleted();
-            let seconds =
-                recording.command_buffer.GPUEndTime() - recording.command_buffer.GPUStartTime();
+        if let Some(seconds) =
+            self.commands
+                .launch(pipeline, launch.args, &launch.dispatch, self.profiling)?
+        {
             self.add_profile(launch, seconds);
         }
         Ok(())
@@ -1320,8 +1329,18 @@ impl Metal {
         let rows = to_usize(n_rows);
         let cols = to_usize(n_cols);
         let tokens = to_usize(n_tokens);
-        let row_tiles = n_rows.div_ceil(MATMUL_ROWS);
-        let token_tiles = n_tokens.div_ceil(MATMUL_TOKENS);
+        let row_tile = if self.tensor_matmul && format == Format::F16 {
+            TENSOR_MATMUL_ROWS
+        } else {
+            MATMUL_ROWS
+        };
+        let row_tiles = n_rows.div_ceil(row_tile);
+        let token_tile = if self.tensor_matmul && format == Format::F16 {
+            TENSOR_MATMUL_TOKENS
+        } else {
+            MATMUL_TOKENS
+        };
+        let token_tiles = n_tokens.div_ceil(token_tile);
         let matrix_bytes = format.matrix_bytes(rows, cols);
         let args = [
             buffer(weights, matrix_bytes),
@@ -1474,15 +1493,6 @@ impl Metal {
     }
 }
 
-impl Drop for Metal {
-    fn drop(&mut self) {
-        // Metal requires every encoder to end before it is released.
-        self.discard();
-        // The caller receives no GPU errors from a drop.
-        let _ = self.wait(Ticket(self.committed));
-    }
-}
-
 /// Return the floats of scratch [`Metal::attention`] needs for `n_queries` queries of `n_heads`
 /// heads of `head_dim` floats over up to `n_ctx` positions.
 pub fn attention_scratch_floats(n_heads: u32, head_dim: u32, n_ctx: u32, n_queries: u32) -> usize {
@@ -1536,29 +1546,6 @@ fn check_range(
             len: view.buffer.len,
         }),
     }
-}
-
-/// Bind `arg` to slot `index` of `encoder`.
-fn bind(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, arg: &Arg<'_>, index: usize) {
-    match arg {
-        Arg::Buffer { view, .. } => {
-            // SAFETY: the launch checked that the range the kernel touches lies inside the buffer.
-            unsafe { encoder.setBuffer_offset_atIndex(Some(&view.buffer.raw), view.offset, index) };
-        }
-        Arg::U32(value) => bind_value(encoder, value, index),
-        Arg::F32(value) => bind_value(encoder, value, index),
-    }
-}
-
-/// Bind the bytes of `value` to slot `index` of `encoder`.
-fn bind_value<T: Copy>(
-    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-    value: &T,
-    index: usize,
-) {
-    // SAFETY: `value` points at `size_of::<T>()` live bytes, and Metal copies them before
-    // returning.
-    unsafe { encoder.setBytes_length_atIndex(NonNull::from(value).cast(), size_of::<T>(), index) };
 }
 
 /// Return the dispatch of a matrix-vector launch over `n_rows` rows of `n_cols` weights of
