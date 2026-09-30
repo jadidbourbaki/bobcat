@@ -4,8 +4,8 @@
 
 bobcat is an inference engine for Apple silicon Macs. bobcat aims to
 run every popular local model that fits in a Mac's memory, as fast as
-possible and with as little energy as possible, on any Mac from a
-MacBook Air to a Mac Studio.
+possible and with as little energy as possible, on any Apple silicon Mac
+from a MacBook Air to a Mac Studio running macOS 26 or newer.
 
 New architectures appear every few months, so adding one must be cheap.
 bobcat builds each model from shared operations, such as quantized
@@ -105,7 +105,8 @@ guides this section.
 
 ### Metal 4
 
-Metal 4 runs on every Apple silicon Mac and gives the engine more
+Metal 4 runs on every Apple silicon Mac with macOS 26, the minimum
+bobcat requires, and gives the engine more
 control over the GPU. Explicit command allocators let bobcat reuse one
 command allocation for every step. Argument tables replace per-dispatch
 buffer binding. Residency sets keep the weights and caches resident for
