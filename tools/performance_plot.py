@@ -53,7 +53,8 @@ matplotlib.rcParams.update(
 # The panels stack, so each spans the full width and the engine names fit level under the bars.
 FIGURE_SIZE_INCHES = (6.4, 4.4)
 PNG_DPI = 300
-BAR_WIDTH = 0.6
+# Each bar fills 0.35 of the space between two engines, so full-width panels keep slim bars.
+BAR_WIDTH = 0.35
 BAR_EDGE_COLOR = "#000000"
 # bobcat's bars are filled black, and every other engine's bars are open.
 BOBCAT_FACE_COLOR = "#000000"
