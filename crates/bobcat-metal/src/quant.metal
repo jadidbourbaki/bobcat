@@ -278,6 +278,7 @@ enum
    (L % 8) / 4 and IR is L % 4.  */
 struct q4k_lanes
 {
+  static constant constexpr uint block_weights = 256;
   static constant constexpr uint blocks_per_pass = 4;
   static constant constexpr uint block_bytes = 144;
 
@@ -384,6 +385,7 @@ struct q4k_lanes
    L0 = 4 ((L / 2) % 8) within each quarter.  */
 struct q6k_lanes
 {
+  static constant constexpr uint block_weights = 256;
   static constant constexpr uint blocks_per_pass = 2;
   static constant constexpr uint block_bytes = 210;
 
@@ -448,5 +450,80 @@ struct q6k_lanes
     return d
            * (sums[0] * float (sc[0]) + sums[1] * float (sc[2])
               + sums[2] * float (sc[4]) + sums[3] * float (sc[6]));
+  }
+};
+
+/* Q4_0 lanes, after llama.cpp's kernel_mul_mv_q4_0_f32: lane L covers
+   blocks L / 2, L / 2 + 16, and so on.  Within a block it covers the 8
+   bytes at 8 (L % 2), whose low nibbles hold weights 8 (L % 2) onward
+   and whose high nibbles hold the weights 16 further.  */
+struct q4_0_lanes
+{
+  static constant constexpr uint block_weights = 32;
+  static constant constexpr uint blocks_per_pass = 16;
+  static constant constexpr uint block_bytes = 18;
+
+  struct inputs
+  {
+    /* The inputs of the lane's low and high nibbles, each divided by
+       the place value its nibble has inside a 16-bit load: 1 or 256
+       for low nibbles and 16 or 4096 for high ones.  */
+    float low[8];
+    float high[8];
+    /* The sum of the lane's 16 inputs, which multiplies the offset of
+       8 that every quant carries.  */
+    float sum;
+  };
+
+  static uint
+  first_block (uint lane)
+  {
+    return lane / 2;
+  }
+
+  static void
+  load (device const float *x, device const float *norm_weight, uint block,
+        uint lane, thread inputs &in, thread float &sum_squares)
+  {
+    uint base = block * 32 + 8 * (lane % 2);
+    in.sum = 0.0f;
+    for (uint i = 0; i < 8; i += 2)
+      {
+        uint at[4] = { base + i, base + i + 1, base + i + 16, base + i + 17 };
+        float4 v = float4 (x[at[0]], x[at[1]], x[at[2]], x[at[3]]);
+        if (fuse_norm)
+          {
+            sum_squares += dot (v, v);
+            v *= float4 (norm_weight[at[0]], norm_weight[at[1]],
+                         norm_weight[at[2]], norm_weight[at[3]]);
+          }
+        in.sum += v[0] + v[1] + v[2] + v[3];
+        in.low[i] = v[0];
+        in.low[i + 1] = v[1] / 256.0f;
+        in.high[i] = v[2] / 16.0f;
+        in.high[i + 1] = v[3] / 4096.0f;
+      }
+  }
+
+  /* Return the lane's part of the dot product of block BLOCK of ROW
+     with its loaded inputs IN.  Each 16-bit load holds two quant bytes,
+     and the masks keep one nibble in place, which the scaled inputs
+     undo.  */
+  static float
+  dot_part (device const uchar *row, uint block, uint lane,
+            thread const inputs &in)
+  {
+    device const uchar *b = row + block * block_bytes;
+    float d = float (*(device const half *)b);
+    device const ushort *q = (device const ushort *)(b + 2) + 4 * (lane % 2);
+    float acc = 0.0f;
+    for (uint i = 0; i < 4; i++)
+      {
+        acc += in.low[2 * i] * float (q[i] & 0x000f)
+               + in.low[2 * i + 1] * float (q[i] & 0x0f00)
+               + in.high[2 * i] * float (q[i] & 0x00f0)
+               + in.high[2 * i + 1] * float (q[i] & 0xf000);
+      }
+    return d * (acc - 8.0f * in.sum);
   }
 };

@@ -1660,7 +1660,8 @@ fn check_range(
 /// The Q8_0 and Q4_0 kernels split the columns of each threadgroup's rows among its simdgroups,
 /// and wider rows get more simdgroups. The K-quant kernels give each simdgroup whole rows.
 fn matvec_dispatch(format: Format, n_rows: u32, n_cols: u32) -> Dispatch {
-    if matches!(format, Format::Q4K | Format::Q6K) {
+    // The Q4_0 kernel shares the K-quant kernels' layout of whole rows per simdgroup.
+    if matches!(format, Format::Q4_0 | Format::Q4K | Format::Q6K) {
         let rows_per_threadgroup = K_QUANT_SIMDGROUPS * K_QUANT_ROWS_PER_SIMDGROUP;
         return Dispatch::Threadgroups(
             [to_usize(n_rows.div_ceil(rows_per_threadgroup)), 1, 1],
