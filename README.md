@@ -52,7 +52,7 @@ bobcat respond -m lfm2.5:2.6b "Name three primes."
 </p>
 
 LFM2.5-2.6B on an M4 Pro, with llama-bench's pp512 and tg128 tests. The
-raw runs are in [`docs/performance`](docs/performance).
+details are [here](docs/performance/eval.md).
 
 ## bobcat ❤️ agents
 

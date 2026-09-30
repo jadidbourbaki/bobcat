@@ -139,6 +139,15 @@ come from the maintainer's stated preference and must be honored.
   "That", "These", "Those", "Their", or "It" pointing at a noun from
   an earlier sentence. Name the noun again. The reader should never
   have to look backward to resolve a pronoun.
+- **Write in the active voice.** Name the actor as the subject. "The
+  loader validates every offset" replaces "Every offset is validated."
+- **No unnecessary bold.** Bold marks only a label a reader scans a
+  list for, such as a model's name above its pull command. Running
+  prose, notes, and paragraph openings carry no bold.
+- **No invented section headings.** A document shorter than two pages
+  is plain paragraphs under one plain title. A longer document such as
+  `docs/design.md` takes headings that name each section's topic in a
+  noun or two, such as "Attention" or "Benchmarks".
 
 ### Soft rules
 
