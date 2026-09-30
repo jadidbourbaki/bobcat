@@ -133,12 +133,12 @@ embed_q8_0 (device const uchar *weights [[buffer (0)]],
       = float (block->scale) * float (block->quants[i % QK8_0]);
 }
 
-/* Store at OUT the index of the largest of the N floats at X.  Ties go
-   to the lowest index, as a sequential scan would choose.  One
-   threadgroup handles the whole vector.  */
+/* Store at OUT and at COPY the index of the largest of the N floats at
+   X.  Ties go to the lowest index, as a sequential scan would choose.
+   One threadgroup handles the whole vector.  */
 kernel void
 argmax (device const float *x [[buffer (0)]], device int *out [[buffer (1)]],
-        constant uint &n [[buffer (2)]],
+        constant uint &n [[buffer (2)]], device int *copy [[buffer (3)]],
         uint tid [[thread_position_in_threadgroup]],
         uint threads [[threads_per_threadgroup]],
         uint simdgroup_index [[simdgroup_index_in_threadgroup]],
@@ -186,6 +186,7 @@ argmax (device const float *x [[buffer (0)]], device int *out [[buffer (1)]],
             best_index = best_indices[s];
           }
       out[0] = int (best_index);
+      copy[0] = int (best_index);
     }
 }
 /* Dequantize row TOKENS[T] of the matrix WEIGHTS of format F, whose rows

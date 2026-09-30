@@ -204,6 +204,62 @@ fn restore_continues_from_the_checkpoint() -> TestResult {
     Ok(())
 }
 
+/// Streaming must emit the tokens `generate` picks, stop where the caller stops it, and report
+/// every token its steps ran, including those past the stop and at the end of the context.
+#[cfg(target_os = "macos")]
+#[test]
+fn streaming_matches_generate() -> TestResult {
+    let path = models_dir().join("LFM2.5-350M-Q4_K_M.gguf");
+    if !path.exists() {
+        eprintln!("skip: {} is missing", path.display());
+        return Ok(());
+    }
+    let model = Model::load(path)?;
+    let mut metal = match bobcat::metal::Metal::open() {
+        Ok(metal) => metal,
+        Err(error) => {
+            eprintln!("skip: {error}");
+            return Ok(());
+        }
+    };
+    let prompt = [1, 2000, 3000, 4000];
+    // The context holds the prompt and 16 more tokens, so a full stream ends at its last position.
+    let mut gpu = bobcat::Lfm2Metal::new(&model, &mut metal, 20, true)?;
+    gpu.prefill(&prompt, None, None)?;
+    let checkpoint = gpu.checkpoint()?;
+    let mut expected = [0; 16];
+    gpu.generate(&mut expected)?;
+    let after = gpu.greedy_token()?;
+
+    gpu.restore(&checkpoint)?;
+    let mut emitted = Vec::new();
+    let gained = gpu.generate_stream(17, |token| {
+        emitted.push(token);
+        true
+    })?;
+    assert_eq!(emitted[..16], expected, "streamed tokens");
+    assert_eq!(emitted[16], after, "the selection after the last position");
+    assert_eq!(gained, expected, "tokens a full stream ran");
+
+    gpu.restore(&checkpoint)?;
+    emitted.clear();
+    let gained = gpu.generate_stream(17, |token| {
+        emitted.push(token);
+        emitted.len() < 5
+    })?;
+    assert_eq!(emitted, expected[..5], "tokens up to the stop");
+    assert!(
+        gained.len() >= 4,
+        "a stopped stream ran the tokens before its last"
+    );
+    assert_eq!(
+        gained,
+        expected[..gained.len()],
+        "tokens a stopped stream ran"
+    );
+    Ok(())
+}
+
 /// Early token selection must preserve generation, checkpoints, and the remaining context.
 #[cfg(target_os = "macos")]
 #[test]

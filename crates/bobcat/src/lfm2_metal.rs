@@ -7,7 +7,8 @@ use std::time::Instant;
 
 use bobcat_gguf::{Tensor, TensorType};
 use bobcat_metal::{
-    Buffer, Format, MatvecOptions, Metal, Norm, Store, Ticket, View, attention_scratch_floats,
+    Buffer, Format, MatvecOptions, Metal, Norm, Readback, Store, Ticket, View,
+    attention_scratch_floats,
 };
 
 use crate::error::Error;
@@ -107,6 +108,8 @@ pub struct Lfm2Metal<'a> {
     last_encode_seconds: f64,
     last_gpu_seconds: f64,
     buffers: Buffers,
+    /// One token slot per step [`Lfm2Metal::generate_stream`] keeps in flight.
+    readback: Readback,
 }
 
 impl<'a> Lfm2Metal<'a> {
@@ -191,6 +194,7 @@ impl<'a> Lfm2Metal<'a> {
             trace_layers: floats(to_usize(hp.n_layers) * n_embd)?,
             trace_final: floats(n_embd)?,
         };
+        let readback = metal.new_readback(GENERATE_IN_FLIGHT)?;
 
         Ok(Self {
             model,
@@ -204,6 +208,7 @@ impl<'a> Lfm2Metal<'a> {
             last_encode_seconds: 0.0,
             last_gpu_seconds: 0.0,
             buffers,
+            readback,
         })
     }
 
@@ -400,6 +405,155 @@ impl<'a> Lfm2Metal<'a> {
     /// the sequence unchanged.
     pub fn generate_next(&mut self, out: &mut [u32]) -> Result<(), Error> {
         self.generate_inner(out, true)
+    }
+
+    /// Decode greedily from the current logits and pass each token to `emit` as soon as the
+    /// GPU selects it, until `emit` returns false or `max_tokens` tokens have gone out.
+    ///
+    /// The previous call must have produced logits. The CPU keeps several steps submitted ahead
+    /// of the GPU, so the GPU never waits for the CPU, and a token reaches `emit` when the step
+    /// that selects it finishes. Steps already submitted when `emit` stops still run.
+    ///
+    /// Return the tokens the sequence gained, in order. They start with every emitted token but
+    /// the last, whose forward pass never runs, and may include tokens past the last emitted
+    /// one.
+    pub fn generate_stream(
+        &mut self,
+        max_tokens: u32,
+        mut emit: impl FnMut(u32) -> bool,
+    ) -> Result<Vec<u32>, Error> {
+        if max_tokens == 0 {
+            return Ok(Vec::new());
+        }
+        let first = self.greedy_token()?;
+        if !emit(first) {
+            return Ok(Vec::new());
+        }
+        // Each step runs one token and selects the next, so the first token needs no step.
+        let steps = (max_tokens - 1).min(self.n_ctx - self.n_past);
+        let start = self.n_past;
+        let n_vocab = self.model.hyperparameters().n_vocab;
+        let mut tickets: [Option<Ticket>; GENERATE_IN_FLIGHT] = [None; GENERATE_IN_FLIGHT];
+        let mut emitting = true;
+        let mut committed = 0;
+        let mut gpu_seconds = 0.0;
+        let mut encode_seconds = 0.0;
+        let mut result = Ok(());
+
+        for step in 0..steps {
+            // The slot's previous step selected the token that goes out next.
+            let slot = to_usize(step) % GENERATE_IN_FLIGHT;
+            if let Some(ticket) = tickets[slot].take() {
+                match self.finish_stream_step(ticket, slot, &mut emit, &mut emitting) {
+                    Ok(seconds) => gpu_seconds += seconds,
+                    Err(error) => {
+                        result = Err(error);
+                        break;
+                    }
+                }
+            }
+            if !emitting {
+                break;
+            }
+
+            let encode_start = Instant::now();
+            if let Err(error) = self.metal.begin() {
+                result = Err(error.into());
+                break;
+            }
+            if let Err(error) = self.record_stream_step(start + step, step == 0, slot, n_vocab) {
+                self.metal.discard();
+                result = Err(error);
+                break;
+            }
+            match self.metal.commit() {
+                Ok(ticket) => tickets[slot] = Some(ticket),
+                Err(error) => {
+                    result = Err(error.into());
+                    break;
+                }
+            }
+            committed += 1;
+            encode_seconds += encode_start.elapsed().as_secs_f64();
+        }
+
+        // Finish the steps still in flight in submission order, which is the order of their
+        // tokens.
+        for offset in 0..GENERATE_IN_FLIGHT {
+            let slot = (to_usize(committed) + offset) % GENERATE_IN_FLIGHT;
+            let Some(ticket) = tickets[slot].take() else {
+                continue;
+            };
+            match self.finish_stream_step(ticket, slot, &mut emit, &mut emitting) {
+                Ok(seconds) => gpu_seconds += seconds,
+                Err(error) => {
+                    if result.is_ok() {
+                        result = Err(error);
+                    }
+                }
+            }
+        }
+        self.n_past += committed;
+        self.last_encode_seconds = encode_seconds;
+        self.last_gpu_seconds = gpu_seconds;
+        result?;
+
+        let mut gained = vec![0; to_usize(committed)];
+        self.metal.read(self.buffers.token(start), &mut gained)?;
+        Ok(gained)
+    }
+
+    /// Wait for the stream step with `ticket` and pass the token it selected into `slot` to
+    /// `emit` while `emitting` holds. Return the GPU seconds the wait covered.
+    fn finish_stream_step(
+        &mut self,
+        ticket: Ticket,
+        slot: usize,
+        emit: &mut impl FnMut(u32) -> bool,
+        emitting: &mut bool,
+    ) -> Result<f64, Error> {
+        let seconds = self.metal.wait(ticket)?;
+        if *emitting {
+            let token = self.metal.read_readback(&self.readback, slot)?;
+            *emitting = emit(token);
+        }
+        Ok(seconds)
+    }
+
+    /// Record the stream step at position `pos`: run the token there and select the next into
+    /// the token buffer and readback `slot`. The first step also selects its own token from the
+    /// current logits.
+    fn record_stream_step(
+        &mut self,
+        pos: u32,
+        first: bool,
+        slot: usize,
+        n_vocab: u32,
+    ) -> Result<(), Error> {
+        if first {
+            self.metal.argmax(
+                self.buffers.logits.floats(0),
+                self.buffers.token(pos),
+                n_vocab,
+            )?;
+            self.metal.barrier();
+        }
+        self.recorder().record_step(pos, true, false)?;
+        self.metal.barrier();
+        // The last position of the context has no next slot in the token buffer.
+        let next = if pos + 1 < self.n_ctx {
+            self.buffers.token(pos + 1)
+        } else {
+            self.buffers.greedy_token.at(0)
+        };
+        self.metal.argmax_readback(
+            self.buffers.logits.floats(0),
+            next,
+            &mut self.readback,
+            slot,
+            n_vocab,
+        )?;
+        Ok(())
     }
 
     fn generate_inner(&mut self, out: &mut [u32], select_next: bool) -> Result<(), Error> {

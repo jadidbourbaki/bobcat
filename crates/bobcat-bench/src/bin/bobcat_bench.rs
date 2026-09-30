@@ -191,11 +191,23 @@ fn run(options: &Options) -> Result<(), bobcat::Error> {
             let start = Instant::now();
             gpu.prefill(&prompt, None, None)?;
             let mut emissions = Vec::new();
-            generated[0] = gpu.greedy_token()?;
-            emissions.push(start.elapsed().as_secs_f64() * 1e3);
-            for chunk in generated[1..].chunks_mut(options.stream_chunk as usize) {
-                gpu.generate_next(chunk)?;
+            if options.stream_chunk == 1 {
+                // Each token goes out as soon as the step that selects it finishes, with later
+                // steps already submitted.
+                let mut emitted = 0;
+                gpu.generate_stream(options.generate, |token| {
+                    generated[emitted] = token;
+                    emitted += 1;
+                    emissions.push(start.elapsed().as_secs_f64() * 1e3);
+                    true
+                })?;
+            } else {
+                generated[0] = gpu.greedy_token()?;
                 emissions.push(start.elapsed().as_secs_f64() * 1e3);
+                for chunk in generated[1..].chunks_mut(options.stream_chunk as usize) {
+                    gpu.generate_next(chunk)?;
+                    emissions.push(start.elapsed().as_secs_f64() * 1e3);
+                }
             }
             if rep > 0 {
                 let ttft = emissions[0];

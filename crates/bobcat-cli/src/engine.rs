@@ -17,11 +17,6 @@ use crate::Error;
 use crate::sampler::Sampler;
 use crate::tools::{self, ToolCall};
 
-/// Decode this many tokens per GPU call after the first token, which decodes alone so the reply
-/// starts to show at once. Each call pipelines its steps, and text streams out after each call,
-/// so the count trades pipelining against output latency.
-const DECODE_CHUNK: usize = 8;
-
 /// The part of a reply a piece of text belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Part {
@@ -352,25 +347,30 @@ impl<'a> Engine<'a> {
         let mut remaining = request.max_tokens.min(room);
         let mut finish = None;
         if request.sampler.is_greedy() {
-            // The GPU picks each most likely token itself, several steps ahead of the CPU. The
-            // GPU also runs each token it picks, including tokens after the stop token in the
-            // same chunk.
+            // The GPU picks each most likely token itself, several steps ahead of the CPU, and
+            // each token streams out as soon as its step finishes. The steps already submitted
+            // when the reply ends still run, and their tokens join the consumed history.
             self.gpu.prefill(&tokens[start..], None, None)?;
             self.consumed = tokens;
-            let mut chunk = [0; DECODE_CHUNK];
-            let mut count = 1;
-            'decode: while remaining > 0 {
-                count = count.min(remaining);
-                self.gpu.generate(&mut chunk[..count])?;
-                self.consumed.extend_from_slice(&chunk[..count]);
-                remaining -= count;
-                for &token in &chunk[..count] {
-                    finish = reader.accept(token, cancel, &mut emit)?;
-                    if finish.is_some() {
-                        break 'decode;
-                    }
-                }
-                count = DECODE_CHUNK;
+            let mut failure = None;
+            let gained =
+                self.gpu
+                    .generate_stream(u32::try_from(remaining)?, |token| {
+                        match reader.accept(token, cancel, &mut emit) {
+                            Ok(None) => true,
+                            Ok(Some(reason)) => {
+                                finish = Some(reason);
+                                false
+                            }
+                            Err(error) => {
+                                failure = Some(error);
+                                false
+                            }
+                        }
+                    })?;
+            self.consumed.extend_from_slice(&gained);
+            if let Some(error) = failure {
+                return Err(error);
             }
         } else {
             // Sampling reads each step's logits on the CPU before the next step can start.

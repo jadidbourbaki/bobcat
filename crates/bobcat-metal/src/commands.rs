@@ -339,6 +339,19 @@ impl Commands {
         !self.pending.is_empty()
     }
 
+    /// Return the ticket that the open command buffer receives when it commits.
+    pub(super) fn recording_ticket(&self) -> Result<Ticket, Error> {
+        if self.recording.is_none() {
+            return Err(Error::NotRecording);
+        }
+        Ok(Ticket(self.committed + 1))
+    }
+
+    /// Report whether a wait has seen the command buffer with `ticket` finish.
+    pub(super) fn finished(&self, ticket: Ticket) -> bool {
+        self.completed >= ticket.0
+    }
+
     pub(super) fn launch(
         &mut self,
         pipeline: &ProtocolObject<dyn MTLComputePipelineState>,

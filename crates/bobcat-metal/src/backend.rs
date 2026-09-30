@@ -196,6 +196,17 @@ impl Buffer {
     }
 }
 
+/// Token slots the CPU reads while later command buffers still run.
+///
+/// Only [`Metal::argmax_readback`] writes a slot, and each slot remembers the command buffer
+/// that last wrote it. [`Metal::read_readback`] reads a slot once a wait has seen that command
+/// buffer finish, so no command buffer in flight writes the slot during the read.
+#[derive(Debug)]
+pub struct Readback {
+    buffer: Buffer,
+    writers: Vec<Option<Ticket>>,
+}
+
 /// A position inside a [`Buffer`].
 #[derive(Debug, Clone, Copy)]
 pub struct View<'a> {
@@ -830,12 +841,18 @@ impl Metal {
     /// Return the CPU address of `bytes` bytes at `view` after checking that the CPU may touch
     /// them.
     fn cpu_access(&self, view: View<'_>, bytes: usize) -> Result<NonNull<u8>, Error> {
+        if self.commands.busy() {
+            return Err(Error::Busy);
+        }
+        self.cpu_address(view, bytes)
+    }
+
+    /// Return the CPU address of `bytes` bytes at `view` after checking that they lie inside a
+    /// buffer of this device. The caller checks that no command buffer in flight writes them.
+    fn cpu_address(&self, view: View<'_>, bytes: usize) -> Result<NonNull<u8>, Error> {
         let buffer = view.buffer;
         if buffer.owner != self.id {
             return Err(Error::ForeignBuffer);
-        }
-        if self.commands.busy() {
-            return Err(Error::Busy);
         }
         let access = Error::Access {
             offset: view.offset,
@@ -1493,10 +1510,78 @@ impl Metal {
     /// Record a store at `out`, one 32-bit integer, of the index of the largest of the `n`
     /// floats at `x`. Ties go to the lowest index.
     pub fn argmax(&mut self, x: View<'_>, out: View<'_>, n: u32) -> Result<(), Error> {
+        // The kernel writes its result to two places, and here both are `out`.
+        self.argmax_into(x, out, out, n)
+    }
+
+    /// Record the index of the largest of the `n` floats at `x` into `out` and into `slot` of
+    /// `readback`, which [`Metal::read_readback`] reads once this command buffer finishes.
+    pub fn argmax_readback(
+        &mut self,
+        x: View<'_>,
+        out: View<'_>,
+        readback: &mut Readback,
+        slot: usize,
+        n: u32,
+    ) -> Result<(), Error> {
+        let ticket = self.commands.recording_ticket()?;
+        let writer = readback.writers.get_mut(slot).ok_or(Error::Access {
+            offset: slot * size_of::<u32>(),
+            needed: size_of::<u32>(),
+            len: readback.buffer.len,
+        })?;
+        // A discarded command buffer leaves a stale writer behind. Its slot then reads a token
+        // from an earlier step, and the read still races no GPU write.
+        *writer = Some(ticket);
+        let copy = readback.buffer.at(slot * size_of::<u32>());
+        self.argmax_into(x, out, copy, n)
+    }
+
+    /// Return the token in `slot` of `readback`, which the last [`Metal::argmax_readback`] into it
+    /// wrote.
+    pub fn read_readback(&self, readback: &Readback, slot: usize) -> Result<u32, Error> {
+        let Some(Some(writer)) = readback.writers.get(slot).copied() else {
+            return Err(Error::Access {
+                offset: slot * size_of::<u32>(),
+                needed: size_of::<u32>(),
+                len: readback.buffer.len,
+            });
+        };
+        if !self.commands.finished(writer) {
+            return Err(Error::Busy);
+        }
+        let source = self.cpu_address(
+            readback.buffer.at(slot * size_of::<u32>()),
+            size_of::<u32>(),
+        )?;
+        // SAFETY: `cpu_address` checked that the four bytes at `source` lie inside the buffer.
+        // Only `argmax_readback` binds the readback buffer, and it records each command buffer
+        // that writes the slot. That command buffer finished, and any later writer would have
+        // replaced it, so no command buffer in flight writes these bytes.
+        let bits = unsafe { source.cast::<u32>().read_unaligned() };
+        Ok(bits)
+    }
+
+    /// Return readback storage of `slots` token slots.
+    pub fn new_readback(&self, slots: usize) -> Result<Readback, Error> {
+        Ok(Readback {
+            buffer: self.new_buffer(slots.max(1) * size_of::<u32>())?,
+            writers: vec![None; slots],
+        })
+    }
+
+    fn argmax_into(
+        &mut self,
+        x: View<'_>,
+        out: View<'_>,
+        copy: View<'_>,
+        n: u32,
+    ) -> Result<(), Error> {
         let args = [
             buffer(x, product(&[to_usize(n), FLOAT_BYTES])),
             buffer(out, size_of::<u32>()),
             Arg::U32(n),
+            buffer(copy, size_of::<u32>()),
         ];
         self.launch(&Launch {
             kernel: Kernel::Argmax,
