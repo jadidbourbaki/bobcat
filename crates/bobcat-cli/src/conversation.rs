@@ -1,260 +1,81 @@
-//! A conversation with a model: the chat template, the tokenizer, and the messages so far.
+//! A conversation in the terminal: the messages so far on top of an [`Engine`].
 
-use bobcat::metal::Metal;
-use bobcat::{Lfm2Metal, Model};
-use minijinja::{Environment, Value, context};
-use tokenizers::Tokenizer;
+use std::sync::atomic::AtomicBool;
 
 use crate::Error;
+use crate::engine::{Engine, Event, Message, Reply, Request, Role};
 use crate::sampler::Sampler;
-
-/// Decode this many tokens per GPU call after the first token, which decodes alone so the reply
-/// starts to show at once. Each call pipelines its steps, and text streams out after each call,
-/// so the count trades pipelining against output latency.
-const DECODE_CHUNK: usize = 8;
-
-/// The part of a reply a piece of text belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Part {
-    /// The model's reasoning before its answer.
-    Thinking,
-    /// The answer itself.
-    Answer,
-}
-
-/// The limits of a conversation.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Limits {
-    /// The most tokens in one reply.
-    pub(crate) max_tokens: usize,
-    /// The most tokens in the whole conversation.
-    pub(crate) context: u32,
-}
 
 /// A conversation with a model on the Metal GPU.
 pub(crate) struct Conversation<'a> {
-    model: &'a Model,
-    gpu: Lfm2Metal<'a>,
-    /// The tokens the GPU state has run, in order.
-    consumed: Vec<u32>,
-    tokenizer: &'a Tokenizer,
-    template: Environment<'static>,
-    bos_token: String,
-    stop_token: u32,
-    think_open: Option<u32>,
-    think_close: Option<u32>,
-    /// Every message so far.
-    messages: Vec<Value>,
-    limits: Limits,
+    engine: Engine<'a>,
+    /// Every message so far, starting with the system message when there is one.
+    messages: Vec<Message>,
     sampler: Sampler,
+    max_tokens: usize,
 }
 
 impl<'a> Conversation<'a> {
-    /// Start a conversation with `model` on `metal`, opened by the system message `system` when
-    /// given, whose replies `sampler` chooses.
+    /// Start a conversation on `engine`, opened by the system message `system` when given, whose
+    /// replies `sampler` chooses and hold at most `max_tokens` tokens.
     pub(crate) fn new(
-        model: &'a Model,
-        metal: &'a mut Metal,
-        tokenizer: &'a Tokenizer,
+        engine: Engine<'a>,
         system: Option<&str>,
-        limits: Limits,
         sampler: Sampler,
-    ) -> Result<Self, Error> {
-        let gguf = model.gguf();
-        let source = gguf
-            .string("tokenizer.chat_template")
-            .ok_or("the model file holds no chat template")?;
-        let source = std::str::from_utf8(source)?;
-        let stop_token = gguf
-            .u32("tokenizer.ggml.eos_token_id")
-            .ok_or("the model file names no end-of-turn token")?;
-        let bos_token = gguf
-            .u32("tokenizer.ggml.bos_token_id")
-            .and_then(|id| tokenizer.id_to_token(id))
-            .unwrap_or_default();
-
-        let mut template = Environment::new();
-        // Hugging Face renders chat templates with Python's Jinja2, so templates call Python
-        // string and dictionary methods, which pycompat provides.
-        template.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-        template.add_function("raise_exception", |message: String| -> Result<(), _> {
-            Err(minijinja::Error::new(
-                minijinja::ErrorKind::InvalidOperation,
-                message,
-            ))
-        });
-        // The generation tag marks assistant text for training masks in transformers and has no
-        // effect on the rendered text. MiniJinja does not know the tag.
-        let source = source
-            .replace("{%- generation -%}", "")
-            .replace("{%- endgeneration -%}", "");
-        template.add_template_owned("chat", source)?;
-
-        Ok(Self {
-            model,
-            gpu: Lfm2Metal::new(model, metal, limits.context, true)?,
-            consumed: Vec::new(),
-            tokenizer,
-            template,
-            bos_token,
-            stop_token,
-            think_open: tokenizer.token_to_id("<think>"),
-            think_close: tokenizer.token_to_id("</think>"),
-            messages: system
-                .map(|content| context! { role => "system", content => content })
-                .into_iter()
-                .collect(),
-            limits,
+        max_tokens: usize,
+    ) -> Self {
+        let messages = system
+            .map(|text| Message::new(Role::System, text))
+            .into_iter()
+            .collect();
+        Self {
+            engine,
+            messages,
             sampler,
-        })
+            max_tokens,
+        }
     }
 
-    /// Reply to the user message `text`, passing each piece of the reply to `emit` as it decodes.
+    /// Forget every message except the system message.
+    pub(crate) fn clear(&mut self) {
+        self.messages.retain(|message| message.role == Role::System);
+    }
+
+    /// Replace the system message with `text`, or remove it when `text` is empty.
+    pub(crate) fn set_system(&mut self, text: &str) {
+        self.messages.retain(|message| message.role != Role::System);
+        if !text.is_empty() {
+            self.messages.insert(0, Message::new(Role::System, text));
+        }
+    }
+
+    /// Reply to the user message `text`, passing each event to `emit` as it decodes.
     ///
-    /// A failed reply leaves the messages as they were before `text`.
+    /// The reply ends early when `cancel` becomes true. A failed reply leaves the messages as
+    /// they were before `text`.
     pub(crate) fn reply(
         &mut self,
         text: &str,
-        emit: impl FnMut(Part, &str) -> Result<(), Error>,
-    ) -> Result<(), Error> {
-        self.messages
-            .push(context! { role => "user", content => text });
-        let result = self.answer(emit);
-        if result.is_err() {
-            self.messages.pop();
-            // The GPU state may hold part of the failed reply, so the next reply starts over.
-            self.consumed.clear();
+        cancel: &AtomicBool,
+        emit: impl FnMut(Event<'_>) -> Result<(), Error>,
+    ) -> Result<Reply, Error> {
+        self.messages.push(Message::new(Role::User, text));
+        let mut request = Request {
+            messages: &self.messages,
+            tools: &[],
+            sampler: &mut self.sampler,
+            max_tokens: self.max_tokens,
+            stop: &[],
+        };
+        let result = self.engine.generate(&mut request, cancel, emit);
+        match &result {
+            Ok(reply) => self
+                .messages
+                .push(Message::new(Role::Assistant, reply.answer.clone())),
+            Err(_) => {
+                self.messages.pop();
+            }
         }
         result
-    }
-
-    /// Answer the last message, passing each piece of the answer to `emit` as it decodes.
-    ///
-    /// The GPU state keeps the tokens of earlier turns, and a prompt that starts with those
-    /// tokens runs only the tokens that follow them. The template may render earlier turns
-    /// differently once a new turn follows, for example by dropping an earlier answer's thinking.
-    /// LFM2's convolution state cannot rewind to a shared prefix, so such a prompt runs from a
-    /// fresh state.
-    fn answer(
-        &mut self,
-        mut emit: impl FnMut(Part, &str) -> Result<(), Error>,
-    ) -> Result<(), Error> {
-        let prompt = self.template.get_template("chat")?.render(context! {
-            messages => &self.messages,
-            bos_token => &self.bos_token,
-            add_generation_prompt => true,
-        })?;
-        // The template writes the special tokens as text, including the one that begins the
-        // sequence, so the tokenizer adds none of its own.
-        let tokens = self
-            .tokenizer
-            .encode(prompt.as_str(), false)?
-            .get_ids()
-            .to_vec();
-        let prompt_len = u32::try_from(tokens.len())?;
-        if prompt_len >= self.limits.context {
-            return Err(format!(
-                "the conversation holds {prompt_len} tokens, which fills the context of {}",
-                self.limits.context
-            )
-            .into());
-        }
-
-        // Some templates open the reply's thinking in the prompt itself.
-        let mut part = if prompt.ends_with("<think>") {
-            Part::Thinking
-        } else {
-            Part::Answer
-        };
-        let mut thinking = String::new();
-        let mut answer = String::new();
-        let tokenizer = self.tokenizer;
-        let mut decoder = tokenizer.decode_stream(false);
-        let (stop_token, think_open, think_close) =
-            (self.stop_token, self.think_open, self.think_close);
-        // Take one decoded token into the reply and report whether the reply has ended.
-        let mut accept = |token: u32| -> Result<bool, Error> {
-            if token == stop_token {
-                return Ok(true);
-            }
-            if Some(token) == think_open {
-                part = Part::Thinking;
-                return Ok(false);
-            }
-            if Some(token) == think_close {
-                part = Part::Answer;
-                return Ok(false);
-            }
-            let Some(piece) = decoder.step(token)? else {
-                return Ok(false);
-            };
-            let text = match part {
-                Part::Thinking => &mut thinking,
-                Part::Answer => &mut answer,
-            };
-            // The model separates its thinking from its answer with blank lines.
-            let piece = if text.is_empty() {
-                piece.trim_start()
-            } else {
-                &piece
-            };
-            if !piece.is_empty() {
-                text.push_str(piece);
-                emit(part, piece)?;
-            }
-            Ok(false)
-        };
-
-        let start = if !self.consumed.is_empty() && tokens.starts_with(&self.consumed) {
-            self.consumed.len()
-        } else {
-            self.gpu.reset()?;
-            0
-        };
-        let room = (self.limits.context - prompt_len) as usize;
-        let mut remaining = self.limits.max_tokens.min(room);
-        if self.sampler.is_greedy() {
-            // The GPU picks each most likely token itself, several steps ahead of the CPU. The
-            // GPU also runs each token it picks, including tokens after the stop token in the
-            // same chunk.
-            self.gpu.prefill(&tokens[start..], None, None)?;
-            self.consumed = tokens;
-            let mut chunk = [0; DECODE_CHUNK];
-            let mut count = 1;
-            'decode: while remaining > 0 {
-                count = count.min(remaining);
-                self.gpu.generate(&mut chunk[..count])?;
-                self.consumed.extend_from_slice(&chunk[..count]);
-                remaining -= count;
-                for &token in &chunk[..count] {
-                    if accept(token)? {
-                        break 'decode;
-                    }
-                }
-                count = DECODE_CHUNK;
-            }
-        } else {
-            // Sampling reads each step's logits on the CPU before the next step can start.
-            let mut logits = vec![0.0; self.model.hyperparameters().n_vocab as usize];
-            self.gpu
-                .prefill(&tokens[start..], Some(&mut logits), None)?;
-            self.consumed = tokens;
-            while remaining > 0 {
-                let token = self.sampler.sample(&mut logits, &self.consumed);
-                remaining -= 1;
-                if accept(token)? || remaining == 0 {
-                    break;
-                }
-                self.gpu.step(token, Some(&mut logits), None)?;
-                self.consumed.push(token);
-            }
-        }
-
-        self.messages.push(context! {
-            role => "assistant",
-            content => answer.trim_end(),
-            thinking => thinking.trim_end(),
-        });
-        Ok(())
     }
 }

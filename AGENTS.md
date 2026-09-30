@@ -98,7 +98,7 @@ crates/
     src/lfm2.rs           LFM2 on the CPU with the scalar ops
     src/lfm2_metal.rs     LFM2 on the Metal GPU
     tests/                reference and kernel tests
-  bobcat-cli/              the bobcat command: respond, chat, pull, list, and rm
+  bobcat-cli/              the bobcat command: respond, chat, serve, pull, list, and rm
   bobcat-bench/            bobcat-bench, bobcat-matmul-bench, gpu-bw, and cpu-bw programs
 docs/design.md             the design and the research plan
 tools/                     Python reference dumps and benchmark scripts

@@ -10,11 +10,14 @@ license = "MIT"
 repository = "https://github.com/jadidbourbaki/bobcat"
 
 [workspace.dependencies]
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
 block2 = { version = "0.6.2", default-features = false, features = ["std"] }
 bobcat = { path = "crates/bobcat" }
 bobcat-gguf = { path = "crates/bobcat-gguf" }
 bobcat-metal = { path = "crates/bobcat-metal" }
-clap = { version = "4.6.7", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
+clap_complete = { version = "4.6.11" }
+ctrlc = { version = "3.5.2" }
 fastrand = { version = "2.5.0" }
 half = { version = "2.7.1", default-features = false }
 hf-hub = { version = "1.0.0", features = ["blocking"] }
@@ -60,8 +63,11 @@ objc2-metal = { version = "0.3.2", default-features = false, features = [
   "MTLTypes",
 ] }
 rustyline = { version = "18.0.1", default-features = false }
+serde_json = { version = "1.0.151" }
 thiserror = { version = "2.0.21" }
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
+tokio = { version = "1.53.1", default-features = false, features = ["net", "rt", "sync"] }
+tokio-stream = { version = "0.1.19", default-features = false }
 
 [workspace.lints.rust]
 unreachable_pub = "warn"
