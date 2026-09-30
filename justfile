@@ -68,6 +68,10 @@ bench-latency model="models/LFM2.5-2.6B-Q4_K_M.gguf":
     cargo build --release --locked -p bobcat-bench
     target/release/bobcat-bench --latency --reps 20 {{model}}
 
+# Measure warmed MLX latency with the same pre-tokenized prompt and output count.
+bench-mlx-latency model="models/LFM2.5-2.6B-MLX-4bit" prompt="512" generate="128" reps="5":
+    cd tools && uv run mlx_latency.py "../{{model}}" --prompt {{prompt}} --generate {{generate}} --reps {{reps}}
+
 # Measure warmed llama.cpp latency with the same prompt token, batch, and half KV cache.
 bench-llama-latency model="models/LFM2.5-2.6B-Q4_K_M.gguf" prompt="512" generate="128" reps="5":
     mkdir -p target
