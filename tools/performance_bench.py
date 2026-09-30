@@ -1,15 +1,16 @@
-"""Measure prompt and generation throughput of bobcat and four baseline engines.
+"""Measure the time to first token and the time per output token of bobcat and six baselines.
 
 Usage:
 
     uv run python performance_bench.py --out ../docs/performance/lfm2.5-2.6b.csv
 
-Every engine runs through its own benchmark tool with llama-bench's tests: pp512, the rate of
-processing a 512-token prompt, and tg128, the rate of generating 128 tokens after that prompt.
-The GGUF engines read the same `LFM2.5-2.6B-Q4_K_M.gguf`, and mlx-lm reads Liquid AI's 4-bit
-MLX weights. Each round runs every engine once, after the tool's own warmup, and the order
-rotates between rounds, so background load falls on every engine alike. The script writes one
-CSV row per engine and round, and writes the machine description next to the CSV.
+Every engine runs LFM2.5-2.6B on a 512-token prompt and then generates 128 tokens greedily.
+bobcat, llama.cpp, and mlx-lm run through matched streaming harnesses. ExecuTorch and Cactus
+run through their harnesses in tools/. mistral.rs and candle run through their own benchmark
+tools. Each round runs every engine once, after the tool's own warmup, and the order rotates
+between rounds, so background load falls on every engine alike. The script writes one CSV row
+per engine and round, and writes the machine description next to the CSV. `eval.md` in the
+output directory describes each engine's weights and timing.
 """
 
 from __future__ import annotations
@@ -27,14 +28,19 @@ from pathlib import Path
 from pydantic import BaseModel, PositiveFloat, PositiveInt
 
 ROOT = Path(__file__).resolve().parent.parent
-GGUF = ROOT / "models/LFM2.5-2.6B-Q4_K_M.gguf"
+TOOLS = ROOT / "tools"
+GGUF = ROOT / "models/LFM2.5-2.6B-QAD-Q4_0.gguf"
 MLX = ROOT / "models/LFM2.5-2.6B-MLX-4bit"
+EXECUTORCH = ROOT / "bench/executorch"
+EXECUTORCH_MODEL = EXECUTORCH / "lfm2_5_2_6b_mlx_4w.pte"
+CACTUS = ROOT / "bench/cactus"
+CACTUS_LIBRARY = CACTUS / "cactus-engine/build/libcactus_engine.dylib"
+CACTUS_BUNDLE = CACTUS / "weights/lfm2.5-2.6b-cq4"
 PROMPT_TOKENS = 512
 GENERATED_TOKENS = 128
-MISTRALRS_RATE = re.compile(r"^│\s*(TTFT|Decode) \(.*?┆\s*([\d.]+) ±", re.MULTILINE)
-# bobcat-bench and candle_bench.py print their rates in the same form.
-PREFILL_DECODE_RATE = re.compile(r"^(prefill|decode)\s+([\d.]+) ±", re.MULTILINE)
-MLX_RATE = re.compile(r"prompt_tps=([\d.]+), generation_tps=([\d.]+)")
+MISTRALRS_TTFT = re.compile(r"┆\s*([\d.]+) ms TTFT")
+MISTRALRS_TPOT = re.compile(r"┆\s*([\d.]+) ms TPOT")
+CANDLE_RATE = re.compile(r"^(prefill|decode)\s+([\d.]+) ±", re.MULTILINE)
 
 
 class Run(BaseModel):
@@ -43,8 +49,16 @@ class Run(BaseModel):
     engine: str
     version: str
     run: PositiveInt
-    pp512_tok_s: PositiveFloat
-    tg128_tok_s: PositiveFloat
+    ttft_ms: PositiveFloat
+    tpot_ms: PositiveFloat
+
+
+class LatencyRow(BaseModel):
+    """A row of the latency CSV that the streaming harnesses print."""
+
+    engine: str
+    ttft_ms: PositiveFloat
+    tpot_ms: PositiveFloat
 
 
 @dataclass(frozen=True)
@@ -65,78 +79,87 @@ def git_version(path: Path) -> str:
     return output(["git", "-C", str(path), "rev-parse", "--short", "HEAD"]).strip()
 
 
-def matches(pattern: re.Pattern[str], text: str, command: str) -> dict[str, float]:
-    found = {label: float(value) for label, value in pattern.findall(text)}
-    if len(found) != 2:
-        raise RuntimeError(f"unexpected output from {command}:\n{text}")
-    return found
+def latency(command: list[str], engine: str, cwd: Path = ROOT) -> tuple[float, float]:
+    """Run a harness that prints the latency CSV for one run and return its TTFT and TPOT."""
+    rows = [
+        LatencyRow.model_validate(row)
+        for row in csv.DictReader(io.StringIO(output(command, cwd)))
+        if row.get("engine") == engine
+    ]
+    if len(rows) != 1:
+        raise RuntimeError(f"expected one {engine} row from {command}")
+    return rows[0].ttft_ms, rows[0].tpot_ms
 
 
 def bobcat() -> tuple[float, float]:
-    text = output(
-        [
-            "target/release/bobcat-bench",
-            "-r",
-            "1",
-            "-p",
-            str(PROMPT_TOKENS),
-            "-n",
-            str(GENERATED_TOKENS),
-            str(GGUF),
-        ]
+    return latency(
+        ["target/release/bobcat-bench", "--latency", "--latency-only", "-r", "1", str(GGUF)],
+        "bobcat",
     )
-    rates = matches(PREFILL_DECODE_RATE, text, "bobcat-bench")
-    return rates["prefill"], rates["decode"]
-
-
-def llama_rate(test: list[str]) -> float:
-    text = output(
-        [
-            "bench/llama.cpp/build-metal/bin/llama-bench",
-            "-m",
-            str(GGUF),
-            *test,
-            "-r",
-            "1",
-            "-o",
-            "csv",
-        ]
-    )
-    rows = list(csv.DictReader(io.StringIO(text)))
-    if len(rows) != 1:
-        raise RuntimeError(f"unexpected output from llama-bench:\n{text}")
-    return float(rows[0]["avg_ts"])
 
 
 def llama_cpp() -> tuple[float, float]:
-    prompt = llama_rate(["-p", str(PROMPT_TOKENS), "-n", "0"])
-    generation = llama_rate(["-p", "0", "-n", str(GENERATED_TOKENS), "-d", str(PROMPT_TOKENS)])
-    return prompt, generation
+    return latency(
+        ["target/llama-latency", str(GGUF), str(PROMPT_TOKENS), str(GENERATED_TOKENS), "1"],
+        "llama.cpp",
+    )
 
 
 def mlx_lm() -> tuple[float, float]:
-    text = output(
+    return latency(
         [
             "uv",
             "run",
-            "python",
-            "-m",
-            "mlx_lm.benchmark",
-            "--model",
+            "mlx_latency.py",
             str(MLX),
-            "-p",
+            "--prompt",
             str(PROMPT_TOKENS),
-            "-g",
+            "--generate",
             str(GENERATED_TOKENS),
-            "-n",
+            "--reps",
             "1",
         ],
-        cwd=ROOT / "tools",
+        "mlx-lm",
+        TOOLS,
     )
-    found = MLX_RATE.search(text)
-    if found is None:
-        raise RuntimeError(f"unexpected output from mlx_lm.benchmark:\n{text}")
-    return float(found[1]), float(found[2])
+
+
+def executorch() -> tuple[float, float]:
+    return latency(
+        [
+            str(EXECUTORCH / ".venv/bin/python"),
+            "executorch_latency.py",
+            str(EXECUTORCH_MODEL),
+            "--prompt",
+            str(PROMPT_TOKENS),
+            "--generate",
+            str(GENERATED_TOKENS),
+            "--reps",
+            "1",
+        ],
+        "executorch",
+        TOOLS,
+    )
+
+
+def cactus() -> tuple[float, float]:
+    return latency(
+        [
+            "uv",
+            "run",
+            "cactus_latency.py",
+            str(CACTUS_LIBRARY),
+            str(CACTUS_BUNDLE),
+            "--prompt",
+            str(PROMPT_TOKENS),
+            "--generate",
+            str(GENERATED_TOKENS),
+            "--reps",
+            "1",
+        ],
+        "cactus",
+        TOOLS,
+    )
 
 
 def mistral_rs() -> tuple[float, float]:
@@ -158,8 +181,11 @@ def mistral_rs() -> tuple[float, float]:
             "1",
         ]
     )
-    rates = matches(MISTRALRS_RATE, text, "mistralrs bench")
-    return rates["TTFT"], rates["Decode"]
+    ttft = MISTRALRS_TTFT.search(text)
+    tpot = MISTRALRS_TPOT.search(text)
+    if ttft is None or tpot is None:
+        raise RuntimeError(f"unexpected output from mistralrs bench:\n{text}")
+    return float(ttft[1]), float(tpot[1])
 
 
 def candle() -> tuple[float, float]:
@@ -182,17 +208,13 @@ def candle() -> tuple[float, float]:
             "--reps",
             "1",
         ],
-        cwd=ROOT / "tools",
+        TOOLS,
     )
-    rates = matches(PREFILL_DECODE_RATE, text, "candle_bench.py")
-    return rates["prefill"], rates["decode"]
-
-
-def mlx_version() -> str:
-    return output(
-        ["uv", "run", "python", "-c", "import mlx_lm; print(mlx_lm.__version__)"],
-        cwd=ROOT / "tools",
-    ).strip()
+    rates = {label: float(value) for label, value in CANDLE_RATE.findall(text)}
+    if set(rates) != {"prefill", "decode"}:
+        raise RuntimeError(f"unexpected output from candle_bench.py:\n{text}")
+    # candle reports rates, so the prompt's duration stands in for the time to first token.
+    return PROMPT_TOKENS / rates["prefill"] * 1000, 1000 / rates["decode"]
 
 
 def machine() -> str:
@@ -211,17 +233,29 @@ def machine() -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Measure the engines' throughput.")
+    parser = argparse.ArgumentParser(description="Measure the engines' latency.")
     parser.add_argument("--out", required=True, type=Path, help="the CSV to write")
     parser.add_argument("--rounds", type=int, default=5)
     arguments = parser.parse_args()
     out: Path = arguments.out
 
     output(["cargo", "build", "--release", "--locked", "-p", "bobcat-bench"])
+    mlx_version = output(
+        ["uv", "run", "python", "-c", "import mlx_lm; print(mlx_lm.__version__)"], TOOLS
+    ).strip()
+    executorch_version = output(
+        [
+            str(EXECUTORCH / ".venv/bin/python"),
+            "-c",
+            "import executorch.version; print(executorch.version.__version__)",
+        ]
+    ).strip()
     engines = [
         Engine("bobcat", git_version(ROOT), bobcat),
+        Engine("mlx-lm", mlx_version, mlx_lm),
         Engine("llama.cpp", git_version(ROOT / "bench/llama.cpp"), llama_cpp),
-        Engine("mlx-lm", mlx_version(), mlx_lm),
+        Engine("ExecuTorch", executorch_version, executorch),
+        Engine("Cactus", git_version(CACTUS), cactus),
         Engine("mistral.rs", git_version(ROOT / "bench/mistral.rs"), mistral_rs),
         Engine("candle", git_version(ROOT / "bench/candle"), candle),
     ]
@@ -229,18 +263,17 @@ def main() -> None:
     for round_index in range(arguments.rounds):
         shift = round_index % len(engines)
         for engine in engines[shift:] + engines[:shift]:
-            prompt, generation = engine.measure()
+            ttft_ms, tpot_ms = engine.measure()
             run = Run(
                 engine=engine.name,
                 version=engine.version,
                 run=round_index + 1,
-                pp512_tok_s=prompt,
-                tg128_tok_s=generation,
+                ttft_ms=ttft_ms,
+                tpot_ms=tpot_ms,
             )
             print(run.model_dump_json(), flush=True)
             runs.append(run)
 
-    # Rows follow the engine order, so the figure keeps bobcat first.
     order = {engine.name: index for index, engine in enumerate(engines)}
     runs.sort(key=lambda run: (order[run.engine], run.run))
     out.parent.mkdir(parents=True, exist_ok=True)

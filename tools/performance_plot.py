@@ -4,10 +4,11 @@ Usage:
 
     uv run python performance_plot.py ../docs/performance/lfm2.5-2.6b.csv
 
-`performance_bench.py` writes the CSV, one row per engine and round. The script writes an SVG and
-a PNG next to the CSV, with one panel for prompt processing and one for generation, both in
-tokens per second. Each bar is the median run of an engine, and each red error bar spans the
-slowest to the fastest run. Engines appear in the order of their first row in the CSV.
+`performance_bench.py` writes the CSV, one row per engine and round, with each run's time to first
+token and time per output token. The script writes an SVG and a PNG next to the CSV, with one
+panel for prompt processing and one for generation, both in tokens per second. Each bar is the
+median run of an engine, and each red error bar spans the slowest to the fastest run. bobcat
+comes first, and the other engines follow from the fastest generation to the slowest.
 """
 
 from __future__ import annotations
@@ -49,13 +50,14 @@ matplotlib.rcParams.update(
         "patch.linewidth": 0.8,
     }
 )
-# Two panels of 3.3 inches side by side display at 634 px in a browser. At that panel width the
-# bars stay slim with narrow gaps, and 9 point engine names just fit level under them.
-FIGURE_SIZE_INCHES = (6.6, 2.4)
-ENGINE_FONT_SIZE = 9
+# Two panels of 4.4 inches side by side display at 845 px in a browser, inside a GitHub README
+# column. At that panel width seven engines keep slim bars, and 8 point names fit level under
+# them.
+FIGURE_SIZE_INCHES = (8.8, 2.4)
+ENGINE_FONT_SIZE = 8
 PNG_DPI = 300
-# Each bar fills 0.48 of the space between two engines.
-BAR_WIDTH = 0.48
+# Each bar fills 0.42 of the space between two engines.
+BAR_WIDTH = 0.42
 BAR_EDGE_COLOR = "#000000"
 # bobcat's bars are filled black, and every other engine's bars are open.
 BOBCAT_FACE_COLOR = "#000000"
@@ -66,6 +68,7 @@ SURFACE_COLOR = "#ffffff"
 TEXT_COLOR = "#000000"
 # A solid light grid stays sharp on a screen, where a thin dotted line breaks into uneven pixels.
 GRID_COLOR = "#d9d9d9"
+PROMPT_TOKENS = 512
 METRICS = {
     "pp512_tok_s": "Prompt Processing (tokens/s)",
     "tg128_tok_s": "Generation (tokens/s)",
@@ -73,8 +76,14 @@ METRICS = {
 
 
 def summarize(runs: pl.DataFrame) -> pl.DataFrame:
-    """Return the median, fastest, and slowest run of each metric per engine, in CSV order."""
-    first_row = pl.col("row").min().alias("first_row")
+    """Return the median, slowest, and fastest run of each metric per engine, in figure order."""
+    # A 512-token prompt that takes TTFT milliseconds runs at 512,000 / TTFT tokens per second.
+    prompt_rate = PROMPT_TOKENS * 1000 / pl.col("ttft_ms")
+    generation_rate = 1000 / pl.col("tpot_ms")
+    rates = runs.with_columns(
+        prompt_rate.alias("pp512_tok_s"),
+        generation_rate.alias("tg128_tok_s"),
+    )
     statistics = [
         expression
         for metric in METRICS
@@ -84,10 +93,10 @@ def summarize(runs: pl.DataFrame) -> pl.DataFrame:
             pl.col(metric).max().alias(f"{metric}_max"),
         )
     ]
-    numbered = runs.with_row_index("row")
-    by_engine = numbered.group_by("engine")
-    summary = by_engine.agg(first_row, *statistics)
-    return summary.sort("first_row")
+    by_engine = rates.group_by("engine")
+    summary = by_engine.agg(*statistics)
+    is_other = pl.col("engine") != "bobcat"
+    return summary.sort([is_other, "tg128_tok_s_median"], descending=[False, True])
 
 
 def draw_panel(axes: Axes, summary: pl.DataFrame, metric: str) -> None:
