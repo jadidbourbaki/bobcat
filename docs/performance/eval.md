@@ -24,6 +24,13 @@ and a bf16 embedding table that its pipeline cannot quantize. Cactus read
 bundles in its own 4-bit CQ4 format. Its converter has a profile for
 LFM2.5-8B-A1B and builds the other models with a generic graph.
 
+For Qwen3.5, bobcat, llama.cpp, and mistral.rs read Unsloth's
+`Qwen3.5-*-Q4_K_M.gguf` files, which `bobcat pull qwen3.5:SIZE`
+downloads. mlx-lm read mlx-community's 4-bit weights. ExecuTorch and
+candle have no Qwen3.5 model. Cactus skips Qwen3.5 as well. Its
+converter reads the full-precision release, and the four releases needed
+more disk than the machine had free.
+
 Three engines skip LFM2.5-8B-A1B. ExecuTorch's LFM2 model has no
 mixture-of-experts layers. candle's LFM2 example reads only dense
 models. mistral.rs loads the model but generated about 0.2 tokens per

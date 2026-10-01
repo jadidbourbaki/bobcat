@@ -138,11 +138,19 @@ bobcat pull lfm2.5:2.6b
 bobcat pull lfm2.5:8b
 ```
 
+<p align="center">
+  <img src="docs/performance/qwen3.5-0.8b.svg" alt="Prompt processing and generation throughput on Qwen3.5-0.8B">
+</p>
+
 **[Qwen3.5-0.8B](https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF)**
 
 ```sh
 bobcat pull qwen3.5:0.8b
 ```
+
+<p align="center">
+  <img src="docs/performance/qwen3.5-2b.svg" alt="Prompt processing and generation throughput on Qwen3.5-2B">
+</p>
 
 **[Qwen3.5-2B](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF)**
 
@@ -150,11 +158,19 @@ bobcat pull qwen3.5:0.8b
 bobcat pull qwen3.5:2b
 ```
 
+<p align="center">
+  <img src="docs/performance/qwen3.5-4b.svg" alt="Prompt processing and generation throughput on Qwen3.5-4B">
+</p>
+
 **[Qwen3.5-4B](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF)**
 
 ```sh
 bobcat pull qwen3.5:4b
 ```
+
+<p align="center">
+  <img src="docs/performance/qwen3.5-9b.svg" alt="Prompt processing and generation throughput on Qwen3.5-9B">
+</p>
 
 **[Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)**
 
@@ -178,6 +194,7 @@ echo '{"model": "clef-flash", "state": "Checkout is down.",
 ```
 
 `bobcat serve -m clef-flash-Q8_0.gguf` also answers `POST /v1/systemone`.
+A warm server answers a 300-token decision in 0.88 seconds on an M4 Pro.
 
 bobcat is still in alpha. We are rapidly adding support for more models
 and model families. Please stay tuned!
