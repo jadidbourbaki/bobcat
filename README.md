@@ -96,7 +96,60 @@ OPENAI_API_KEY=bobcat \
 aider --model openai/lfm2.5:2.6b
 ```
 
-## Supported models
+## bobcat ❤️ decision models
+
+Start the server, then ask it typed questions about any input:
+
+```sh
+bobcat serve -m qwen3.5:4b
+```
+
+**[SystemOne](https://modelsystem.one)**
+
+```sh
+curl http://127.0.0.1:8080/v1/systemone -d '{
+  "model": "qwen3.5:4b",
+  "state": "Checkout returns 500 errors and orders are blocked.",
+  "questions": {
+    "team": {"type": "choice", "criteria": {"billing": "Payments", "technical": "Bugs"}},
+    "urgency": {"type": "score", "criteria": ["Can wait", "This week", "Today"]},
+    "outage": {"type": "noul", "instructions": "Is a service down?"}
+  }
+}'
+```
+
+**[TypeSafe SDK](https://pypi.org/project/typesafe-sdk/)**
+
+```python
+from typesafe_sdk import Choice, TypeSafeClient
+
+client = TypeSafeClient(base_url="http://127.0.0.1:8080", api_key="bobcat")
+result = client.system_one(
+    "Checkout returns 500 errors.",
+    {"team": Choice(criteria={"billing": "Payments", "technical": "Bugs"})},
+)
+```
+
+**[SGLang decisions](https://docs.sglang.io/docs/supported-models/decision_models)**
+
+```sh
+curl http://127.0.0.1:8080/v1/decisions -d '{
+  "input": "Checkout returns 500 errors.",
+  "questions": [{"id": "outage", "type": "yes_no", "question": "A service is down."}]
+}'
+```
+
+`/v1/score` takes SGLang's prompt and label token ids for decisions you
+build yourself.
+
+**One decision without a server**
+
+```sh
+bobcat decide -m qwen3.5:4b '{"model": "qwen3.5:4b", "state": "Checkout is down.",
+  "questions": {"outage": {"type": "noul", "instructions": "Is a service down?"}}}'
+```
+
+## Supported language models
 
 <p align="center">
   <img src="docs/performance/lfm2.5-350m.svg" alt="Prompt processing and generation throughput on LFM2.5-350M">
@@ -178,6 +231,11 @@ bobcat pull qwen3.5:4b
 bobcat pull qwen3.5:9b
 ```
 
+## Supported decision models
+
+Every language model above answers decisions, except LFM2.5-2.6B, whose
+chat template always opens a reasoning block before the answer.
+
 **[Clef-Flash](https://huggingface.co/Cloudflare/clef-flash)**
 
 ```sh
@@ -189,12 +247,12 @@ cd tools && uv run python clef_gguf.py --backbone ../clef-flash-backbone.gguf \
 ```
 
 ```sh
-echo '{"model": "clef-flash", "state": "Checkout is down.",
-  "questions": {"outage": {"type": "noul"}}}' | bobcat decide -m clef-flash-Q8_0.gguf
+bobcat serve -m clef-flash-Q8_0.gguf
 ```
 
-`bobcat serve -m clef-flash-Q8_0.gguf` also answers `POST /v1/systemone`.
-A warm server answers a 300-token decision in 0.88 seconds on an M4 Pro.
+Clef-Flash answers `/v1/systemone` and `bobcat decide` with its own
+decision head. A warm server answers a 300-token decision in 0.88
+seconds on an M4 Pro.
 
 bobcat is still in alpha. We are rapidly adding support for more models
 and model families. Please stay tuned!
