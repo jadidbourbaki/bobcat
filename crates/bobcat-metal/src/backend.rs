@@ -92,6 +92,9 @@ pub const GDN_MAX_KERNEL: u32 = 8;
 /// The largest key head of a Gated DeltaNet layer. Must match `GDN_MAX_K_DIM` in
 /// `common.metal`.
 pub const GDN_MAX_K_DIM: u32 = 128;
+/// The state columns, one per simdgroup, of a `gdn_recurrence` threadgroup. Must match
+/// `GDN_COLUMNS` in `common.metal`.
+const GDN_COLUMNS: u32 = 4;
 
 /// Must match `MOE_ROUTE_SIMDGROUPS`, `MOE_ROUTE_TOKENS`, and `MOE_GROUP_SIMDGROUPS` in
 /// `common.metal`.
@@ -221,8 +224,8 @@ pub enum Error {
     NoExperts(Format),
     /// A Gated DeltaNet layer exceeds the kernels' limits.
     #[error(
-        "the DeltaNet kernels need a convolution of 2 to {GDN_MAX_KERNEL} taps, key heads of up \
-         to {GDN_MAX_K_DIM} floats, and value heads of a multiple of 32 floats, got \
+        "the DeltaNet kernels need a convolution of 2 to {GDN_MAX_KERNEL} taps, key heads of a \
+         multiple of 32 floats up to {GDN_MAX_K_DIM}, and value heads of a multiple of 32 floats, got \
          {conv_kernel}, {k_dim}, and {v_dim}"
     )]
     DeltaNetLimits {
@@ -1787,6 +1790,7 @@ impl Metal {
     ) -> Result<(), Error> {
         if shape.k_dim == 0
             || shape.k_dim > GDN_MAX_K_DIM
+            || !shape.k_dim.is_multiple_of(32)
             || shape.v_dim == 0
             || !shape.v_dim.is_multiple_of(32)
             || shape.n_k_heads == 0
@@ -1830,8 +1834,8 @@ impl Metal {
             kernel: Kernel::GdnRecurrence,
             args: &args,
             dispatch: Dispatch::Threadgroups(
-                [to_usize(shape.v_dim / 32), heads, 1],
-                [SIMD_WIDTH, 1, 1],
+                [to_usize(shape.v_dim / GDN_COLUMNS), heads, 1],
+                [SIMD_WIDTH * to_usize(GDN_COLUMNS), 1, 1],
             ),
             n_rows: 0,
             n_cols: 0,

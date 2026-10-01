@@ -101,10 +101,13 @@ gdn_gates (device float *beta [[buffer (0)]],
    their values, and BETA and DECAY hold each token's gates per value
    head.  STATE holds N_V_HEADS matrices of K_DIM rows of V_DIM floats.
 
-   Threadgroup (B, J) of one simdgroup handles columns 32 B onward of the
-   state of value head J, one column per lane.  The columns update
-   independently, so the lanes keep their columns in threadgroup memory
-   for the whole batch and share each token's query and key.  */
+   Each simdgroup handles one column of the state of one value head, as
+   in MLX's gated_delta_kernel.  Lane L keeps rows L, L + 32, and so on
+   of the column in registers for the whole batch, and simd_sum finishes
+   each token's two dot products over the rows.  Threadgroup (B, J) of
+   GDN_COLUMNS simdgroups handles columns GDN_COLUMNS B onward of value
+   head J.  One column per simdgroup gives the 9B model's 32 heads of 128
+   columns 4096 simdgroups, where one column per lane gave 128.  */
 kernel void
 gdn_recurrence (device const float *y [[buffer (0)]],
                 device const float *beta [[buffer (1)]],
@@ -117,54 +120,50 @@ gdn_recurrence (device const float *y [[buffer (0)]],
                 constant uint &v_dim [[buffer (8)]],
                 constant uint &n_tokens [[buffer (9)]],
                 uint2 position [[threadgroup_position_in_grid]],
+                uint simdgroup [[simdgroup_index_in_threadgroup]],
                 uint lane [[thread_index_in_simdgroup]])
 {
-  threadgroup float columns[GDN_MAX_K_DIM * SIMD_WIDTH];
-  threadgroup float query[GDN_MAX_K_DIM];
-  threadgroup float key[GDN_MAX_K_DIM];
-
-  uint column = position.x * SIMD_WIDTH + lane;
+  constexpr uint max_rows = GDN_MAX_K_DIM / SIMD_WIDTH;
+  uint column = position.x * GDN_COLUMNS + simdgroup;
   uint head = position.y;
   uint key_head = head % n_k_heads;
   uint key_dim = n_k_heads * k_dim;
   uint conv_dim = 2 * key_dim + n_v_heads * v_dim;
+  uint n_rows = k_dim / SIMD_WIDTH;
   device float *head_state = state + ulong (head) * k_dim * v_dim;
-  for (uint d = 0; d < k_dim; d++)
-    columns[d * SIMD_WIDTH + lane] = head_state[d * v_dim + column];
+  float rows[max_rows];
+  for (uint i = 0; i < max_rows; i++)
+    rows[i] = i < n_rows ? head_state[(lane + i * SIMD_WIDTH) * v_dim + column]
+                         : 0.0f;
 
   for (uint t = 0; t < n_tokens; t++)
     {
       device const float *token = y + ulong (t) * conv_dim;
-      simdgroup_barrier (mem_flags::mem_threadgroup);
-      for (uint d = lane; d < k_dim; d += SIMD_WIDTH)
-        {
-          query[d] = token[key_head * k_dim + d];
-          key[d] = token[key_dim + key_head * k_dim + d];
-        }
-      simdgroup_barrier (mem_flags::mem_threadgroup);
-
+      device const float *query = token + key_head * k_dim + lane;
+      device const float *key = token + key_dim + key_head * k_dim + lane;
       float token_decay = decay[t * n_v_heads + head];
       float remembered = 0.0f;
-      for (uint d = 0; d < k_dim; d++)
+      for (uint i = 0; i < n_rows; i++)
         {
-          float value = columns[d * SIMD_WIDTH + lane] * token_decay;
-          columns[d * SIMD_WIDTH + lane] = value;
-          remembered += value * key[d];
+          rows[i] *= token_decay;
+          remembered += rows[i] * key[i * SIMD_WIDTH];
         }
+      remembered = simd_sum (remembered);
       float value = token[2 * key_dim + head * v_dim + column];
       float delta = (value - remembered) * beta[t * n_v_heads + head];
       float sum = 0.0f;
-      for (uint d = 0; d < k_dim; d++)
+      for (uint i = 0; i < n_rows; i++)
         {
-          float updated = columns[d * SIMD_WIDTH + lane] + key[d] * delta;
-          columns[d * SIMD_WIDTH + lane] = updated;
-          sum += updated * query[d];
+          rows[i] += key[i * SIMD_WIDTH] * delta;
+          sum += rows[i] * query[i * SIMD_WIDTH];
         }
-      out[ulong (t) * n_v_heads * v_dim + head * v_dim + column] = sum;
+      sum = simd_sum (sum);
+      if (lane == 0)
+        out[ulong (t) * n_v_heads * v_dim + head * v_dim + column] = sum;
     }
 
-  for (uint d = 0; d < k_dim; d++)
-    head_state[d * v_dim + column] = columns[d * SIMD_WIDTH + lane];
+  for (uint i = 0; i < n_rows; i++)
+    head_state[(lane + i * SIMD_WIDTH) * v_dim + column] = rows[i];
 }
 
 /* Multiply each of the N floats at X by SiLU of the matching float at

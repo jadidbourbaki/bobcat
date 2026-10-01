@@ -49,6 +49,9 @@ enum
      against both.  */
   GDN_MAX_KERNEL = 8,
   GDN_MAX_K_DIM = 128,
+  /* The state columns, one per simdgroup, of a gdn_recurrence
+     threadgroup.  */
+  GDN_COLUMNS = 4,
   /* A threadgroup of attention_flash covers FLASH_QUERIES queries of one
      head with four simdgroups of 8 queries each, over FLASH_KEYS keys at
      a time, for heads of FLASH_HEAD_DIM.  */
