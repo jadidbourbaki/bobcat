@@ -43,7 +43,7 @@ pub(crate) struct Options {
 /// Serve `model` with `tokenizer` until the process ends.
 pub(crate) fn run(
     options: &Options,
-    model: bobcat::Model,
+    model: crate::backend::Model,
     tokenizer: tokenizers::Tokenizer,
 ) -> Result<(), Error> {
     // Binding before the model loads reports a busy port at once.
@@ -69,6 +69,7 @@ pub(crate) fn run(
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
+        .route("/v1/systemone", post(systemone))
         .with_state(shared);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -95,6 +96,11 @@ enum Job {
         tools: Vec<Value>,
         settings: Settings,
         updates: channel::UnboundedSender<Update>,
+    },
+    /// Answer a Jev/SystemOne decision request.
+    Decide {
+        request: Value,
+        reply: oneshot::Sender<Result<Value, String>>,
     },
     /// Count the tokens of a prompt.
     Count {
@@ -132,7 +138,7 @@ enum Update {
 
 /// Load `model` onto the GPU, report on `ready`, and answer the jobs on `queue` one at a time.
 fn worker(
-    model: &bobcat::Model,
+    model: &crate::backend::Model,
     tokenizer: &tokenizers::Tokenizer,
     context: u32,
     max_tokens: usize,
@@ -180,6 +186,10 @@ fn worker(
                     .count(&messages, &tools)
                     .map_err(|error| error.to_string());
                 let _ = reply.send(count);
+            }
+            Job::Decide { request, reply } => {
+                let response = engine.decide(&request).map_err(|error| error.to_string());
+                let _ = reply.send(response);
             }
         }
     }
@@ -833,6 +843,31 @@ async fn messages(State(shared): State<Arc<Shared>>, body: Bytes) -> Response {
             }
         }
     })
+}
+
+async fn systemone(State(shared): State<Arc<Shared>>, body: Bytes) -> Response {
+    let request: Value = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(error) => return openai_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
+    if let Err(error) = crate::systemone::validate(&request) {
+        return openai_error(StatusCode::BAD_REQUEST, &error);
+    }
+    let (reply, receiver) = oneshot::channel();
+    if shared.jobs.send(Job::Decide { request, reply }).is_err() {
+        return openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the model worker has stopped",
+        );
+    }
+    match receiver.await {
+        Ok(Ok(response)) => axum::Json(response).into_response(),
+        Ok(Err(error)) => openai_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+        Err(_) => openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the model worker has stopped",
+        ),
+    }
 }
 
 async fn count_tokens(State(shared): State<Arc<Shared>>, body: Bytes) -> Response {

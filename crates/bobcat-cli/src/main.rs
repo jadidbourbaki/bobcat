@@ -13,6 +13,8 @@ use std::process::ExitCode;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 
 #[cfg(target_os = "macos")]
+mod backend;
+#[cfg(target_os = "macos")]
 mod conversation;
 #[cfg(target_os = "macos")]
 mod engine;
@@ -21,6 +23,8 @@ mod models;
 mod sampler;
 #[cfg(target_os = "macos")]
 mod serve;
+#[cfg(target_os = "macos")]
+mod systemone;
 #[cfg(target_os = "macos")]
 mod tokenizer;
 mod tools;
@@ -62,10 +66,20 @@ enum Command {
         #[command(flatten)]
         reply: ReplyOptions,
     },
+    /// Answer a Jev/SystemOne decision request with a Clef model and write the response.
+    ///
+    /// The request is a JSON object with `model`, `state`, and `questions`, given as an argument
+    /// or on standard input.
+    Decide {
+        #[command(flatten)]
+        model: ModelOptions,
+        /// The request.
+        request: Option<String>,
+    },
     /// Answer OpenAI and Anthropic API requests over HTTP, for agents and other tools.
     ///
     /// The server answers `/v1/chat/completions`, `/v1/messages`, `/v1/messages/count_tokens`,
-    /// and `/v1/models`.
+    /// and `/v1/models`. A Clef model also answers Jev/SystemOne decisions at `/v1/systemone`.
     Serve {
         #[command(flatten)]
         model: ModelOptions,
@@ -183,6 +197,7 @@ fn run(command: Command) -> Result<(), Error> {
             prompt,
         } => respond(&model, &reply, think, &prompt.join(" ")),
         Command::Chat { model, reply } => chat(&model, &reply),
+        Command::Decide { model, request } => decide(&model, request.as_deref().unwrap_or("")),
         Command::Serve {
             model,
             host,
@@ -226,6 +241,11 @@ fn chat(_: &ModelOptions, _: &ReplyOptions) -> Result<(), Error> {
 }
 
 #[cfg(not(target_os = "macos"))]
+fn decide(_: &ModelOptions, _: &str) -> Result<(), Error> {
+    Err("bobcat runs models on the Metal GPU, which needs macOS".into())
+}
+
+#[cfg(not(target_os = "macos"))]
 fn serve(_: &ModelOptions, _: SocketAddr, _: usize, _: u32) -> Result<(), Error> {
     Err("bobcat runs models on the Metal GPU, which needs macOS".into())
 }
@@ -250,11 +270,11 @@ fn full_prompt(prompt: &str) -> Result<String, Error> {
 
 /// Load the model and tokenizer that `options` name.
 #[cfg(target_os = "macos")]
-fn load(options: &ModelOptions) -> Result<(bobcat::Model, tokenizers::Tokenizer), Error> {
-    let model = bobcat::Model::load(models::resolve(&options.model)?)?;
+fn load(options: &ModelOptions) -> Result<(backend::Model, tokenizers::Tokenizer), Error> {
+    let model = backend::Model::load(models::resolve(&options.model)?)?;
     let tokenizer = match &options.tokenizer {
         Some(path) => tokenizers::Tokenizer::from_file(path)?,
-        None => tokenizer::from_gguf(model.gguf())?,
+        None => model.tokenizer()?,
     };
     Ok((model, tokenizer))
 }
@@ -263,7 +283,7 @@ fn load(options: &ModelOptions) -> Result<(bobcat::Model, tokenizers::Tokenizer)
 #[cfg(target_os = "macos")]
 fn start<'a>(
     options: &ReplyOptions,
-    model: &'a bobcat::Model,
+    model: &'a backend::Model,
     metal: &'a mut bobcat::metal::Metal,
     tokenizer: &'a tokenizers::Tokenizer,
 ) -> Result<conversation::Conversation<'a>, Error> {
@@ -354,6 +374,21 @@ fn respond(
     if options.verbose {
         report(&reply)?;
     }
+    Ok(())
+}
+
+/// Answer the decision `request`, or the request on stdin, and write the response to stdout.
+#[cfg(target_os = "macos")]
+fn decide(model_options: &ModelOptions, request: &str) -> Result<(), Error> {
+    let text = full_prompt(request)?;
+    let request: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| format!("the request is not JSON: {error}"))?;
+    let (model, tokenizer) = load(model_options)?;
+    let mut metal = bobcat::metal::Metal::open()?;
+    let context = u32::try_from(systemone::MAX_TOKENS)?;
+    let mut engine = engine::Engine::new(&model, &mut metal, &tokenizer, context)?;
+    let response = engine.decide(&request)?;
+    writeln!(io::stdout(), "{response:#}")?;
     Ok(())
 }
 

@@ -16,7 +16,8 @@ use bobcat_gguf::Gguf;
 
 use crate::error::Error;
 use crate::lfm2::{
-    Matrix, Trace, Vector, require_f32, require_matrix, require_u32, require_vector, to_usize,
+    Matrix, Sampling, Trace, Vector, require_f32, require_matrix, require_u32, require_vector,
+    to_usize,
 };
 use crate::scalar;
 use crate::storage::Storage;
@@ -241,6 +242,20 @@ impl Model {
     /// Return the parsed model file, whose metadata holds the tokenizer and the chat template.
     pub fn gguf(&self) -> &Gguf<impl AsRef<[u8]>> {
         &self.gguf
+    }
+
+    /// Return the sampling settings for this model: the values the file stores under
+    /// `general.sampling`, then the values Qwen's Qwen3.5 model cards recommend for thinking on
+    /// text. bobcat has no presence penalty, so the repeat penalty stays off as the cards set it.
+    pub fn recommended_sampling(&self) -> Sampling {
+        let gguf = &self.gguf;
+        Sampling {
+            temperature: gguf.f32("general.sampling.temp").unwrap_or(1.0),
+            top_k: gguf.u32("general.sampling.top_k").unwrap_or(20),
+            top_p: gguf.f32("general.sampling.top_p").unwrap_or(0.95),
+            min_p: gguf.f32("general.sampling.min_p").unwrap_or(0.0),
+            repeat_penalty: gguf.f32("general.sampling.penalty_repeat").unwrap_or(1.0),
+        }
     }
 
     /// Return a zeroed trace of `n_tokens` tokens of this model.

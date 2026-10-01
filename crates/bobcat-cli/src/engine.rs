@@ -8,13 +8,15 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use bobcat::clef::Head;
 use bobcat::metal::Metal;
-use bobcat::{Checkpoint, Lfm2Metal, Model};
 use minijinja::{Environment, context};
 use tokenizers::Tokenizer;
 
 use crate::Error;
+use crate::backend::{Checkpoint, Gpu, Model};
 use crate::sampler::Sampler;
+use crate::systemone;
 use crate::tools::{self, ToolCall};
 
 /// The part of a reply a piece of text belongs to.
@@ -121,7 +123,7 @@ pub(crate) struct Request<'r> {
 /// A model on the Metal GPU.
 pub(crate) struct Engine<'a> {
     model: &'a Model,
-    gpu: Lfm2Metal<'a>,
+    gpu: Gpu<'a>,
     /// The tokens the GPU state has run, in order.
     consumed: Vec<u32>,
     /// The GPU state after the latest prompt's history, before the turn of the reply, with the
@@ -133,11 +135,17 @@ pub(crate) struct Engine<'a> {
     bos_token: String,
     context: u32,
     special: Special,
+    calls: CallFormat,
+    /// The decision head of a Clef model.
+    head: Option<Head>,
 }
 
 /// The ids of the tokens that change how the engine reads the model's output.
 struct Special {
     stop: u32,
+    /// The token that ends a document in pretraining. Clef ends its replies with the token in
+    /// place of the end-of-turn token its file names.
+    end_of_text: Option<u32>,
     think_open: Option<u32>,
     think_close: Option<u32>,
     call_open: Option<u32>,
@@ -145,9 +153,29 @@ struct Special {
     turn_open: Option<u32>,
 }
 
-/// The tokens that wrap a tool call in LFM2's output.
-const CALL_OPEN: &str = "<|tool_call_start|>";
-const CALL_CLOSE: &str = "<|tool_call_end|>";
+/// How a model's output wraps and writes tool calls.
+#[derive(Debug, Clone, Copy)]
+struct CallFormat {
+    open: &'static str,
+    close: &'static str,
+    /// Whether each call is a `<function=NAME>` block between its own tags, as Qwen3.5 writes
+    /// calls. LFM2 writes a Python list of calls between one pair of tokens.
+    tagged: bool,
+}
+
+/// LFM2's tool call tokens, which wrap a Python list of calls.
+const LFM2_CALLS: CallFormat = CallFormat {
+    open: "<|tool_call_start|>",
+    close: "<|tool_call_end|>",
+    tagged: false,
+};
+
+/// Qwen3.5's tool call tags, which wrap one `<function=NAME>` block each.
+const QWEN_CALLS: CallFormat = CallFormat {
+    open: "<tool_call>",
+    close: "</tool_call>",
+    tagged: true,
+};
 
 impl<'a> Engine<'a> {
     /// Load `model` onto `metal` for conversations of up to `context` tokens.
@@ -157,16 +185,15 @@ impl<'a> Engine<'a> {
         tokenizer: &'a Tokenizer,
         context: u32,
     ) -> Result<Self, Error> {
-        let gguf = model.gguf();
-        let source = gguf
-            .string("tokenizer.chat_template")
+        let source = model
+            .metadata_string("tokenizer.chat_template")
             .ok_or("the model file holds no chat template")?;
         let source = std::str::from_utf8(source)?;
-        let stop = gguf
-            .u32("tokenizer.ggml.eos_token_id")
+        let stop = model
+            .metadata_u32("tokenizer.ggml.eos_token_id")
             .ok_or("the model file names no end-of-turn token")?;
-        let bos_token = gguf
-            .u32("tokenizer.ggml.bos_token_id")
+        let bos_token = model
+            .metadata_u32("tokenizer.ggml.bos_token_id")
             .and_then(|id| tokenizer.id_to_token(id))
             .unwrap_or_default();
 
@@ -186,10 +213,17 @@ impl<'a> Engine<'a> {
             .replace("{%- generation -%}", "")
             .replace("{%- endgeneration -%}", "");
         template.add_template_owned("chat", source)?;
+        let calls = if tokenizer.token_to_id(LFM2_CALLS.open).is_none()
+            && tokenizer.token_to_id(QWEN_CALLS.open).is_some()
+        {
+            QWEN_CALLS
+        } else {
+            LFM2_CALLS
+        };
 
         Ok(Self {
             model,
-            gpu: Lfm2Metal::new(model, metal, context, true)?,
+            gpu: Gpu::new(model, metal, context)?,
             consumed: Vec::new(),
             history: None,
             tokenizer,
@@ -198,11 +232,17 @@ impl<'a> Engine<'a> {
             context,
             special: Special {
                 stop,
+                end_of_text: tokenizer.token_to_id("<|endoftext|>"),
                 think_open: tokenizer.token_to_id("<think>"),
                 think_close: tokenizer.token_to_id("</think>"),
-                call_open: tokenizer.token_to_id(CALL_OPEN),
-                call_close: tokenizer.token_to_id(CALL_CLOSE),
+                call_open: tokenizer.token_to_id(calls.open),
+                call_close: tokenizer.token_to_id(calls.close),
                 turn_open: tokenizer.token_to_id("<|im_start|>"),
+            },
+            calls,
+            head: match model {
+                Model::Lfm2(_) => None,
+                Model::Qwen35(model) => Head::load(model)?,
             },
         })
     }
@@ -219,13 +259,28 @@ impl<'a> Engine<'a> {
             .map(|message| {
                 // The template knows no tool calls, so earlier calls go back into the text in the
                 // form the model writes them.
+                let calls = self.calls;
                 let content = if message.tool_calls.is_empty() {
                     message.content.clone()
+                } else if calls.tagged {
+                    // Qwen3.5's template puts a blank line between text and the first call.
+                    let separator = if message.content.trim().is_empty() {
+                        ""
+                    } else {
+                        "\n\n"
+                    };
+                    format!(
+                        "{}{separator}{}",
+                        message.content,
+                        tools::format_tagged(&message.tool_calls, calls.open, calls.close)
+                    )
                 } else {
                     format!(
-                        "{}{CALL_OPEN}{}{CALL_CLOSE}",
+                        "{}{}{}{}",
                         message.content,
-                        tools::format(&message.tool_calls)
+                        calls.open,
+                        tools::format(&message.tool_calls),
+                        calls.close
                     )
                 };
                 context! { role => message.role.as_str(), content => content }
@@ -257,6 +312,31 @@ impl<'a> Engine<'a> {
         tools: &[serde_json::Value],
     ) -> Result<usize, Error> {
         Ok(self.encode(messages, tools)?.len())
+    }
+
+    /// Answer the decision `request` of the Jev/SystemOne API with the model's Clef head.
+    pub(crate) fn decide(
+        &mut self,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, Error> {
+        let Model::Qwen35(model) = self.model else {
+            return Err("the model file holds no Clef decision head".into());
+        };
+        let head = self
+            .head
+            .as_ref()
+            .ok_or("the model file holds no Clef decision head")?;
+        systemone::validate(request)?;
+        let max_tokens = systemone::MAX_TOKENS.min(self.context as usize);
+        let encoded = systemone::encode(self.tokenizer, request, max_tokens)?;
+        // A decision runs a sequence of its own, so the next reply starts over.
+        self.consumed.clear();
+        self.history = None;
+        let n_embd = model.hyperparameters().n_embd as usize;
+        let mut hidden = vec![0.0; encoded.tokens.len() * n_embd];
+        self.gpu.hidden(&encoded.tokens, &mut hidden)?;
+        let logits = head.logits(model, &hidden, &encoded.tokens, &encoded.questions)?;
+        Ok(systemone::response(request, &encoded, &logits))
     }
 
     /// Generate the reply to `request`, passing each event to `emit` as it decodes.
@@ -297,8 +377,19 @@ impl<'a> Engine<'a> {
         }
         emit(Event::Prompt(prompt_tokens))?;
 
-        // Some templates open the reply's thinking in the prompt itself.
-        let part = if tokens.last().copied() == self.special.think_open {
+        // Some templates open the reply's thinking in the prompt itself, and Qwen3.5's follow the
+        // tag with a newline.
+        let opened = tokens
+            .iter()
+            .rev()
+            .take(2)
+            .any(|&token| Some(token) == self.special.think_open);
+        let closed = tokens
+            .iter()
+            .rev()
+            .take(2)
+            .any(|&token| Some(token) == self.special.think_close);
+        let part = if opened && !closed {
             Part::Thinking
         } else {
             Part::Answer
@@ -336,7 +427,7 @@ impl<'a> Engine<'a> {
             .rposition(|&token| Some(token) == self.special.turn_open)
             .unwrap_or(0);
         let start = if turn > cached_tokens {
-            self.gpu.prefill(&tokens[cached_tokens..turn], None, None)?;
+            self.gpu.prefill(&tokens[cached_tokens..turn], None)?;
             self.history = Some((tokens[..turn].to_vec(), self.gpu.checkpoint()?));
             turn
         } else {
@@ -350,7 +441,7 @@ impl<'a> Engine<'a> {
             // The GPU picks each most likely token itself, several steps ahead of the CPU, and
             // each token streams out as soon as its step finishes. The steps already submitted
             // when the reply ends still run, and their tokens join the consumed history.
-            self.gpu.prefill(&tokens[start..], None, None)?;
+            self.gpu.prefill(&tokens[start..], None)?;
             self.consumed = tokens;
             let mut failure = None;
             let gained =
@@ -374,9 +465,8 @@ impl<'a> Engine<'a> {
             }
         } else {
             // Sampling reads each step's logits on the CPU before the next step can start.
-            let mut logits = vec![0.0; self.model.hyperparameters().n_vocab as usize];
-            self.gpu
-                .prefill(&tokens[start..], Some(&mut logits), None)?;
+            let mut logits = vec![0.0; self.model.n_vocab() as usize];
+            self.gpu.prefill(&tokens[start..], Some(&mut logits))?;
             self.consumed = tokens;
             while remaining > 0 {
                 let token = request.sampler.sample(&mut logits, &self.consumed);
@@ -385,7 +475,7 @@ impl<'a> Engine<'a> {
                 if finish.is_some() || remaining == 0 {
                     break;
                 }
-                self.gpu.step(token, Some(&mut logits), None)?;
+                self.gpu.step(token, Some(&mut logits))?;
                 self.consumed.push(token);
             }
         }
@@ -447,7 +537,7 @@ impl Reader<'_> {
             .get_or_insert_with(|| self.started.elapsed());
         self.generated += 1;
         let special = self.special;
-        if token == special.stop {
+        if token == special.stop || Some(token) == special.end_of_text {
             return Ok(Some(Finish::Stop));
         }
         if Some(token) == special.think_open {

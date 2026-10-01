@@ -63,7 +63,7 @@ objc2-metal = { version = "0.3.2", default-features = false, features = [
   "MTLTypes",
 ] }
 rustyline = { version = "18.0.1", default-features = false }
-serde_json = { version = "1.0.151" }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
 thiserror = { version = "2.0.21" }
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 tokio = { version = "1.53.1", default-features = false, features = ["net", "rt", "sync"] }

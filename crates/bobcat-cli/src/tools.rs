@@ -1,10 +1,12 @@
-//! Tool calls in the form LFM2 writes them.
+//! Tool calls in the forms LFM2 and Qwen write them.
 //!
 //! LFM2 writes tool calls between its tool call tokens as a Python list of calls, as in
 //! `[get_weather(city='Paris', days=3)]`. Keyword arguments hold Python literals: quoted
 //! strings, numbers, `True`, `False`, `None`, and lists and dicts. When a system prompt asks for
 //! JSON, the model writes a JSON list of `{"name", "arguments"}` objects in place of the
-//! Python list, so the parser accepts both.
+//! Python list, so the parser accepts both. Qwen3.5 writes each call between its own tool call
+//! tags as a `<function=NAME>` block of `<parameter=NAME>` blocks, one per argument, with each
+//! value on its own lines.
 
 use serde_json::{Map, Value};
 
@@ -20,6 +22,9 @@ pub(crate) struct ToolCall {
 /// Return the tool calls in `text`, the model's output between its tool call tokens.
 pub(crate) fn parse(text: &str) -> Result<Vec<ToolCall>, String> {
     let text = text.trim();
+    if text.starts_with("<function=") {
+        return Ok(vec![tagged_call(text)?]);
+    }
     if let Ok(Value::Array(calls)) = serde_json::from_str::<Value>(text) {
         return calls.into_iter().map(json_call).collect();
     }
@@ -65,6 +70,83 @@ pub(crate) fn format(calls: &[ToolCall]) -> String {
         })
         .collect();
     format!("[{}]", calls.join(", "))
+}
+
+/// Return the call in `text`, a `<function=NAME>` block as Qwen3.5 writes it.
+///
+/// A parameter's value is JSON when it parses as an object, a list, a number, or a JSON literal,
+/// and Python's `True`, `False`, and `None` become their JSON values. Any other value is a string,
+/// as Qwen3.5's chat template writes strings without quotes.
+fn tagged_call(text: &str) -> Result<ToolCall, String> {
+    let rest = text
+        .strip_prefix("<function=")
+        .ok_or_else(|| format!("expected <function= at {text:?}"))?;
+    let (name, mut rest) = rest
+        .split_once('>')
+        .ok_or_else(|| format!("the function tag never closes in {text:?}"))?;
+    let mut arguments = Map::new();
+    loop {
+        rest = rest.trim_start();
+        if rest.starts_with("</function>") {
+            return Ok(ToolCall {
+                name: name.trim().to_owned(),
+                arguments,
+            });
+        }
+        let after = rest
+            .strip_prefix("<parameter=")
+            .ok_or_else(|| format!("expected <parameter= or </function> at {rest:?}"))?;
+        let (key, after) = after
+            .split_once('>')
+            .ok_or_else(|| format!("the parameter tag never closes in {after:?}"))?;
+        let (value, after) = after
+            .split_once("</parameter>")
+            .ok_or_else(|| format!("the parameter {key} never closes"))?;
+        // The template writes each value on lines of its own.
+        let value = value.strip_prefix('\n').unwrap_or(value);
+        let value = value.strip_suffix('\n').unwrap_or(value);
+        arguments.insert(key.trim().to_owned(), tagged_value(value));
+        rest = after;
+    }
+}
+
+/// Return the JSON value a parameter's text stands for.
+fn tagged_value(text: &str) -> Value {
+    match text.trim() {
+        "True" => return Value::Bool(true),
+        "False" => return Value::Bool(false),
+        "None" => return Value::Null,
+        _ => {}
+    }
+    match serde_json::from_str::<Value>(text) {
+        Ok(Value::String(_)) | Err(_) => Value::String(text.to_owned()),
+        Ok(value) => value,
+    }
+}
+
+/// Return `calls` in the form Qwen3.5 writes them, each between `open` and `close`, for replaying
+/// earlier calls in a conversation.
+pub(crate) fn format_tagged(calls: &[ToolCall], open: &str, close: &str) -> String {
+    calls
+        .iter()
+        .map(|call| {
+            let mut text = format!("{open}\n<function={}>\n", call.name);
+            for (key, value) in &call.arguments {
+                let value = match value {
+                    Value::String(text) => text.clone(),
+                    Value::Bool(true) => "True".to_owned(),
+                    Value::Bool(false) => "False".to_owned(),
+                    Value::Null => "None".to_owned(),
+                    Value::Number(_) | Value::Array(_) | Value::Object(_) => value.to_string(),
+                };
+                for piece in ["<parameter=", key, ">\n", &value, "\n</parameter>\n"] {
+                    text.push_str(piece);
+                }
+            }
+            text + "</function>\n" + close
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Return `value` as a Python literal, with dicts and lists in JSON, as LFM2's template writes
@@ -282,6 +364,23 @@ mod tests {
         let calls = parse(r#"[{"name": "f", "arguments": {"a": "b"}}]"#).unwrap();
         assert_eq!(calls[0].name, "f");
         assert_eq!(calls[0].arguments["a"], json!("b"));
+    }
+
+    #[test]
+    fn tagged_calls_parse_back() {
+        let call = ToolCall {
+            name: "search".to_owned(),
+            arguments: json!({"query": "two\nlines", "n": 3, "exact": true, "tags": ["a"]})
+                .as_object()
+                .unwrap()
+                .clone(),
+        };
+        let text = format_tagged(std::slice::from_ref(&call), "<tool_call>", "</tool_call>");
+        let inner = text
+            .strip_prefix("<tool_call>")
+            .and_then(|text| text.strip_suffix("</tool_call>"))
+            .unwrap();
+        assert_eq!(parse(inner).unwrap(), vec![call]);
     }
 
     #[test]

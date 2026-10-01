@@ -8,6 +8,7 @@
 use bobcat_gguf::Gguf;
 use tokenizers::decoders::byte_level::ByteLevel as ByteLevelDecoder;
 use tokenizers::models::bpe::{BPE, Vocab};
+use tokenizers::normalizers::unicode::NFC;
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 use tokenizers::pre_tokenizers::sequence::Sequence;
 use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
@@ -18,6 +19,14 @@ use crate::Error;
 /// The pre-tokenizer regex of Llama 3, which LFM2 shares. The pattern matches the one in LFM2's
 /// `tokenizer.json`.
 const LLAMA3_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+/// The pre-tokenizer regex of Qwen2, which splits digits one at a time. Cloudflare's Clef releases
+/// tokenize with it. The pattern matches the one in their `tokenizer.json`.
+const QWEN2_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+/// The pre-tokenizer regex of Qwen3.5, which also keeps combining marks in words. The pattern
+/// matches the one in Qwen3.5's `tokenizer.json`.
+const QWEN35_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 /// The GGUF token type of control tokens such as `<|im_start|>`.
 const CONTROL_TOKEN: u32 = 3;
@@ -40,8 +49,12 @@ pub(crate) fn from_gguf(gguf: &Gguf<impl AsRef<[u8]>>) -> Result<Tokenizer, Erro
         .into());
     }
     let pre = gguf.string("tokenizer.ggml.pre").unwrap_or_default();
-    let pattern = match pre {
-        b"lfm2" => LLAMA3_PATTERN,
+    // llama.cpp ignores merges for LFM2, taking any whole word the vocabulary holds as one token.
+    // Qwen models merge as their tokenizer.json does, after NFC normalization.
+    let (pattern, ignore_merges, nfc) = match pre {
+        b"lfm2" => (LLAMA3_PATTERN, true, false),
+        b"qwen2" => (QWEN2_PATTERN, false, true),
+        b"qwen35" => (QWEN35_PATTERN, false, true),
         other => {
             return Err(format!(
                 "bobcat cannot rebuild the {} pre-tokenizer from the model file, so pass the \
@@ -83,12 +96,14 @@ pub(crate) fn from_gguf(gguf: &Gguf<impl AsRef<[u8]>>) -> Result<Tokenizer, Erro
         .map(|(id, token, _)| (token.clone(), *id))
         .collect();
 
-    // llama.cpp ignores merges for LFM2, taking any whole word the vocabulary holds as one token.
     let bpe = BPE::builder()
         .vocab_and_merges(vocab, merges)
-        .ignore_merges(true)
+        .ignore_merges(ignore_merges)
         .build()?;
     let mut tokenizer = Tokenizer::new(bpe);
+    if nfc {
+        tokenizer.with_normalizer(Some(NFC))?;
+    }
     tokenizer.with_pre_tokenizer(Some(Sequence::new(vec![
         Split::new(
             SplitPattern::Regex(pattern.to_owned()),
@@ -135,14 +150,25 @@ mod tests {
         "<think>Let me count.</think>The answer is 4.<|im_end|>",
     ];
 
-    /// Check that the tokenizer rebuilt from each LFM2.5 model file matches the model's own
+    /// Check that the tokenizer rebuilt from each model file matches the model's own
     /// `tokenizer.json` on the whole vocabulary and on every sample.
     #[test]
     fn gguf_tokenizer_matches_tokenizer_json() {
         let models = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models");
-        for name in ["LFM2.5-350M", "LFM2.5-1.2B-Instruct", "LFM2.5-2.6B"] {
-            let gguf_path = models.join(format!("{name}-Q8_0.gguf"));
-            let json_path = models.join(format!("{name}-MLX-8bit/tokenizer.json"));
+        let lfm2 = ["LFM2.5-350M", "LFM2.5-1.2B-Instruct", "LFM2.5-2.6B"].map(|name| {
+            (
+                format!("{name}-Q8_0.gguf"),
+                format!("{name}-MLX-8bit/tokenizer.json"),
+            )
+        });
+        let qwen35 = [
+            ("Qwen3.5-0.8B-Q8_0.gguf", "hf/Qwen3.5-0.8B/tokenizer.json"),
+            ("clef-flash-Q8_0.gguf", "hf/clef-flash/tokenizer.json"),
+        ]
+        .map(|(gguf, json)| (gguf.to_owned(), json.to_owned()));
+        for (name, json) in lfm2.into_iter().chain(qwen35) {
+            let gguf_path = models.join(&name);
+            let json_path = models.join(json);
             if !gguf_path.exists() || !json_path.exists() {
                 eprintln!(
                     "skip: needs {} and {}",
@@ -151,14 +177,16 @@ mod tests {
                 );
                 continue;
             }
-            let model = bobcat::Model::load(&gguf_path).unwrap();
-            let rebuilt = from_gguf(model.gguf()).unwrap();
+            let storage = std::fs::read(&gguf_path).unwrap();
+            let gguf = Gguf::parse(storage).unwrap();
+            let rebuilt = from_gguf(&gguf).unwrap();
             let reference = Tokenizer::from_file(&json_path).unwrap();
 
+            // llama.cpp's converter appends Qwen3.5's audio control tokens after the
+            // vocabulary of its tokenizer.json, and no text maps to them.
             let vocab_size = reference.get_vocab_size(true);
-            assert_eq!(
-                rebuilt.get_vocab_size(true),
-                vocab_size,
+            assert!(
+                rebuilt.get_vocab_size(true) >= vocab_size,
                 "{name} vocabulary size"
             );
             for id in 0..u32::try_from(vocab_size).unwrap() {
