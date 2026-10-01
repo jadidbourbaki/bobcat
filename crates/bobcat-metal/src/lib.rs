@@ -11,6 +11,6 @@ mod backend;
 pub use backend::bandwidth::{Bandwidth, BandwidthSample, measure_bandwidth};
 #[cfg(target_os = "macos")]
 pub use backend::{
-    Buffer, Element, Error, Format, MatvecOptions, Metal, Norm, ProfileEntry, Readback, Store,
-    Ticket, View, attention_scratch_floats,
+    Buffer, Element, Error, Format, MOE_MAX_EXPERTS, MOE_MAX_USED, MatvecOptions, Metal, Norm,
+    ProfileEntry, Readback, Store, Ticket, View, attention_scratch_floats, route_bytes,
 };

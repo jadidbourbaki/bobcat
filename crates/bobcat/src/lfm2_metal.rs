@@ -7,13 +7,13 @@ use std::time::Instant;
 
 use bobcat_gguf::{Tensor, TensorType};
 use bobcat_metal::{
-    Buffer, Format, MatvecOptions, Metal, Norm, Readback, Store, Ticket, View,
-    attention_scratch_floats,
+    Buffer, Format, MOE_MAX_EXPERTS, MOE_MAX_USED, MatvecOptions, Metal, Norm, Readback, Store,
+    Ticket, View, attention_scratch_floats, route_bytes,
 };
 
 use crate::error::Error;
 use crate::lfm2::{
-    Attention, Conv, Dense, Ffn, Layer, Matrix, Mixer, Model, Trace, Vector, to_usize,
+    Attention, Conv, Ffn, Layer, Matrix, Mixer, Model, Moe, Trace, Vector, to_usize,
 };
 use crate::storage::Storage;
 
@@ -58,6 +58,13 @@ struct Buffers {
     attn: Buffer,
     scores: Buffer,
     ffn: Buffer,
+    /// The experts each token of a batch picks and their weights, for mixture-of-experts layers.
+    route: Buffer,
+    /// A batch's routes grouped by expert: each expert's first entry, then the entries.
+    expert_offsets: Buffer,
+    expert_entries: Buffer,
+    /// One row of `n_embd` floats per routed expert of each token of a batch.
+    expert_out: Buffer,
     logits: Buffer,
     greedy_token: Buffer,
     tokens: Buffer,
@@ -150,7 +157,7 @@ impl<'a> Lfm2Metal<'a> {
         let expanded_bytes = model
             .layers
             .iter()
-            .flat_map(Layer::matrices)
+            .flat_map(matmul_matrices)
             .filter(|matrix| batch >= K_EXPAND_MIN_TOKENS && expands(matrix.tensor.data_type()))
             .map(|matrix| to_usize(matrix.n_rows) * to_usize(matrix.n_cols) * 2)
             .max()
@@ -183,7 +190,12 @@ impl<'a> Lfm2Metal<'a> {
                 n_ctx,
                 batch,
             ))?,
-            ffn: floats(rows * to_usize(hp.n_ff))?,
+            // A mixture-of-experts layer keeps one row of expert activations per routed expert.
+            ffn: floats(rows * to_usize(hp.n_ff.max(hp.n_experts_used * hp.n_ff_expert)))?,
+            route: metal.new_buffer(route_bytes(hp.n_experts_used, batch))?,
+            expert_offsets: metal.new_buffer((to_usize(hp.n_experts) + 1) * TOKEN_BYTES)?,
+            expert_entries: metal.new_buffer(rows * to_usize(hp.n_experts_used) * TOKEN_BYTES)?,
+            expert_out: floats(rows * to_usize(hp.n_experts_used) * n_embd)?,
             logits: floats(to_usize(hp.n_vocab))?,
             greedy_token: metal.new_buffer(TOKEN_BYTES)?,
             tokens: metal.new_buffer(to_usize(n_ctx) * TOKEN_BYTES)?,
@@ -771,41 +783,44 @@ impl<'a> Lfm2Metal<'a> {
 }
 
 /// Return the dense feed-forward block of `layer`.
-fn dense(layer: &Layer) -> &Dense {
-    match &layer.ffn {
-        Ffn::Dense(dense) => dense,
-        Ffn::Moe(_) => {
-            unreachable!("check_supported rejects models with mixture-of-experts layers")
+/// Return the matrices of `layer` that batches multiply with [`Recorder::matmul`]. The experts
+/// of a mixture-of-experts block multiply through their own launches.
+fn matmul_matrices(layer: &Layer) -> Vec<&Matrix> {
+    let mut matrices = match &layer.mixer {
+        Mixer::Attention(attention) => {
+            vec![&attention.q, &attention.k, &attention.v, &attention.output]
         }
+        Mixer::Conv(conv) => vec![&conv.in_proj, &conv.out_proj],
+    };
+    if let Ffn::Dense(dense) = &layer.ffn {
+        matrices.extend([&dense.gate, &dense.up, &dense.down]);
     }
+    matrices
 }
 
 /// Check that the Metal kernels can run `model`.
 fn check_supported(model: &Model) -> Result<(), Error> {
     let hp = model.hyperparameters();
-    if model
-        .layers
-        .iter()
-        .any(|layer| matches!(layer.ffn, Ffn::Moe(_)))
-    {
-        return Err(Error::MetalUnsupported(
-            "dense feed-forward blocks".to_owned(),
-        ));
-    }
     for matrix in [&model.token_embd, &model.output]
         .into_iter()
-        .chain(model.layers.iter().flat_map(Layer::matrices))
+        .chain(model.layers.iter().flat_map(matmul_matrices))
     {
         format(matrix)?;
     }
-    // The fused SwiGLU launch reads the gate and up matrices with one kernel.
     for layer in &model.layers {
-        let dense = dense(layer);
-        if format(&dense.gate)? != format(&dense.up)? {
+        // The fused SwiGLU launches read the gate and up matrices with one kernel.
+        let (gate, up) = match &layer.ffn {
+            Ffn::Dense(dense) => (&dense.gate, &dense.up),
+            Ffn::Moe(moe) => {
+                check_experts(moe, hp.n_experts, hp.n_experts_used)?;
+                (&moe.gate, &moe.up)
+            }
+        };
+        if format(gate)? != format(up)? {
             return Err(Error::MetalUnsupported(format!(
                 "gate and up matrices of one type, got {:?} and {:?}",
-                dense.gate.tensor.data_type(),
-                dense.up.tensor.data_type()
+                gate.tensor.data_type(),
+                up.tensor.data_type()
             )));
         }
     }
@@ -825,6 +840,32 @@ fn check_supported(model: &Model) -> Result<(), Error> {
             "a convolution of at most {CONV_MAX_KERNEL} taps, got {}",
             hp.conv_kernel
         )));
+    }
+    Ok(())
+}
+
+/// Check that the expert kernels can run the mixture of experts `moe`, which routes each token
+/// to `n_used` of `n_experts` experts.
+fn check_experts(moe: &Moe, n_experts: u32, n_used: u32) -> Result<(), Error> {
+    if n_experts > MOE_MAX_EXPERTS || n_used > MOE_MAX_USED {
+        return Err(Error::MetalUnsupported(format!(
+            "at most {MOE_MAX_USED} of {MOE_MAX_EXPERTS} experts per token, got {n_used} of \
+             {n_experts}"
+        )));
+    }
+    if moe.router.tensor.data_type() != TensorType::F32 {
+        return Err(Error::MetalUnsupported(format!(
+            "an F32 router, got {:?}",
+            moe.router.tensor.data_type()
+        )));
+    }
+    for matrix in [&moe.gate, &moe.up, &moe.down] {
+        if !format(matrix)?.holds_experts() {
+            return Err(Error::MetalUnsupported(format!(
+                "experts in Q4_0, Q4_K, or Q6_K, got {:?}",
+                matrix.tensor.data_type()
+            )));
+        }
     }
     Ok(())
 }
@@ -1149,23 +1190,27 @@ impl<'r> Recorder<'r> {
                 Mixer::Conv(conv) => self.conv(conv, layer.cache_index, &layer.attn_norm)?,
             }
 
-            let ffn_block = dense(layer);
-            self.metal.matvec_swiglu(
-                format(&ffn_block.gate)?,
-                b.weights(&ffn_block.gate.tensor),
-                b.weights(&ffn_block.up.tensor),
-                ffn_block.gate.n_rows,
-                ffn_block.gate.n_cols,
-                h,
-                Norm {
-                    weight: b.weights(&layer.ffn_norm.tensor),
-                    eps: hp.norm_eps,
-                },
-                ffn,
-            )?;
-            self.metal.barrier();
-            self.matvec(&ffn_block.down, ffn, h, ADD_TO_RESIDUAL)?;
-            self.metal.barrier();
+            match &layer.ffn {
+                Ffn::Dense(dense) => {
+                    self.metal.matvec_swiglu(
+                        format(&dense.gate)?,
+                        b.weights(&dense.gate.tensor),
+                        b.weights(&dense.up.tensor),
+                        dense.gate.n_rows,
+                        dense.gate.n_cols,
+                        h,
+                        Norm {
+                            weight: b.weights(&layer.ffn_norm.tensor),
+                            eps: hp.norm_eps,
+                        },
+                        ffn,
+                    )?;
+                    self.metal.barrier();
+                    self.matvec(&dense.down, ffn, h, ADD_TO_RESIDUAL)?;
+                    self.metal.barrier();
+                }
+                Ffn::Moe(moe) => self.moe(moe, 1, Some(&layer.ffn_norm))?,
+            }
 
             if traced {
                 self.metal.copy(
@@ -1192,6 +1237,135 @@ impl<'r> Recorder<'r> {
             let options = self.normalized(&model.output_norm);
             self.matvec(&model.output, h, b.logits.floats(0), options)?;
         }
+        Ok(())
+    }
+
+    /// Record the mixture of experts `moe` on the `n` tokens of the batch and add its output to
+    /// the residual stream.
+    ///
+    /// With `norm`, the routing launch normalizes the residual stream into the normed buffer.
+    /// Otherwise the normed buffer already holds the normalized tokens. One token runs
+    /// matrix-vector products on its experts. A batch groups its tokens by expert, so each
+    /// expert's weights stream through the GPU once per batch.
+    fn moe(&mut self, moe: &Moe, n: u32, norm: Option<&Vector>) -> Result<(), Error> {
+        let b = self.buffers;
+        let hp = self.model.hyperparameters();
+        let normed = b.normed.floats(0);
+        let route = b.route.at(0);
+        let ffn = b.ffn.floats(0);
+        let (input, fused_norm) = match norm {
+            Some(norm) => (
+                b.hidden.floats(0),
+                Some((
+                    Norm {
+                        weight: b.weights(&norm.tensor),
+                        eps: hp.norm_eps,
+                    },
+                    normed,
+                )),
+            ),
+            None => (normed, None),
+        };
+        self.metal.moe_route(
+            input,
+            fused_norm,
+            b.weights(&moe.router.tensor),
+            b.weights(&moe.expert_bias.tensor),
+            route,
+            hp.n_embd,
+            hp.n_experts,
+            hp.n_experts_used,
+            n,
+        )?;
+        self.metal.barrier();
+        if n > 1 {
+            return self.grouped_moe(moe, n);
+        }
+        self.metal.matvec_experts_swiglu(
+            format(&moe.gate)?,
+            b.weights(&moe.gate.tensor),
+            b.weights(&moe.up.tensor),
+            hp.n_ff_expert,
+            hp.n_embd,
+            hp.n_experts,
+            normed,
+            route,
+            hp.n_experts_used,
+            ffn,
+            n,
+        )?;
+        self.metal.barrier();
+        self.metal.matvec_experts_down(
+            format(&moe.down)?,
+            b.weights(&moe.down.tensor),
+            hp.n_embd,
+            hp.n_ff_expert,
+            hp.n_experts,
+            ffn,
+            route,
+            hp.n_experts_used,
+            b.hidden.floats(0),
+            n,
+        )?;
+        self.metal.barrier();
+        Ok(())
+    }
+
+    /// Record the experts of `moe` on the `n` tokens of a batch, grouped by expert, once the
+    /// route buffer holds their routes.
+    fn grouped_moe(&mut self, moe: &Moe, n: u32) -> Result<(), Error> {
+        let b = self.buffers;
+        let hp = self.model.hyperparameters();
+        let route = b.route.at(0);
+        let offsets = b.expert_offsets.at(0);
+        let entries = b.expert_entries.at(0);
+        let ffn = b.ffn.floats(0);
+        let expert_out = b.expert_out.floats(0);
+        self.metal
+            .moe_group(route, offsets, entries, hp.n_experts, hp.n_experts_used, n)?;
+        self.metal.barrier();
+        // One launch multiplies the gate and up projections and applies the SwiGLU.
+        self.metal.matmul_experts(
+            format(&moe.gate)?,
+            b.weights(&moe.gate.tensor),
+            Some(b.weights(&moe.up.tensor)),
+            hp.n_ff_expert,
+            hp.n_embd,
+            hp.n_experts,
+            b.normed.floats(0),
+            true,
+            offsets,
+            entries,
+            hp.n_experts_used,
+            ffn,
+            n,
+        )?;
+        self.metal.barrier();
+        self.metal.matmul_experts(
+            format(&moe.down)?,
+            b.weights(&moe.down.tensor),
+            None,
+            hp.n_embd,
+            hp.n_ff_expert,
+            hp.n_experts,
+            ffn,
+            false,
+            offsets,
+            entries,
+            hp.n_experts_used,
+            expert_out,
+            n,
+        )?;
+        self.metal.barrier();
+        self.metal.moe_combine(
+            expert_out,
+            route,
+            b.hidden.floats(0),
+            hp.n_embd,
+            hp.n_experts_used,
+            n,
+        )?;
+        self.metal.barrier();
         Ok(())
     }
 
@@ -1335,15 +1509,19 @@ impl<'r> Recorder<'r> {
                 hp.norm_eps,
             )?;
             self.metal.barrier();
-            // The up projection's store combines with the gate projection already in the
-            // buffer, which applies the SwiGLU.
-            let ffn_block = dense(layer);
-            self.matmul(&ffn_block.gate, normed, ffn, n, Store::Overwrite)?;
-            self.metal.barrier();
-            self.matmul(&ffn_block.up, normed, ffn, n, Store::Swiglu)?;
-            self.metal.barrier();
-            self.matmul(&ffn_block.down, ffn, h, n, Store::Accumulate)?;
-            self.metal.barrier();
+            match &layer.ffn {
+                Ffn::Dense(dense) => {
+                    // The up projection's store combines with the gate projection already in
+                    // the buffer, which applies the SwiGLU.
+                    self.matmul(&dense.gate, normed, ffn, n, Store::Overwrite)?;
+                    self.metal.barrier();
+                    self.matmul(&dense.up, normed, ffn, n, Store::Swiglu)?;
+                    self.metal.barrier();
+                    self.matmul(&dense.down, ffn, h, n, Store::Accumulate)?;
+                    self.metal.barrier();
+                }
+                Ffn::Moe(moe) => self.moe(moe, n, None)?,
+            }
 
             if let Some(stride) = trace_layer_stride {
                 self.metal

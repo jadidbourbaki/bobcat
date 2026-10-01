@@ -191,36 +191,75 @@ matmul_q8_0 (device const uchar *weights [[buffer (0)]],
     }
 }
 
-/* Multiply the matrix WEIGHTS of format F, which has N_ROWS rows of
-   N_COLS weights, by each of the N_TOKENS rows of N_COLS floats at X,
-   with the tiles, function constants, and stores of matmul_q8_0.  Each
-   pass of the main loop dequantizes one 32-weight group of every row of
-   the tile.  The input tile holds elements of type S.  Half inputs made
-   LFM2.5-2.6B QAD-Q4_0 prefill about 6 ms faster than half weights
-   expanded for the tensor path on M4 Pro, and slowed Q4_K_M.  */
-template <typename F, typename S = float>
-kernel void
-matmul_q (device const uchar *weights [[buffer (0)]],
-          device const float *x [[buffer (1)]], device float *y [[buffer (2)]],
-          constant uint &n_rows [[buffer (3)]],
-          constant uint &n_cols [[buffer (4)]],
-          constant uint &n_tokens [[buffer (5)]],
-          uint2 position [[threadgroup_position_in_grid]],
-          uint2 thread_position [[thread_position_in_threadgroup]],
-          uint simdgroup_index [[simdgroup_index_in_threadgroup]])
+/* Token I of a dense product reads row I of X and writes row I of Y.  */
+struct dense_rows
 {
-  /* The tiles are laid out as in matmul_q8_0.  The output tile reuses
-     the input and weight scratch after the final multiply.  */
-  threadgroup uchar scratch[MATMUL_ROWS * QK8_0 * sizeof (half)
-                            + MATMUL_TOKENS * QK8_0 * sizeof (float)];
+  static constant constexpr bool contiguous = true;
+
+  uint
+  input (uint token) const
+  {
+    return token;
+  }
+
+  uint
+  output (uint token) const
+  {
+    return token;
+  }
+};
+
+/* Token I of an expert's product is entry I of the expert's ENTRIES,
+   which names row ENTRIES[I] of Y and row ENTRIES[I] / DIVISOR of X.  */
+struct expert_rows
+{
+  static constant constexpr bool contiguous = false;
+  device const uint *entries;
+  uint divisor;
+
+  uint
+  input (uint token) const
+  {
+    return entries[token] / divisor;
+  }
+
+  uint
+  output (uint token) const
+  {
+    return entries[token];
+  }
+};
+
+/* Compute the tile of rows FIRST_ROW onward and tokens FIRST_TOKEN
+   onward of the product of WEIGHTS of format F, which has N_ROWS rows of
+   N_COLS weights, with N_TOKENS tokens whose rows of X and Y come from
+   ROWS, with the tiles, function constants, and stores of matmul_q8_0.
+   Each pass of the main loop dequantizes one 32-weight group of every
+   row of the tile.  The input tile holds elements of type S.  Half
+   inputs made LFM2.5-2.6B QAD-Q4_0 prefill about 6 ms faster than half
+   weights expanded for the tensor path on M4 Pro, and slowed Q4_K_M.
+   SCRATCH holds the weight and input tiles, which the output tile
+   reuses after the final multiply.
+
+   When PAIRED is true, the tile also multiplies UP_WEIGHTS, the up
+   projection of the SwiGLU whose gate is WEIGHTS, by the same inputs and
+   stores SiLU of each gate result times the matching up result.  The
+   tiles share the inputs, and SCRATCH holds twice the output tile.  */
+template <typename F, typename S, bool PAIRED, typename R>
+static void
+matmul_tile (device const uchar *weights, device const uchar *up_weights,
+             device const float *x, device float *y, uint n_rows, uint n_cols,
+             uint n_tokens, R rows, uint first_row, uint first_token, uint tid,
+             uint simdgroup_index, threadgroup uchar *scratch)
+{
   threadgroup half *weight_tile = (threadgroup half *)scratch;
   threadgroup S *input_tile
       = (threadgroup S *)(scratch + MATMUL_ROWS * QK8_0 * sizeof (half));
+  threadgroup half *up_tile
+      = (threadgroup half *)(scratch + MATMUL_ROWS * QK8_0 * sizeof (half)
+                             + MATMUL_TOKENS * QK8_0 * sizeof (float));
   threadgroup float *out_tile = (threadgroup float *)scratch;
 
-  uint tid = thread_position.x;
-  uint first_token = position.x * MATMUL_TOKENS;
-  uint first_row = position.y * MATMUL_ROWS;
   uint n_groups = n_cols / QK8_0;
   ulong row_bytes = row_bytes_of<F> (n_cols);
 
@@ -241,15 +280,20 @@ matmul_q (device const uchar *weights [[buffer (0)]],
                                   + 64 * (4 * input_part + input_token / 8)
                                   + 8 * (input_token % 8));
   device const uchar *row_weights = weights + row * row_bytes;
+  device const uchar *up_row_weights = up_weights + row * row_bytes;
   device const float4 *token_inputs
-      = (device const float4 *)(x + ulong (token) * n_cols
+      = (device const float4 *)(x + ulong (rows.input (token)) * n_cols
                                 + input_part * QUANTS_PER_LANE);
 
   uint row_block_base = 4 * (simdgroup_index % 2);
   uint token_block_base = 2 * (simdgroup_index / 2);
   simdgroup_float8x8 acc[8];
+  simdgroup_float8x8 up_acc[PAIRED ? 8 : 1];
   for (uint i = 0; i < 8; i++)
     acc[i] = make_filled_simdgroup_matrix<float, 8, 8> (0.0f);
+  if (PAIRED)
+    for (uint i = 0; i < 8; i++)
+      up_acc[i] = make_filled_simdgroup_matrix<float, 8, 8> (0.0f);
 
   for (uint g = 0; g < n_groups; g++)
     {
@@ -259,6 +303,9 @@ matmul_q (device const uchar *weights [[buffer (0)]],
       uint e = g * QK8_0 + 16 * weight_half;
       half4 w[4];
       F::load16 (row_weights, e, w);
+      half4 up_w[4];
+      if (PAIRED)
+        F::load16 (up_row_weights, e, up_w);
       device const float4 *xs = token_inputs + g * (QK8_0 / 4);
       vec<S, 4> in0 = vec<S, 4> (xs[0]);
       vec<S, 4> in1 = vec<S, 4> (xs[1]);
@@ -268,8 +315,10 @@ matmul_q (device const uchar *weights [[buffer (0)]],
         for (ushort c = 0; c < 4; c++)
           {
             ushort kk = 4 * v + c;
-            weight_tile[weight_base + 64 * 8 * (kk / 8) + 8 * (kk % 8)]
-                = w[v][c];
+            ushort slot = weight_base + 64 * 8 * (kk / 8) + 8 * (kk % 8);
+            weight_tile[slot] = w[v][c];
+            if (PAIRED)
+              up_tile[slot] = up_w[v][c];
           }
       input_slot[0] = in0;
       input_slot[1] = in1;
@@ -297,15 +346,56 @@ matmul_q (device const uchar *weights [[buffer (0)]],
             for (ushort i = 0; i < 4; i++)
               simdgroup_multiply_accumulate (acc[4 * j + i], bm[j], a[i],
                                              acc[4 * j + i]);
+          if (PAIRED)
+            {
+              simdgroup_barrier (mem_flags::mem_none);
+#pragma unroll
+              for (ushort i = 0; i < 4; i++)
+                simdgroup_load (
+                    a[i], up_tile + 64 * (8 * k + row_block_base + i), 8);
+              simdgroup_barrier (mem_flags::mem_none);
+#pragma unroll
+              for (ushort j = 0; j < 2; j++)
+#pragma unroll
+                for (ushort i = 0; i < 4; i++)
+                  simdgroup_multiply_accumulate (up_acc[4 * j + i], bm[j],
+                                                 a[i], up_acc[4 * j + i]);
+            }
         }
     }
   threadgroup_barrier (mem_flags::mem_threadgroup);
 
   uint row_offset = 8 * row_block_base;
   uint token_offset = 8 * token_block_base;
+  if (PAIRED)
+    {
+      threadgroup float *up_out = out_tile + MATMUL_ROWS * MATMUL_TOKENS;
+      for (uint j = 0; j < 2; j++)
+        for (uint i = 0; i < 4; i++)
+          {
+            uint offset
+                = (token_offset + 8 * j) * MATMUL_ROWS + row_offset + 8 * i;
+            simdgroup_store (acc[4 * j + i], out_tile + offset, MATMUL_ROWS);
+            simdgroup_store (up_acc[4 * j + i], up_out + offset, MATMUL_ROWS);
+          }
+      threadgroup_barrier (mem_flags::mem_threadgroup);
+      for (uint idx = tid; idx < MATMUL_ROWS * MATMUL_TOKENS;
+           idx += MATMUL_SIMDGROUPS * SIMD_WIDTH)
+        {
+          uint out_row = first_row + idx % MATMUL_ROWS;
+          uint out_token = first_token + idx / MATMUL_ROWS;
+          if (out_row < n_rows && out_token < n_tokens)
+            {
+              float gate = out_tile[idx];
+              y[ulong (rows.output (out_token)) * n_rows + out_row]
+                  = gate / (1.0f + precise::exp (-gate)) * up_out[idx];
+            }
+        }
+      return;
+    }
   bool full = first_row + MATMUL_ROWS <= n_rows
               && first_token + MATMUL_TOKENS <= n_tokens;
-  if (full && !accumulate && !swiglu_store)
+  if (R::contiguous && full && !accumulate && !swiglu_store)
     {
       device float *out = y + ulong (first_token + token_offset) * n_rows
                           + first_row + row_offset;
@@ -332,7 +422,8 @@ matmul_q (device const uchar *weights [[buffer (0)]],
       uint out_token = first_token + t;
       if (out_row < n_rows && out_token < n_tokens)
         {
-          device float *dst = y + ulong (out_token) * n_rows + out_row;
+          device float *dst
+              = y + ulong (rows.output (out_token)) * n_rows + out_row;
           float value = out_tile[t * MATMUL_ROWS + r];
           if (swiglu_store)
             {
@@ -344,6 +435,85 @@ matmul_q (device const uchar *weights [[buffer (0)]],
         }
     }
 }
+
+/* Multiply the matrix WEIGHTS of format F, which has N_ROWS rows of
+   N_COLS weights, by each of the N_TOKENS rows of N_COLS floats at X,
+   with one threadgroup per tile.  */
+template <typename F, typename S = float>
+kernel void
+matmul_q (device const uchar *weights [[buffer (0)]],
+          device const float *x [[buffer (1)]], device float *y [[buffer (2)]],
+          constant uint &n_rows [[buffer (3)]],
+          constant uint &n_cols [[buffer (4)]],
+          constant uint &n_tokens [[buffer (5)]],
+          uint2 position [[threadgroup_position_in_grid]],
+          uint2 thread_position [[thread_position_in_threadgroup]],
+          uint simdgroup_index [[simdgroup_index_in_threadgroup]])
+{
+  threadgroup uchar scratch[MATMUL_ROWS * QK8_0 * sizeof (half)
+                            + MATMUL_TOKENS * QK8_0 * sizeof (float)];
+  matmul_tile<F, S, false> (weights, weights, x, y, n_rows, n_cols, n_tokens,
+                            dense_rows{}, position.y * MATMUL_ROWS,
+                            position.x * MATMUL_TOKENS, thread_position.x,
+                            simdgroup_index, scratch);
+}
+
+/* Multiply each expert of the stacked matrix WEIGHTS of format F, with
+   N_ROWS rows of N_COLS weights per expert, by the tokens routed to it.
+   Expert E's tokens are entries OFFSETS[E] through OFFSETS[E + 1] of
+   ENTRIES, as moe_group wrote them.  Entry V names row V of Y and row
+   V / DIVISOR of X.  Threadgroup (I, J, E) computes token tile I and row
+   tile J of expert E, and tiles past the expert's tokens return.  The
+   products overwrite Y.  With swiglu_store, WEIGHTS holds the gate
+   projections and UP the up projections of a SwiGLU, and Y receives
+   SiLU of each gate result times the matching up result.  */
+template <typename F, typename S = float>
+kernel void
+matmul_experts (device const uchar *weights [[buffer (0)]],
+                device const float *x [[buffer (1)]],
+                device float *y [[buffer (2)]],
+                constant uint &n_rows [[buffer (3)]],
+                constant uint &n_cols [[buffer (4)]],
+                device const uint *offsets [[buffer (5)]],
+                device const uint *entries [[buffer (6)]],
+                constant uint &divisor [[buffer (7)]],
+                device const uchar *up
+                [[buffer (8), function_constant (swiglu_store)]],
+                uint3 position [[threadgroup_position_in_grid]],
+                uint3 thread_position [[thread_position_in_threadgroup]],
+                uint simdgroup_index [[simdgroup_index_in_threadgroup]])
+{
+  /* The paired tile stores two output tiles.  */
+  threadgroup uchar scratch[2 * MATMUL_ROWS * MATMUL_TOKENS * sizeof (float)];
+  uint expert = position.z;
+  uint begin = offsets[expert];
+  uint n_tokens = offsets[expert + 1] - begin;
+  uint first_token = position.x * MATMUL_TOKENS;
+  if (first_token >= n_tokens)
+    return;
+  ulong offset = expert * (ulong (n_rows) * row_bytes_of<F> (n_cols));
+  expert_rows rows{ entries + begin, divisor };
+  uint first_row = position.y * MATMUL_ROWS;
+  if (swiglu_store)
+    matmul_tile<F, S, true> (weights + offset, up + offset, x, y, n_rows,
+                             n_cols, n_tokens, rows, first_row, first_token,
+                             thread_position.x, simdgroup_index, scratch);
+  else
+    matmul_tile<F, S, false> (weights + offset, weights + offset, x, y, n_rows,
+                              n_cols, n_tokens, rows, first_row, first_token,
+                              thread_position.x, simdgroup_index, scratch);
+}
+
+template [[host_name (
+    "matmul_experts_q4_0")]] kernel decltype (matmul_experts<q4_0_format,
+                                                             half>)
+    matmul_experts<q4_0_format, half>;
+template [[host_name (
+    "matmul_experts_q4k")]] kernel decltype (matmul_experts<q4k_format, half>)
+    matmul_experts<q4k_format, half>;
+template [[host_name (
+    "matmul_experts_q6k")]] kernel decltype (matmul_experts<q6k_format, half>)
+    matmul_experts<q6k_format, half>;
 
 template
     [[host_name ("matmul_q4_0")]] kernel decltype (matmul_q<q4_0_format, half>)

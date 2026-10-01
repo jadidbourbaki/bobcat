@@ -454,29 +454,21 @@ template
     [[host_name ("matvec_conv_q6k")]] kernel decltype (matvec_conv<q6k_lanes>)
         matvec_conv<q6k_lanes>;
 
-/* The SwiGLU pair of matvec_k, as matvec_q8_0_swiglu is of
-   matvec_q8_0.  */
+/* Store at Y SiLU of each gate result times the matching up result for
+   the threadgroup's rows of GATE and UP, which have N_ROWS rows of
+   N_COLS weights of K-quant format K, times the N_COLS floats at X.  The
+   simdgroups share the rows and split the columns, as in matvec_k.
+   PARTIALS holds each simdgroup's gate sums, then its up sums, then its
+   sum of squares, in (2 K_ROWS_PER_SIMDGROUP + 1) MAX_SIMDGROUPS floats.
+   NORM_WEIGHT and EPS normalize the input when fuse_norm is set.  */
 template <typename K>
-kernel void
-matvec_k_swiglu (device const uchar *gate [[buffer (0)]],
-                 device const uchar *up [[buffer (1)]],
-                 device const float *x [[buffer (2)]],
-                 device float *y [[buffer (3)]],
-                 constant uint &n_rows [[buffer (4)]],
-                 constant uint &n_cols [[buffer (5)]],
-                 device const float *norm_weight
-                 [[buffer (6), function_constant (fuse_norm)]],
-                 constant float &eps
-                 [[buffer (7), function_constant (fuse_norm)]],
-                 uint threadgroup_index [[threadgroup_position_in_grid]],
-                 uint simdgroup_index [[simdgroup_index_in_threadgroup]],
-                 uint simdgroups [[simdgroups_per_threadgroup]],
-                 uint lane [[thread_index_in_simdgroup]])
+static void
+swiglu_rows (device const uchar *gate, device const uchar *up,
+             device const float *x, device float *y, uint n_rows, uint n_cols,
+             device const float *norm_weight, float eps,
+             threadgroup float *partials, uint threadgroup_index,
+             uint simdgroup_index, uint simdgroups, uint lane)
 {
-  /* The simdgroups share the threadgroup's rows and split the columns,
-     as in matvec_k.  PARTIALS holds each simdgroup's gate sums, then its
-     up sums, then its sum of squares.  */
-  threadgroup float partials[(2 * K_ROWS_PER_SIMDGROUP + 1) * MAX_SIMDGROUPS];
   uint first_row = threadgroup_index * K_ROWS_PER_SIMDGROUP;
   uint n_blocks = n_cols / K::block_weights;
   ulong row_bytes = ulong (n_blocks) * K::block_bytes;
@@ -540,6 +532,31 @@ matvec_k_swiglu (device const uchar *gate [[buffer (0)]],
   g *= scale;
   u *= scale;
   y[row] = g / (1.0f + precise::exp (-g)) * u;
+}
+
+/* The SwiGLU pair of matvec_k, as matvec_q8_0_swiglu is of
+   matvec_q8_0.  */
+template <typename K>
+kernel void
+matvec_k_swiglu (device const uchar *gate [[buffer (0)]],
+                 device const uchar *up [[buffer (1)]],
+                 device const float *x [[buffer (2)]],
+                 device float *y [[buffer (3)]],
+                 constant uint &n_rows [[buffer (4)]],
+                 constant uint &n_cols [[buffer (5)]],
+                 device const float *norm_weight
+                 [[buffer (6), function_constant (fuse_norm)]],
+                 constant float &eps
+                 [[buffer (7), function_constant (fuse_norm)]],
+                 uint threadgroup_index [[threadgroup_position_in_grid]],
+                 uint simdgroup_index [[simdgroup_index_in_threadgroup]],
+                 uint simdgroups [[simdgroups_per_threadgroup]],
+                 uint lane [[thread_index_in_simdgroup]])
+{
+  threadgroup float partials[(2 * K_ROWS_PER_SIMDGROUP + 1) * MAX_SIMDGROUPS];
+  swiglu_rows<K> (gate, up, x, y, n_rows, n_cols, fuse_norm ? norm_weight : x,
+                  fuse_norm ? eps : 0.0f, partials, threadgroup_index,
+                  simdgroup_index, simdgroups, lane);
 }
 
 template [[host_name (

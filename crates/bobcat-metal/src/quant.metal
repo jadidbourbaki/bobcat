@@ -146,12 +146,14 @@ struct q4k_format
       }
     float group_scale = d * float (scale);
     float group_min = dmin * float (min);
-    device const uchar *quants = block + 16 + (j / 2) * 32 + o % 32;
+    /* Rows span whole 144-byte blocks, and 16 divides E, so the 16
+       quant bytes start on a 16-byte boundary.  */
+    device const uchar4 *quants
+        = (device const uchar4 *)(block + 16 + (j / 2) * 32 + o % 32);
     uint shift = j % 2 == 0 ? 0 : 4;
     for (uint i = 0; i < 4; i++)
       {
-        uint4 q = uint4 (quants[4 * i], quants[4 * i + 1], quants[4 * i + 2],
-                         quants[4 * i + 3]);
+        uint4 q = uint4 (quants[i]);
         out[i] = half4 (group_scale * float4 ((q >> shift) & 0xf) - group_min);
       }
   }

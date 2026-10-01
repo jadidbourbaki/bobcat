@@ -52,6 +52,15 @@ enum
   FLASH_KEYS = 32,
   FLASH_SIMDGROUPS = 4,
   FLASH_HEAD_DIM = 64,
+  /* The mixture-of-experts kernels' limits.  The host checks the model
+     against both.  A routing threadgroup has MOE_ROUTE_SIMDGROUPS
+     simdgroups and routes MOE_ROUTE_TOKENS tokens.  A grouping
+     threadgroup has MOE_GROUP_SIMDGROUPS simdgroups.  */
+  MOE_MAX_EXPERTS = 128,
+  MOE_MAX_USED = 8,
+  MOE_ROUTE_SIMDGROUPS = 32,
+  MOE_ROUTE_TOKENS = 8,
+  MOE_GROUP_SIMDGROUPS = 32,
   /* A matmul threadgroup computes MATMUL_ROWS rows by MATMUL_TOKENS
      tokens with four simdgroups, each owning 32 rows by 16 tokens.  */
   MATMUL_ROWS = 64,

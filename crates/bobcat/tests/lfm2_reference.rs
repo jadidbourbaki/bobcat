@@ -19,9 +19,10 @@ use bobcat::{Hyperparameters, Model, State, Trace};
 const TOLERANCE: f64 = 1e-4;
 
 /// The largest error allowed when the KV cache holds half precision, which rounds every cached
-/// key and value to 11 significant bits. On LFM2.5-350M the largest error measured was 1.2e-3.
+/// key and value to 11 significant bits, or when batched matmuls multiply half-precision weight
+/// tiles. On LFM2.5-350M the largest error measured was 1.2e-3.
 #[cfg(target_os = "macos")]
-const HALF_KV_TOLERANCE: f64 = 5e-3;
+const HALF_TOLERANCE: f64 = 5e-3;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -51,6 +52,22 @@ fn q4_k_m_scalar() -> TestResult {
 #[test]
 fn moe_q4_k_m_scalar() -> TestResult {
     check_scalar("LFM2.5-8B-A1B-Q4_K_M.gguf", "LFM2.5-8B-A1B-Q4_K_M")
+}
+
+/// At generated token 12 of the 8B reference, the float pass scores transformers' token 3980 at
+/// 32.29 and token 278 at 32.24. Half precision anywhere flips the pick. Both 8B passes keep a
+/// float cache, and the batched pass, whose matmuls multiply half-precision weight tiles, checks
+/// the first 12 generated tokens.
+#[cfg(target_os = "macos")]
+#[test]
+fn moe_q4_k_m_metal() -> TestResult {
+    check_metal("LFM2.5-8B-A1B-Q4_K_M", false, false)
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn moe_q4_k_m_metal_batch() -> TestResult {
+    check_metal_generating("LFM2.5-8B-A1B-Q4_K_M", false, true, 12)
 }
 
 #[cfg(target_os = "macos")]
@@ -127,7 +144,7 @@ fn long_prefill_matches_steps(model_file: &str) -> TestResult {
     }
     let error = relative_error(&batch_logits, &step_logits);
     assert!(
-        error < HALF_KV_TOLERANCE,
+        error < HALF_TOLERANCE,
         "{model_file} long prefill error {error}"
     );
     Ok(())
@@ -353,7 +370,7 @@ fn check_scalar(model_file: &str, ref_name: &str) -> TestResult {
         model: &model,
         state: State::new(&model, reference.n_ctx()?)?,
     };
-    compare(&model, &reference, &mut pass, false, TOLERANCE)
+    compare(&model, &reference, &mut pass, false, TOLERANCE, usize::MAX)
 }
 
 /// Compare the Metal pass on `models/NAME.gguf` against the dump in `models/ref/NAME`. The KV
@@ -361,6 +378,17 @@ fn check_scalar(model_file: &str, ref_name: &str) -> TestResult {
 /// `batched` is true.
 #[cfg(target_os = "macos")]
 fn check_metal(name: &str, kv_half: bool, batched: bool) -> TestResult {
+    check_metal_generating(name, kv_half, batched, usize::MAX)
+}
+
+/// Run [`check_metal`] with only the first `generated` greedy tokens checked.
+#[cfg(target_os = "macos")]
+fn check_metal_generating(
+    name: &str,
+    kv_half: bool,
+    batched: bool,
+    generated: usize,
+) -> TestResult {
     let Some((model, reference)) = load(&format!("{name}.gguf"), name)? else {
         return Ok(());
     };
@@ -372,12 +400,12 @@ fn check_metal(name: &str, kv_half: bool, batched: bool) -> TestResult {
         }
     };
     let mut gpu = bobcat::Lfm2Metal::new(&model, &mut metal, reference.n_ctx()?, kv_half)?;
-    let tolerance = if kv_half {
-        HALF_KV_TOLERANCE
+    let tolerance = if kv_half || batched {
+        HALF_TOLERANCE
     } else {
         TOLERANCE
     };
-    compare(&model, &reference, &mut gpu, batched, tolerance)
+    compare(&model, &reference, &mut gpu, batched, tolerance, generated)
 }
 
 /// A forward pass under test.
@@ -548,13 +576,15 @@ fn argmax(x: &[f32]) -> u32 {
 }
 
 /// Run `pass` on the prompt of `reference` and compare every activation within `tolerance`,
-/// then check greedy decoding. The prompt runs in one prefill call when `batched` is true.
+/// then check the first `generated` tokens of greedy decoding. The prompt runs in one prefill call
+/// when `batched` is true.
 fn compare(
     model: &Model,
     reference: &Reference,
     pass: &mut impl Pass,
     batched: bool,
     tolerance: f64,
+    generated: usize,
 ) -> TestResult {
     let hp = model.hyperparameters();
     let n_embd = hp.n_embd as usize;
@@ -628,7 +658,12 @@ fn compare(
     // next step.
     let mut predicted = vec![0; reference.generated.len()];
     pass.generate(&mut logits, &mut predicted)?;
-    for (g, (&got, &want)) in predicted.iter().zip(&reference.generated).enumerate() {
+    for (g, (&got, &want)) in predicted
+        .iter()
+        .zip(&reference.generated)
+        .take(generated)
+        .enumerate()
+    {
         if got != want {
             return Err(format!("generated token {g} is {got}, transformers chose {want}").into());
         }

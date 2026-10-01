@@ -24,10 +24,11 @@ const DEFAULT_TAG: &str = "Q8_0";
 
 /// The short names of the models bobcat supports, with the Hugging Face repository each one names.
 /// Supporting a new model adds a line here.
-const ALIASES: [(&str, &str, &str); 3] = [
+const ALIASES: [(&str, &str, &str); 4] = [
     ("lfm2.5:350m", "LiquidAI", "LFM2.5-350M-GGUF"),
     ("lfm2.5:1.2b", "LiquidAI", "LFM2.5-1.2B-Instruct-GGUF"),
     ("lfm2.5:2.6b", "LiquidAI", "LFM2.5-2.6B-GGUF"),
+    ("lfm2.5:8b", "LiquidAI", "LFM2.5-8B-A1B-GGUF"),
 ];
 
 /// The tag an alias without one picks. Q4_K_M files are half the size of Q8_0 ones, and bobcat

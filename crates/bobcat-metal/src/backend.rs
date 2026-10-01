@@ -40,6 +40,7 @@ const SOURCE: &str = concat!(
     include_str!("common.metal"),
     include_str!("quant.metal"),
     include_str!("matvec.metal"),
+    include_str!("moe.metal"),
     include_str!("norm.metal"),
     include_str!("attention.metal"),
     include_str!("conv.metal"),
@@ -52,7 +53,6 @@ const TENSOR_MATMUL_TOKENS: u32 = 64;
 /// On M4 Pro, 32-row tiles improve 6144-row and square matrix timings by about 2%.
 /// Matches `TENSOR_ROWS` in `matmul_tensor.metal`.
 const TENSOR_MATMUL_ROWS: u32 = 32;
-
 /// A sweep of 1, 2, and 4 rows per threadgroup against 2, 4, and 8 simdgroups on an M4 Pro put
 /// two rows first on every model. Two simdgroups won on rows of 1024 columns, lifting
 /// LFM2.5-350M from 445 to 495 tokens per second. Four simdgroups won by about 1% on the wider
@@ -78,6 +78,18 @@ const ELEMENTWISE_THREADS: usize = 256;
 const ATTENTION_CHUNK: u32 = 64;
 /// A 64-query batch cuts 512-query scratch by eight times. The 4096-token screen held GPU time.
 const ATTENTION_QUERY_BATCH: u32 = 64;
+
+/// The most experts a mixture-of-experts layer may hold. Must match `MOE_MAX_EXPERTS` in
+/// `common.metal`.
+pub const MOE_MAX_EXPERTS: u32 = 128;
+/// The most experts the router may pick for a token. Must match `MOE_MAX_USED` in
+/// `common.metal`.
+pub const MOE_MAX_USED: u32 = 8;
+/// Must match `MOE_ROUTE_SIMDGROUPS`, `MOE_ROUTE_TOKENS`, and `MOE_GROUP_SIMDGROUPS` in
+/// `common.metal`.
+const MOE_ROUTE_SIMDGROUPS: usize = 32;
+const MOE_ROUTE_TOKENS: u32 = 8;
+const MOE_GROUP_SIMDGROUPS: usize = 32;
 
 /// Must match `FLASH_QUERIES`, `FLASH_SIMDGROUPS`, and `FLASH_HEAD_DIM` in `common.metal`.
 const FLASH_QUERIES: u32 = 32;
@@ -196,6 +208,20 @@ pub enum Error {
     /// The format has no kernel that expands it into half precision.
     #[error("{0:?} matrices cannot expand into half precision")]
     NoExpansion(Format),
+    /// The format has no mixture-of-experts kernels.
+    #[error("{0:?} matrices cannot hold experts")]
+    NoExperts(Format),
+    /// The router picks more experts than the kernels allow.
+    #[error(
+        "the router picks {n_used} of {n_experts} experts, and the kernels allow at most \
+         {MOE_MAX_USED} of {MOE_MAX_EXPERTS}"
+    )]
+    ExpertLimits {
+        /// The experts of each layer.
+        n_experts: u32,
+        /// The experts the router picks for each token.
+        n_used: u32,
+    },
     /// The GPU reported an error while running a command buffer.
     #[error("the GPU failed to run a command buffer: {0}")]
     Execution(String),
@@ -352,6 +378,35 @@ impl Format {
         }
     }
 
+    /// Report whether the expert launches such as [`Metal::matvec_experts_swiglu`] run matrices of
+    /// this format.
+    pub fn holds_experts(self) -> bool {
+        self.experts_names().is_some()
+    }
+
+    /// Return the expert kernels of this format, if it has them: the SwiGLU and down projection
+    /// matrix-vector products, and the grouped matrix-matrix product.
+    fn experts_names(self) -> Option<[&'static str; 3]> {
+        match self {
+            Self::Q4_0 => Some([
+                "matvec_experts_swiglu_q4_0",
+                "matvec_experts_down_q4_0",
+                "matmul_experts_q4_0",
+            ]),
+            Self::Q4K => Some([
+                "matvec_experts_swiglu_q4k",
+                "matvec_experts_down_q4k",
+                "matmul_experts_q4k",
+            ]),
+            Self::Q6K => Some([
+                "matvec_experts_swiglu_q6k",
+                "matvec_experts_down_q6k",
+                "matmul_experts_q6k",
+            ]),
+            Self::F16 | Self::Q8_0 => None,
+        }
+    }
+
     /// Return the kernel that expands a matrix of this format into half precision, if the format
     /// has one.
     fn expand_name(self) -> Option<&'static str> {
@@ -436,6 +491,17 @@ enum Kernel {
     Copy,
     Embed(Format),
     Argmax,
+    MoeRoute {
+        norm: bool,
+    },
+    MoeGroup,
+    MoeCombine,
+    ExpertsSwiglu(Format),
+    ExpertsDown(Format),
+    MatmulExperts {
+        format: Format,
+        swiglu: bool,
+    },
 }
 
 impl Kernel {
@@ -463,6 +529,18 @@ impl Kernel {
             Self::Copy => "copy",
             Self::Embed(format) => format.kernel_names()[3],
             Self::Argmax => "argmax",
+            Self::MoeRoute { .. } => "moe_route",
+            Self::MoeGroup => "moe_group",
+            Self::MoeCombine => "moe_combine",
+            Self::MatmulExperts { format, .. } => format
+                .experts_names()
+                .map_or("matmul_experts", |names| names[2]),
+            Self::ExpertsSwiglu(format) => format
+                .experts_names()
+                .map_or("matvec_experts_swiglu", |names| names[0]),
+            Self::ExpertsDown(format) => format
+                .experts_names()
+                .map_or("matvec_experts_down", |names| names[1]),
         }
     }
 }
@@ -487,6 +565,9 @@ struct FormatPipelines {
     /// Indexed by [`Store`].
     matmul: [Pipeline; 3],
     embed: Pipeline,
+    /// The expert SwiGLU and down projection, then the grouped expert product that overwrites
+    /// and the one that applies the SwiGLU, for the formats that hold experts.
+    experts: Option<[Pipeline; 4]>,
 }
 
 impl FormatPipelines {
@@ -529,6 +610,16 @@ impl FormatPipelines {
             };
             make_pipeline(compiler, library, name, Some(constants))
         };
+        let unfused = |name| conv(name, false);
+        let grouped_matmul = |name, swiglu_store| {
+            let constants = Constants {
+                rows_per_threadgroup: 0,
+                fuse_norm: false,
+                accumulate: false,
+                swiglu_store,
+            };
+            make_pipeline(compiler, library, name, Some(constants))
+        };
         let matvec_conv = match format.conv_name() {
             Some(name) => Some([conv(name, false)?, conv(name, true)?]),
             None => None,
@@ -546,6 +637,16 @@ impl FormatPipelines {
                 matmul(false, true)?,
             ],
             embed: make_pipeline(compiler, library, embed_name, None)?,
+            // The expert kernels read inputs normalized beforehand.
+            experts: match format.experts_names() {
+                Some([swiglu, down, grouped]) => Some([
+                    unfused(swiglu)?,
+                    unfused(down)?,
+                    grouped_matmul(grouped, false)?,
+                    grouped_matmul(grouped, true)?,
+                ]),
+                None => None,
+            },
         })
     }
 }
@@ -571,6 +672,10 @@ struct Pipelines {
     short_conv_history: Pipeline,
     copy: Pipeline,
     argmax: Pipeline,
+    /// Indexed by whether the launch fuses the norm.
+    moe_route: [Pipeline; 2],
+    moe_group: Pipeline,
+    moe_combine: Pipeline,
 }
 
 impl Pipelines {
@@ -579,6 +684,15 @@ impl Pipelines {
         library: &ProtocolObject<dyn MTLLibrary>,
     ) -> Result<Self, Error> {
         let plain = |name| make_pipeline(compiler, library, name, None);
+        let route = |fuse_norm| {
+            let constants = Constants {
+                rows_per_threadgroup: 0,
+                fuse_norm,
+                accumulate: false,
+                swiglu_store: false,
+            };
+            make_pipeline(compiler, library, "moe_route", Some(constants))
+        };
         Ok(Self {
             formats: Format::ALL
                 .into_iter()
@@ -599,7 +713,18 @@ impl Pipelines {
             short_conv_history: plain("short_conv_history")?,
             copy: plain("copy_floats")?,
             argmax: plain("argmax")?,
+            moe_route: [route(false)?, route(true)?],
+            moe_group: plain("moe_group")?,
+            moe_combine: plain("moe_combine")?,
         })
+    }
+
+    /// Return the expert pipelines of `format`, which an expert launch checked first.
+    fn experts(&self, format: Format) -> &[Pipeline; 4] {
+        self.formats[format.index()]
+            .experts
+            .as_ref()
+            .expect("expert launches check the format first")
     }
 
     fn get(&self, kernel: Kernel) -> &ProtocolObject<dyn MTLComputePipelineState> {
@@ -638,6 +763,14 @@ impl Pipelines {
             Kernel::Copy => &self.copy,
             Kernel::Embed(format) => &self.formats[format.index()].embed,
             Kernel::Argmax => &self.argmax,
+            Kernel::MoeRoute { norm } => &self.moe_route[usize::from(norm)],
+            Kernel::MoeGroup => &self.moe_group,
+            Kernel::MoeCombine => &self.moe_combine,
+            Kernel::ExpertsSwiglu(format) => &self.experts(format)[0],
+            Kernel::ExpertsDown(format) => &self.experts(format)[1],
+            Kernel::MatmulExperts { format, swiglu } => {
+                &self.experts(format)[2 + usize::from(swiglu)]
+            }
         }
     }
 }
@@ -1137,6 +1270,320 @@ impl Metal {
             n_rows,
             n_cols,
             weight_bytes: to_u64(matrix_bytes).saturating_mul(2),
+        })
+    }
+
+    /// Record the routing of each of the `n_tokens` tokens of `n_cols` floats at `x` to
+    /// `n_used` of `n_experts` experts.
+    ///
+    /// `router` is an F32 matrix with one row per expert, and `bias` holds a float per expert
+    /// that steers the pick. Each token's route goes to `route`, which holds `2 * n_used`
+    /// 32-bit words per token: the picked experts, then their weights.
+    ///
+    /// With `norm`, the launch RMS-normalizes each token first, stores the normalized tokens at
+    /// `normed`, and routes them.
+    pub fn moe_route(
+        &mut self,
+        x: View<'_>,
+        norm: Option<(Norm<'_>, View<'_>)>,
+        router: View<'_>,
+        bias: View<'_>,
+        route: View<'_>,
+        n_cols: u32,
+        n_experts: u32,
+        n_used: u32,
+        n_tokens: u32,
+    ) -> Result<(), Error> {
+        check_expert_limits(n_experts, n_used)?;
+        let cols = to_usize(n_cols);
+        let experts = to_usize(n_experts);
+        let tokens = to_usize(n_tokens);
+        let token_bytes = product(&[tokens, cols, FLOAT_BYTES]);
+        let mut args = vec![
+            buffer(x, token_bytes),
+            buffer(router, product(&[experts, cols, FLOAT_BYTES])),
+            buffer(bias, product(&[experts, FLOAT_BYTES])),
+            buffer(route, route_bytes(n_used, n_tokens)),
+            Arg::U32(n_cols),
+            Arg::U32(n_experts),
+            Arg::U32(n_used),
+            Arg::U32(n_tokens),
+        ];
+        if let Some((norm, normed)) = norm {
+            args.push(buffer(norm.weight, product(&[cols, FLOAT_BYTES])));
+            args.push(Arg::F32(norm.eps));
+            args.push(buffer(normed, token_bytes));
+        }
+        self.launch(&Launch {
+            kernel: Kernel::MoeRoute {
+                norm: norm.is_some(),
+            },
+            args: &args,
+            dispatch: Dispatch::Threadgroups(
+                [to_usize(n_tokens.div_ceil(MOE_ROUTE_TOKENS)), 1, 1],
+                [SIMD_WIDTH * MOE_ROUTE_SIMDGROUPS, 1, 1],
+            ),
+            n_rows: n_experts,
+            n_cols,
+            weight_bytes: to_u64(product(&[experts, cols, FLOAT_BYTES])),
+        })
+    }
+
+    /// Record the SwiGLU of every routed expert of each of the `n_tokens` tokens of `n_cols`
+    /// floats at `x`.
+    ///
+    /// `gate` and `up` stack `n_experts` experts of `n_rows` rows of `n_cols` weights of
+    /// `format`. `route` holds the routes [`Metal::moe_route`] wrote. Slot `s` of token `t` stores
+    /// its `n_rows` results at row `n_used * t + s` of `y`.
+    pub fn matvec_experts_swiglu(
+        &mut self,
+        format: Format,
+        gate: View<'_>,
+        up: View<'_>,
+        n_rows: u32,
+        n_cols: u32,
+        n_experts: u32,
+        x: View<'_>,
+        route: View<'_>,
+        n_used: u32,
+        y: View<'_>,
+        n_tokens: u32,
+    ) -> Result<(), Error> {
+        if format.experts_names().is_none() {
+            return Err(Error::NoExperts(format));
+        }
+        check_expert_limits(n_experts, n_used)?;
+        let rows = to_usize(n_rows);
+        let cols = to_usize(n_cols);
+        let tokens = to_usize(n_tokens);
+        let used = to_usize(n_used);
+        let stacked_bytes = format.matrix_bytes(product(&[rows, to_usize(n_experts)]), cols);
+        let args = [
+            buffer(gate, stacked_bytes),
+            buffer(up, stacked_bytes),
+            buffer(x, product(&[tokens, cols, FLOAT_BYTES])),
+            buffer(route, route_bytes(n_used, n_tokens)),
+            buffer(y, product(&[tokens, used, rows, FLOAT_BYTES])),
+            Arg::U32(n_rows),
+            Arg::U32(n_cols),
+            Arg::U32(n_used),
+        ];
+        self.launch(&Launch {
+            kernel: Kernel::ExpertsSwiglu(format),
+            args: &args,
+            dispatch: Dispatch::Threadgroups(
+                [
+                    to_usize(n_rows.div_ceil(K_QUANT_ROWS_PER_SIMDGROUP)),
+                    used,
+                    tokens,
+                ],
+                [SIMD_WIDTH * to_usize(K_QUANT_SIMDGROUPS), 1, 1],
+            ),
+            n_rows,
+            n_cols,
+            weight_bytes: to_u64(format.matrix_bytes(rows, cols))
+                .saturating_mul(2 * u64::from(n_used) * u64::from(n_tokens)),
+        })
+    }
+
+    /// Record the addition to each of the `n_tokens` tokens' `n_rows` floats at `y` of the
+    /// weighted sum of its routed experts' down projections.
+    ///
+    /// `weights` stacks `n_experts` experts of `n_rows` rows of `n_cols` weights of `format`.
+    /// `route` holds the routes [`Metal::moe_route`] wrote, and row `n_used * t + s` of `x` holds
+    /// the `n_cols` inputs of slot `s` of token `t`.
+    pub fn matvec_experts_down(
+        &mut self,
+        format: Format,
+        weights: View<'_>,
+        n_rows: u32,
+        n_cols: u32,
+        n_experts: u32,
+        x: View<'_>,
+        route: View<'_>,
+        n_used: u32,
+        y: View<'_>,
+        n_tokens: u32,
+    ) -> Result<(), Error> {
+        if format.experts_names().is_none() {
+            return Err(Error::NoExperts(format));
+        }
+        check_expert_limits(n_experts, n_used)?;
+        let rows = to_usize(n_rows);
+        let cols = to_usize(n_cols);
+        let tokens = to_usize(n_tokens);
+        let args = [
+            buffer(
+                weights,
+                format.matrix_bytes(product(&[rows, to_usize(n_experts)]), cols),
+            ),
+            buffer(x, product(&[tokens, to_usize(n_used), cols, FLOAT_BYTES])),
+            buffer(route, route_bytes(n_used, n_tokens)),
+            buffer(y, product(&[tokens, rows, FLOAT_BYTES])),
+            Arg::U32(n_rows),
+            Arg::U32(n_cols),
+            Arg::U32(n_used),
+        ];
+        self.launch(&Launch {
+            kernel: Kernel::ExpertsDown(format),
+            args: &args,
+            dispatch: Dispatch::Threadgroups(
+                [
+                    to_usize(n_rows.div_ceil(K_QUANT_ROWS_PER_SIMDGROUP)),
+                    tokens,
+                    1,
+                ],
+                // Each slot of the route gets its own simdgroups.
+                [
+                    SIMD_WIDTH * to_usize(K_QUANT_SIMDGROUPS) * to_usize(n_used),
+                    1,
+                    1,
+                ],
+            ),
+            n_rows,
+            n_cols,
+            weight_bytes: to_u64(format.matrix_bytes(rows, cols))
+                .saturating_mul(u64::from(n_used) * u64::from(n_tokens)),
+        })
+    }
+
+    /// Record the grouping by expert of the routes of `n_tokens` tokens, for
+    /// [`Metal::matmul_experts`].
+    ///
+    /// Entry `n_used * t + s` stands for slot `s` of token `t`. Expert `e`'s entries go to
+    /// `entries`, which holds `n_used * n_tokens` words, from word `offsets[e]` onward. `offsets`
+    /// holds `n_experts + 1` words.
+    pub fn moe_group(
+        &mut self,
+        route: View<'_>,
+        offsets: View<'_>,
+        entries: View<'_>,
+        n_experts: u32,
+        n_used: u32,
+        n_tokens: u32,
+    ) -> Result<(), Error> {
+        check_expert_limits(n_experts, n_used)?;
+        let args = [
+            buffer(route, route_bytes(n_used, n_tokens)),
+            buffer(offsets, product(&[to_usize(n_experts) + 1, FLOAT_BYTES])),
+            buffer(
+                entries,
+                product(&[to_usize(n_used), to_usize(n_tokens), FLOAT_BYTES]),
+            ),
+            Arg::U32(n_experts),
+            Arg::U32(n_used),
+            Arg::U32(n_tokens),
+        ];
+        self.launch(&Launch {
+            kernel: Kernel::MoeGroup,
+            args: &args,
+            dispatch: Dispatch::Threadgroups([1, 1, 1], [MOE_GROUP_SIMDGROUPS * SIMD_WIDTH, 1, 1]),
+            n_rows: 0,
+            n_cols: 0,
+            weight_bytes: 0,
+        })
+    }
+
+    /// Record the products of each of the `n_experts` experts stacked in `weights`, with
+    /// `n_rows` rows of `n_cols` weights of `format` each, with the inputs routed to it.
+    ///
+    /// `offsets` and `entries` hold the groups [`Metal::moe_group`] wrote for `n_tokens` tokens
+    /// that each pick `n_used` experts. Entry `v` writes row `v` of `y`. It reads row `v` of `x`,
+    /// or row `v / n_used` when `shared_input` is true, so the slots of a token share its input.
+    /// The products overwrite `y`. With `up`, `weights` holds gate projections and `up` the
+    /// matching up projections of a SwiGLU, and `y` receives SiLU of each gate result times the
+    /// matching up result.
+    pub fn matmul_experts(
+        &mut self,
+        format: Format,
+        weights: View<'_>,
+        up: Option<View<'_>>,
+        n_rows: u32,
+        n_cols: u32,
+        n_experts: u32,
+        x: View<'_>,
+        shared_input: bool,
+        offsets: View<'_>,
+        entries: View<'_>,
+        n_used: u32,
+        y: View<'_>,
+        n_tokens: u32,
+    ) -> Result<(), Error> {
+        if format.experts_names().is_none() {
+            return Err(Error::NoExperts(format));
+        }
+        check_expert_limits(n_experts, n_used)?;
+        let rows = to_usize(n_rows);
+        let cols = to_usize(n_cols);
+        let entry_count = product(&[to_usize(n_used), to_usize(n_tokens)]);
+        let input_rows = if shared_input {
+            to_usize(n_tokens)
+        } else {
+            entry_count
+        };
+        let stacked_bytes = format.matrix_bytes(product(&[rows, to_usize(n_experts)]), cols);
+        let mut args = vec![
+            buffer(weights, stacked_bytes),
+            buffer(x, product(&[input_rows, cols, FLOAT_BYTES])),
+            buffer(y, product(&[entry_count, rows, FLOAT_BYTES])),
+            Arg::U32(n_rows),
+            Arg::U32(n_cols),
+            buffer(offsets, product(&[to_usize(n_experts) + 1, FLOAT_BYTES])),
+            buffer(entries, product(&[entry_count, FLOAT_BYTES])),
+            Arg::U32(if shared_input { n_used } else { 1 }),
+        ];
+        if let Some(up) = up {
+            args.push(buffer(up, stacked_bytes));
+        }
+        // An expert receives each token at most once, so `n_tokens` bounds its token tiles.
+        self.launch(&Launch {
+            kernel: Kernel::MatmulExperts {
+                format,
+                swiglu: up.is_some(),
+            },
+            args: &args,
+            dispatch: Dispatch::Threadgroups(
+                [
+                    to_usize(n_tokens.div_ceil(MATMUL_TOKENS)),
+                    to_usize(n_rows.div_ceil(MATMUL_ROWS)),
+                    to_usize(n_experts),
+                ],
+                [MATMUL_SIMDGROUPS * SIMD_WIDTH, 1, 1],
+            ),
+            n_rows,
+            n_cols,
+            weight_bytes: to_u64(stacked_bytes).saturating_mul(if up.is_some() { 2 } else { 1 }),
+        })
+    }
+
+    /// Record the addition to each of the `n_tokens` tokens' `n_embd` floats at `y` of its routed
+    /// experts' outputs, each times its weight in `route`. Row `n_used * t + s` of `x` holds the
+    /// output of slot `s` of token `t`.
+    pub fn moe_combine(
+        &mut self,
+        x: View<'_>,
+        route: View<'_>,
+        y: View<'_>,
+        n_embd: u32,
+        n_used: u32,
+        n_tokens: u32,
+    ) -> Result<(), Error> {
+        let n = n_tokens.saturating_mul(n_embd);
+        let args = [
+            buffer(x, product(&[to_usize(n), to_usize(n_used), FLOAT_BYTES])),
+            buffer(route, route_bytes(n_used, n_tokens)),
+            buffer(y, product(&[to_usize(n), FLOAT_BYTES])),
+            Arg::U32(n_embd),
+            Arg::U32(n_used),
+            Arg::U32(n_tokens),
+        ];
+        self.launch(&Launch {
+            kernel: Kernel::MoeCombine,
+            args: &args,
+            dispatch: elementwise(n),
+            n_rows: 0,
+            n_cols: 0,
+            weight_bytes: 0,
         })
     }
 
@@ -1766,6 +2213,20 @@ impl Metal {
             weight_bytes: 0,
         })
     }
+}
+
+/// Return the bytes of the routes of `n_tokens` tokens that each pick `n_used` experts, as
+/// [`Metal::moe_route`] writes them.
+pub fn route_bytes(n_used: u32, n_tokens: u32) -> usize {
+    product(&[2, to_usize(n_used), to_usize(n_tokens), FLOAT_BYTES])
+}
+
+/// Check that the expert kernels can route to `n_used` of `n_experts` experts.
+fn check_expert_limits(n_experts: u32, n_used: u32) -> Result<(), Error> {
+    if n_experts > MOE_MAX_EXPERTS || n_used > MOE_MAX_USED || n_used == 0 || n_used > n_experts {
+        return Err(Error::ExpertLimits { n_experts, n_used });
+    }
+    Ok(())
 }
 
 /// Return the floats of scratch [`Metal::attention`] needs for `n_queries` queries of `n_heads`
