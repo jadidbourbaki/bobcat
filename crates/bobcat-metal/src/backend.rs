@@ -77,6 +77,10 @@ const ELEMENTWISE_THREADS: usize = 256;
 
 /// Must match `ATTENTION_CHUNK` in `common.metal`.
 const ATTENTION_CHUNK: u32 = 64;
+/// Heads at least this wide take `attention_wide` for the chunked pass.
+const ATTENTION_WIDE_HEAD_DIM: u32 = 128;
+/// Must match `ATTENTION_WIDE_SIMDGROUPS` in `common.metal`.
+const ATTENTION_WIDE_SIMDGROUPS: usize = 4;
 /// A 64-query batch cuts 512-query scratch by eight times. The 4096-token screen held GPU time.
 const ATTENTION_QUERY_BATCH: u32 = 64;
 
@@ -525,6 +529,9 @@ enum Kernel {
     AttentionChunk {
         half: bool,
     },
+    AttentionWide {
+        half: bool,
+    },
     AttentionCombine,
     AttentionFlash {
         half: bool,
@@ -549,6 +556,9 @@ enum Kernel {
         swiglu: bool,
     },
     GdnConv,
+    GdnConvBatch,
+    GdnConvHistory,
+    GdnGatedNorm,
     GdnQkNorm,
     GdnGates,
     GdnRecurrence,
@@ -567,6 +577,7 @@ impl Kernel {
             Self::NormRope { .. } => "norm_rope",
             Self::ConvertHalf => "convert_half",
             Self::AttentionChunk { .. } => "attention_chunk",
+            Self::AttentionWide { .. } => "attention_wide",
             Self::AttentionCombine => "attention_combine",
             Self::AttentionFlash { .. } => "attention_flash",
             Self::ShortConv => "short_conv",
@@ -583,6 +594,9 @@ impl Kernel {
             Self::Argmax => "argmax",
             Self::MoeRoute { .. } => "moe_route",
             Self::GdnConv => "gdn_conv",
+            Self::GdnConvBatch => "gdn_conv_batch",
+            Self::GdnConvHistory => "gdn_conv_history",
+            Self::GdnGatedNorm => "gdn_gated_norm",
             Self::GdnQkNorm => "gdn_qk_norm",
             Self::GdnGates => "gdn_gates",
             Self::GdnRecurrence => "gdn_recurrence",
@@ -722,6 +736,7 @@ struct Pipelines {
     convert_half: Pipeline,
     /// Indexed by whether the caches hold half precision.
     attention_chunk: [Pipeline; 2],
+    attention_wide: [Pipeline; 2],
     attention_combine: Pipeline,
     /// Indexed by whether the caches hold half precision.
     attention_flash: [Pipeline; 2],
@@ -735,6 +750,9 @@ struct Pipelines {
     moe_group: Pipeline,
     moe_combine: Pipeline,
     gdn_conv: Pipeline,
+    gdn_conv_batch: Pipeline,
+    gdn_conv_history: Pipeline,
+    gdn_gated_norm: Pipeline,
     gdn_qk_norm: Pipeline,
     gdn_gates: Pipeline,
     gdn_recurrence: Pipeline,
@@ -770,6 +788,7 @@ impl Pipelines {
             norm_rope: [plain("norm_rope_f32")?, plain("norm_rope_f16")?],
             convert_half: plain("convert_half")?,
             attention_chunk: [plain("attention_chunk_f32")?, plain("attention_chunk_f16")?],
+            attention_wide: [plain("attention_wide_f32")?, plain("attention_wide_f16")?],
             attention_combine: plain("attention_combine")?,
             attention_flash: [plain("attention_flash_f32")?, plain("attention_flash_f16")?],
             short_conv: plain("short_conv")?,
@@ -781,6 +800,9 @@ impl Pipelines {
             moe_group: plain("moe_group")?,
             moe_combine: plain("moe_combine")?,
             gdn_conv: plain("gdn_conv")?,
+            gdn_conv_batch: plain("gdn_conv_batch")?,
+            gdn_conv_history: plain("gdn_conv_history")?,
+            gdn_gated_norm: plain("gdn_gated_norm")?,
             gdn_qk_norm: plain("gdn_qk_norm")?,
             gdn_gates: plain("gdn_gates")?,
             gdn_recurrence: plain("gdn_recurrence")?,
@@ -814,6 +836,7 @@ impl Pipelines {
             Kernel::NormRope { half } => &self.norm_rope[usize::from(half)],
             Kernel::ConvertHalf => &self.convert_half,
             Kernel::AttentionChunk { half } => &self.attention_chunk[usize::from(half)],
+            Kernel::AttentionWide { half } => &self.attention_wide[usize::from(half)],
             Kernel::AttentionCombine => &self.attention_combine,
             Kernel::AttentionFlash { half } => &self.attention_flash[usize::from(half)],
             Kernel::ShortConv => &self.short_conv,
@@ -835,6 +858,9 @@ impl Pipelines {
             Kernel::Argmax => &self.argmax,
             Kernel::MoeRoute { norm } => &self.moe_route[usize::from(norm)],
             Kernel::GdnConv => &self.gdn_conv,
+            Kernel::GdnConvBatch => &self.gdn_conv_batch,
+            Kernel::GdnConvHistory => &self.gdn_conv_history,
+            Kernel::GdnGatedNorm => &self.gdn_gated_norm,
             Kernel::GdnQkNorm => &self.gdn_qk_norm,
             Kernel::GdnGates => &self.gdn_gates,
             Kernel::GdnRecurrence => &self.gdn_recurrence,
@@ -1702,9 +1728,43 @@ impl Metal {
             Arg::U32(kernel_size),
             Arg::U32(n_tokens),
         ];
+        // A batch at least as long as the history runs every token at once, then moves the
+        // history forward once every thread has read it.
+        if n_tokens < kernel_size - 1 || n_tokens == 1 {
+            return self.launch(&Launch {
+                kernel: Kernel::GdnConv,
+                args: &args,
+                dispatch: elementwise(channels),
+                n_rows: 0,
+                n_cols: 0,
+                weight_bytes: 0,
+            });
+        }
         self.launch(&Launch {
-            kernel: Kernel::GdnConv,
+            kernel: Kernel::GdnConvBatch,
             args: &args,
+            dispatch: Dispatch::Threads(
+                [to_usize(channels), to_usize(n_tokens), 1],
+                [ELEMENTWISE_THREADS, 1, 1],
+            ),
+            n_rows: 0,
+            n_cols: 0,
+            weight_bytes: 0,
+        })?;
+        self.barrier();
+        let history_args = [
+            buffer(x, token_bytes),
+            buffer(
+                history,
+                product(&[to_usize(channels), to_usize(kernel_size - 1), FLOAT_BYTES]),
+            ),
+            Arg::U32(channels),
+            Arg::U32(kernel_size),
+            Arg::U32(n_tokens),
+        ];
+        self.launch(&Launch {
+            kernel: Kernel::GdnConvHistory,
+            args: &history_args,
             dispatch: elementwise(channels),
             n_rows: 0,
             n_cols: 0,
@@ -1712,32 +1772,30 @@ impl Metal {
         })
     }
 
-    /// Record the L2 normalization of each query and key head of the `n_tokens` DeltaNet tokens
-    /// of `shape` at `y`, and the scaling of the queries by `q_scale`.
-    pub fn gdn_qk_norm(
+    /// Record the gated output norm of a DeltaNet layer: each of the `n_rows` rows of `v_dim`
+    /// floats at `x` divided by its root mean square with `eps`, scaled by `weight`, and
+    /// multiplied by SiLU of the matching floats at `gate`.
+    pub fn gdn_gated_norm(
         &mut self,
-        y: View<'_>,
-        shape: DeltaShape,
-        n_tokens: u32,
-        q_scale: f32,
+        x: View<'_>,
+        weight: View<'_>,
+        gate: View<'_>,
+        v_dim: u32,
+        n_rows: u32,
+        eps: f32,
     ) -> Result<(), Error> {
+        let bytes = product(&[to_usize(n_rows), to_usize(v_dim), FLOAT_BYTES]);
         let args = [
-            buffer(
-                y,
-                product(&[to_usize(n_tokens), to_usize(shape.conv_dim()), FLOAT_BYTES]),
-            ),
-            Arg::U32(shape.n_k_heads),
-            Arg::U32(shape.k_dim),
-            Arg::U32(shape.conv_dim()),
-            Arg::F32(q_scale),
+            buffer(x, bytes),
+            buffer(weight, product(&[to_usize(v_dim), FLOAT_BYTES])),
+            buffer(gate, bytes),
+            Arg::U32(v_dim),
+            Arg::F32(eps),
         ];
         self.launch(&Launch {
-            kernel: Kernel::GdnQkNorm,
+            kernel: Kernel::GdnGatedNorm,
             args: &args,
-            dispatch: Dispatch::Threadgroups(
-                [to_usize(shape.n_k_heads), to_usize(n_tokens), 2],
-                [SIMD_WIDTH, 1, 1],
-            ),
+            dispatch: Dispatch::Threadgroups([to_usize(n_rows), 1, 1], [SIMD_WIDTH, 1, 1]),
             n_rows: 0,
             n_cols: 0,
             weight_bytes: 0,
@@ -1781,10 +1839,15 @@ impl Metal {
 
     /// Record the gated delta rule of `n_tokens` DeltaNet tokens of `shape`.
     ///
-    /// `y` holds the tokens' normalized queries and keys and their values, and `beta` and `decay`
-    /// hold each token's gates per value head. `state` holds `n_v_heads` matrices of `k_dim`
+    /// `y` holds the tokens' queries and keys and their values, and `beta` and `decay` hold each
+    /// token's gates per value head. The recurrence divides each query and key head by its L2
+    /// norm and scales the queries by `q_scale`. `state` holds `n_v_heads` matrices of `k_dim`
     /// rows of `v_dim` floats, which the tokens update in order. Each token's `n_v_heads * v_dim`
     /// outputs go to `out`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a launch binds each buffer and shape the kernel reads"
+    )]
     pub fn gdn_recurrence(
         &mut self,
         y: View<'_>,
@@ -1794,6 +1857,7 @@ impl Metal {
         out: View<'_>,
         shape: DeltaShape,
         n_tokens: u32,
+        q_scale: f32,
     ) -> Result<(), Error> {
         if shape.k_dim == 0
             || shape.k_dim > GDN_MAX_K_DIM
@@ -1811,11 +1875,37 @@ impl Metal {
         let tokens = to_usize(n_tokens);
         let heads = to_usize(shape.n_v_heads);
         let gate_bytes = product(&[tokens, heads, FLOAT_BYTES]);
+        let y_bytes = product(&[tokens, to_usize(shape.conv_dim()), FLOAT_BYTES]);
+        // One token normalizes its heads inside the recurrence. In a batch the norms would
+        // lengthen every sequential step, so a launch of its own normalizes them first, and a
+        // zero scale tells the recurrence they are done. On Qwen3.5-0.8B the norms inside the
+        // recurrence sped decode by 3% and slowed a 512-token prefill by 6%.
+        let q_scale = if n_tokens > 1 {
+            let norm_args = [
+                buffer(y, y_bytes),
+                Arg::U32(shape.n_k_heads),
+                Arg::U32(shape.k_dim),
+                Arg::U32(shape.conv_dim()),
+                Arg::F32(q_scale),
+            ];
+            self.launch(&Launch {
+                kernel: Kernel::GdnQkNorm,
+                args: &norm_args,
+                dispatch: Dispatch::Threadgroups(
+                    [to_usize(shape.n_k_heads), tokens, 2],
+                    [SIMD_WIDTH, 1, 1],
+                ),
+                n_rows: 0,
+                n_cols: 0,
+                weight_bytes: 0,
+            })?;
+            self.barrier();
+            0.0
+        } else {
+            q_scale
+        };
         let args = [
-            buffer(
-                y,
-                product(&[tokens, to_usize(shape.conv_dim()), FLOAT_BYTES]),
-            ),
+            buffer(y, y_bytes),
             buffer(beta, gate_bytes),
             buffer(decay, gate_bytes),
             buffer(
@@ -1836,6 +1926,7 @@ impl Metal {
             Arg::U32(shape.k_dim),
             Arg::U32(shape.v_dim),
             Arg::U32(n_tokens),
+            Arg::F32(q_scale),
         ];
         self.launch(&Launch {
             kernel: Kernel::GdnRecurrence,
@@ -2113,8 +2204,19 @@ impl Metal {
                 Arg::U32(max_chunks),
                 Arg::F32(scale),
             ];
+            let (kernel, threads) = if head_dim >= ATTENTION_WIDE_HEAD_DIM {
+                (
+                    Kernel::AttentionWide { half: kv_half },
+                    ATTENTION_WIDE_SIMDGROUPS * SIMD_WIDTH,
+                )
+            } else {
+                (
+                    Kernel::AttentionChunk { half: kv_half },
+                    to_usize(ATTENTION_CHUNK),
+                )
+            };
             self.launch(&Launch {
-                kernel: Kernel::AttentionChunk { half: kv_half },
+                kernel,
                 args: &chunk_args,
                 dispatch: Dispatch::Threadgroups(
                     [
@@ -2122,7 +2224,7 @@ impl Metal {
                         to_usize(n_chunks),
                         to_usize(n_queries),
                     ],
-                    [to_usize(ATTENTION_CHUNK), 1, 1],
+                    [threads, 1, 1],
                 ),
                 n_rows: 0,
                 n_cols: 0,

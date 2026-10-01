@@ -43,32 +43,84 @@ gdn_conv (device const float *x [[buffer (0)]],
     h[i] = window[i];
 }
 
-/* Divide each query and key head of the N_TOKENS DeltaNet tokens at Y by
-   its L2 norm, and scale the queries by Q_SCALE.  Threadgroup (H, T, W)
-   of one simdgroup handles head H of token T, its queries when W is 0
-   and its keys when W is 1.  */
+/* The convolution of gdn_conv for a batch of at least KERNEL_SIZE - 1
+   tokens, with thread (C, T) computing channel C of token T.  HISTORY
+   holds the inputs before the batch, and gdn_conv_history moves it
+   forward after every thread has read it.  One thread per channel ran
+   the 512 tokens of a Qwen3.5-0.8B prefill one after another, which
+   took 5 percent of the prefill.  */
 kernel void
-gdn_qk_norm (device float *y [[buffer (0)]],
-             constant uint &n_k_heads [[buffer (1)]],
-             constant uint &k_dim [[buffer (2)]],
-             constant uint &conv_dim [[buffer (3)]],
-             constant float &q_scale [[buffer (4)]],
-             uint3 position [[threadgroup_position_in_grid]],
-             uint lane [[thread_index_in_simdgroup]])
+gdn_conv_batch (device const float *x [[buffer (0)]],
+                device const float *taps [[buffer (1)]],
+                device const float *history [[buffer (2)]],
+                device float *y [[buffer (3)]],
+                constant uint &channels [[buffer (4)]],
+                constant uint &kernel_size [[buffer (5)]],
+                constant uint &n_tokens [[buffer (6)]],
+                uint2 position [[thread_position_in_grid]])
 {
-  uint head = position.x;
-  uint token = position.y;
-  uint which = position.z;
-  device float *x = y + token * conv_dim + which * n_k_heads * k_dim + head * k_dim;
+  uint c = position.x;
+  uint t = position.y;
+  if (c >= channels || t >= n_tokens)
+    return;
+  uint past = kernel_size - 1;
+  device const float *w = taps + c * kernel_size;
   float sum = 0.0f;
-  for (uint i = lane; i < k_dim; i += SIMD_WIDTH)
-    sum += x[i] * x[i];
-  sum = simd_sum (sum);
-  float scale = which == 0 ? q_scale : 1.0f;
-  /* transformers fixes the epsilon of this norm at 1e-6.  */
-  float factor = scale / precise::sqrt (sum + 1e-6f);
-  for (uint i = lane; i < k_dim; i += SIMD_WIDTH)
-    x[i] *= factor;
+  for (uint i = 0; i < kernel_size; i++)
+    {
+      /* Tap I reads the input KERNEL_SIZE - 1 - I tokens back.  */
+      int source = int (t) + int (i) - int (past);
+      float input = source >= 0
+                        ? x[uint (source) * channels + c]
+                        : history[c * past + uint (int (past) + source)];
+      sum += w[i] * input;
+    }
+  y[t * channels + c] = sum / (1.0f + precise::exp (-sum));
+}
+
+/* Set HISTORY to the last KERNEL_SIZE - 1 inputs of the batch of
+   N_TOKENS tokens at X, after gdn_conv_batch has read the old history.
+   Thread C handles channel C.  */
+kernel void
+gdn_conv_history (device const float *x [[buffer (0)]],
+                  device float *history [[buffer (1)]],
+                  constant uint &channels [[buffer (2)]],
+                  constant uint &kernel_size [[buffer (3)]],
+                  constant uint &n_tokens [[buffer (4)]],
+                  uint c [[thread_position_in_grid]])
+{
+  if (c >= channels)
+    return;
+  uint past = kernel_size - 1;
+  for (uint i = 0; i < past; i++)
+    history[c * past + i] = x[(n_tokens - past + i) * channels + c];
+}
+
+/* Normalize each of the N_ROWS rows of V_DIM floats at X by its root mean
+   square, scale it by WEIGHT, and multiply it by SiLU of the matching
+   floats at GATE: the gated output norm of a DeltaNet layer, one row per
+   value head of each token.  Threadgroup R of one simdgroup handles row
+   R.  */
+kernel void
+gdn_gated_norm (device float *x [[buffer (0)]],
+                device const float *weight [[buffer (1)]],
+                device const float *gate [[buffer (2)]],
+                constant uint &v_dim [[buffer (3)]],
+                constant float &eps [[buffer (4)]],
+                uint row [[threadgroup_position_in_grid]],
+                uint lane [[thread_index_in_simdgroup]])
+{
+  device float *values = x + ulong (row) * v_dim;
+  device const float *gates = gate + ulong (row) * v_dim;
+  float sum = 0.0f;
+  for (uint i = lane; i < v_dim; i += SIMD_WIDTH)
+    sum += values[i] * values[i];
+  float scale = precise::rsqrt (simd_sum (sum) / float (v_dim) + eps);
+  for (uint i = lane; i < v_dim; i += SIMD_WIDTH)
+    {
+      float g = gates[i];
+      values[i] *= scale * weight[i] * (g / (1.0f + precise::exp (-g)));
+    }
 }
 
 /* Turn the N projections at BETA and ALPHA, one per DeltaNet value head of
@@ -95,16 +147,72 @@ gdn_gates (device float *beta [[buffer (0)]],
   alpha[index] = precise::exp (a[head] * softplus);
 }
 
+/* Set QUERY and KEY to a lane's four elements of a query head and its key
+   head in the DeltaNet token at TOKEN, from element FIRST of the head
+   onward, each head divided by its L2 norm and the query scaled by
+   Q_SCALE.  The norm's epsilon of 1e-6 is the one transformers fixes.
+   Every lane of the simdgroup calls this together.  */
+static void
+load_query_key (device const float *token, uint first, uint key_dim,
+                bool active, float q_scale, thread float4 &query,
+                thread float4 &key)
+{
+  query = 0.0f;
+  key = 0.0f;
+  if (active)
+    {
+      query = *(device const float4 *)(token + first);
+      key = *(device const float4 *)(token + key_dim + first);
+    }
+  /* A zero scale marks heads that gdn_qk_norm already normalized.  */
+  if (q_scale == 0.0f)
+    return;
+  query *= q_scale / precise::sqrt (simd_sum (dot (query, query)) + 1e-6f);
+  key *= 1.0f / precise::sqrt (simd_sum (dot (key, key)) + 1e-6f);
+}
+
+/* Divide each query and key head of the N_TOKENS DeltaNet tokens at Y by
+   its L2 norm, and scale the queries by Q_SCALE, for a batch, where the
+   norms inside gdn_recurrence would lengthen each sequential step.
+   Threadgroup (H, T, W) of one simdgroup handles head H of token T, its
+   queries when W is 0 and its keys when W is 1.  */
+kernel void
+gdn_qk_norm (device float *y [[buffer (0)]],
+             constant uint &n_k_heads [[buffer (1)]],
+             constant uint &k_dim [[buffer (2)]],
+             constant uint &conv_dim [[buffer (3)]],
+             constant float &q_scale [[buffer (4)]],
+             uint3 position [[threadgroup_position_in_grid]],
+             uint lane [[thread_index_in_simdgroup]])
+{
+  uint head = position.x;
+  uint token = position.y;
+  uint which = position.z;
+  device float *x
+      = y + token * conv_dim + which * n_k_heads * k_dim + head * k_dim;
+  float sum = 0.0f;
+  for (uint i = lane; i < k_dim; i += SIMD_WIDTH)
+    sum += x[i] * x[i];
+  sum = simd_sum (sum);
+  float scale = which == 0 ? q_scale : 1.0f;
+  float factor = scale / precise::sqrt (sum + 1e-6f);
+  for (uint i = lane; i < k_dim; i += SIMD_WIDTH)
+    x[i] *= factor;
+}
+
 /* Run the gated delta rule of N_TOKENS tokens on the state of each
    DeltaNet value head and store each token's outputs at OUT, V_DIM floats
-   per value head.  Y holds the tokens' normalized queries and keys and
-   their values, and BETA and DECAY hold each token's gates per value
-   head.  STATE holds N_V_HEADS matrices of K_DIM rows of V_DIM floats.
+   per value head.  Y holds the tokens' queries and keys and their
+   values, and BETA and DECAY hold each token's gates per value head.
+   Each query and key head is divided by its L2 norm, and the queries are
+   scaled by Q_SCALE, so no separate launch normalizes them.  STATE holds
+   N_V_HEADS matrices of K_DIM rows of V_DIM floats.
 
    Each simdgroup handles one column of the state of one value head, as
-   in MLX's gated_delta_kernel.  Lane L keeps rows L, L + 32, and so on
-   of the column in registers for the whole batch, and simd_sum finishes
-   each token's two dot products over the rows.  Threadgroup (B, J) of
+   in MLX's gated_delta_kernel and llama.cpp's kernel_gated_delta_net.
+   The lanes split the column's rows and keep them in registers for the
+   whole batch, and simd_sum finishes each token's two dot products over
+   the rows.  Threadgroup (B, J) of
    GDN_COLUMNS simdgroups handles columns GDN_COLUMNS B onward of value
    head J.  One column per simdgroup gives the 9B model's 32 heads of 128
    columns 4096 simdgroups, where one column per lane gave 128.  */
@@ -119,51 +227,60 @@ gdn_recurrence (device const float *y [[buffer (0)]],
                 constant uint &k_dim [[buffer (7)]],
                 constant uint &v_dim [[buffer (8)]],
                 constant uint &n_tokens [[buffer (9)]],
+                constant float &q_scale [[buffer (10)]],
                 uint2 position [[threadgroup_position_in_grid]],
                 uint simdgroup [[simdgroup_index_in_threadgroup]],
                 uint lane [[thread_index_in_simdgroup]])
 {
-  constexpr uint max_rows = GDN_MAX_K_DIM / SIMD_WIDTH;
+  /* Lane L holds the four rows 4 L onward in a float4, so the rows stay
+     in registers and its query and key loads are single vector loads.
+     Rows strided across the lanes in an array bounded by the head size
+     ran slower.  */
+  constexpr uint rows_per_lane = GDN_MAX_K_DIM / SIMD_WIDTH;
   uint column = position.x * GDN_COLUMNS + simdgroup;
   uint head = position.y;
   uint key_head = head % n_k_heads;
   uint key_dim = n_k_heads * k_dim;
   uint conv_dim = 2 * key_dim + n_v_heads * v_dim;
-  uint n_rows = k_dim / SIMD_WIDTH;
+  uint first = lane * rows_per_lane;
+  bool active = first < k_dim;
   device float *head_state = state + ulong (head) * k_dim * v_dim;
-  float rows[max_rows];
-  for (uint i = 0; i < max_rows; i++)
-    rows[i] = i < n_rows ? head_state[(lane + i * SIMD_WIDTH) * v_dim + column]
-                         : 0.0f;
+  float4 rows = 0.0f;
+  if (active)
+    for (uint i = 0; i < rows_per_lane; i++)
+      rows[i] = head_state[(first + i) * v_dim + column];
 
+  /* Each step loads and normalizes the next token's query and key, which
+     do not depend on the state, so they overlap the current token's
+     update instead of delaying it.  */
+  float4 query;
+  float4 key;
+  load_query_key (y, key_head * k_dim + first, key_dim, active, q_scale,
+                  query, key);
   for (uint t = 0; t < n_tokens; t++)
     {
+      float4 next_query = 0.0f;
+      float4 next_key = 0.0f;
+      if (t + 1 < n_tokens)
+        load_query_key (y + ulong (t + 1) * conv_dim,
+                        key_head * k_dim + first, key_dim, active, q_scale,
+                        next_query, next_key);
       device const float *token = y + ulong (t) * conv_dim;
-      device const float *query = token + key_head * k_dim + lane;
-      device const float *key = token + key_dim + key_head * k_dim + lane;
-      float token_decay = decay[t * n_v_heads + head];
-      float remembered = 0.0f;
-      for (uint i = 0; i < n_rows; i++)
-        {
-          rows[i] *= token_decay;
-          remembered += rows[i] * key[i * SIMD_WIDTH];
-        }
-      remembered = simd_sum (remembered);
+      rows *= decay[t * n_v_heads + head];
+      float remembered = simd_sum (dot (rows, key));
       float value = token[2 * key_dim + head * v_dim + column];
       float delta = (value - remembered) * beta[t * n_v_heads + head];
-      float sum = 0.0f;
-      for (uint i = 0; i < n_rows; i++)
-        {
-          rows[i] += key[i * SIMD_WIDTH] * delta;
-          sum += rows[i] * query[i * SIMD_WIDTH];
-        }
-      sum = simd_sum (sum);
+      rows += key * delta;
+      float sum = simd_sum (dot (rows, query));
       if (lane == 0)
         out[ulong (t) * n_v_heads * v_dim + head * v_dim + column] = sum;
+      query = next_query;
+      key = next_key;
     }
 
-  for (uint i = 0; i < n_rows; i++)
-    head_state[(lane + i * SIMD_WIDTH) * v_dim + column] = rows[i];
+  if (active)
+    for (uint i = 0; i < rows_per_lane; i++)
+      head_state[(first + i) * v_dim + column] = rows[i];
 }
 
 /* Multiply each of the N floats at X by SiLU of the matching float at

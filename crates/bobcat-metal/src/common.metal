@@ -45,6 +45,9 @@ enum
   ATTENTION_CHUNK = 64,
   ATTENTION_MAX_GROUP = 4,
   ATTENTION_MAX_HEAD_DIM = 256,
+  /* The simdgroups of an attention_wide threadgroup, which split a
+     chunk's positions.  backend.rs keeps the same value.  */
+  ATTENTION_WIDE_SIMDGROUPS = 4,
   /* The Gated DeltaNet kernels' limits.  The host checks the model
      against both.  */
   GDN_MAX_KERNEL = 8,

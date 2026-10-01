@@ -119,6 +119,158 @@ attention_chunk (device const float *q [[buffer (0)]],
     }
 }
 
+/* The first pass of attention_chunk for wide heads of 128 or more
+   floats, with the same scratch layout.  A thread of attention_chunk
+   reads a whole key row by itself, which for wide heads and few KV heads
+   leaves the GPU mostly idle.  Here simdgroup S of the threadgroup's
+   ATTENTION_WIDE_SIMDGROUPS takes positions S, S + ATTENTION_WIDE_SIMDGROUPS,
+   and so on of the chunk, and lane L covers elements L, L + 32, and so
+   on of each head, so the lanes read each key and value row together.
+   Each simdgroup keeps a running softmax per query head, and the
+   simdgroups merge theirs at the end.  */
+template <typename T>
+kernel void
+attention_wide (device const float *q [[buffer (0)]],
+                device const T *k_cache [[buffer (1)]],
+                device const T *v_cache [[buffer (2)]],
+                device float *scratch [[buffer (3)]],
+                constant uint &n_heads [[buffer (4)]],
+                constant uint &n_kv_heads [[buffer (5)]],
+                constant uint &head_dim [[buffer (6)]],
+                constant uint &first_pos [[buffer (7)]],
+                constant uint &max_chunks [[buffer (8)]],
+                constant float &scale [[buffer (9)]],
+                uint3 position [[threadgroup_position_in_grid]],
+                uint simdgroup [[simdgroup_index_in_threadgroup]],
+                uint lane [[thread_index_in_simdgroup]])
+{
+  constexpr uint max_parts = ATTENTION_MAX_HEAD_DIM / SIMD_WIDTH;
+  threadgroup float
+      merged_max[ATTENTION_WIDE_SIMDGROUPS * ATTENTION_MAX_GROUP];
+  threadgroup float
+      merged_sum[ATTENTION_WIDE_SIMDGROUPS * ATTENTION_MAX_GROUP];
+  threadgroup float merged_acc[ATTENTION_WIDE_SIMDGROUPS * ATTENTION_MAX_GROUP
+                               * ATTENTION_MAX_HEAD_DIM];
+
+  uint kv_head = position.x;
+  uint chunk = position.y;
+  uint query_index = position.z;
+  uint n_keys = first_pos + query_index + 1;
+  uint start = chunk * ATTENTION_CHUNK;
+  if (start >= n_keys)
+    return;
+
+  uint group = n_heads / n_kv_heads;
+  uint kv_dim = n_kv_heads * head_dim;
+  uint first_head = kv_head * group;
+  uint count = min (uint (ATTENTION_CHUNK), n_keys - start);
+  uint parts = head_dim / SIMD_WIDTH;
+  q += query_index * n_heads * head_dim;
+  scratch += query_index * scratch_per_query (n_heads, head_dim, max_chunks);
+
+  float query[ATTENTION_MAX_GROUP][max_parts];
+  float best[ATTENTION_MAX_GROUP];
+  float total[ATTENTION_MAX_GROUP];
+  float acc[ATTENTION_MAX_GROUP][max_parts];
+  for (uint g = 0; g < ATTENTION_MAX_GROUP; g++)
+    {
+      best[g] = -INFINITY;
+      total[g] = 0.0f;
+      for (uint i = 0; i < max_parts; i++)
+        {
+          bool used = g < group && i < parts;
+          query[g][i]
+              = used ? q[(first_head + g) * head_dim + lane + i * SIMD_WIDTH]
+                           * scale
+                     : 0.0f;
+          acc[g][i] = 0.0f;
+        }
+    }
+
+  for (uint t = simdgroup; t < count; t += ATTENTION_WIDE_SIMDGROUPS)
+    {
+      device const T *key
+          = k_cache + (start + t) * kv_dim + kv_head * head_dim + lane;
+      device const T *value
+          = v_cache + (start + t) * kv_dim + kv_head * head_dim + lane;
+      float k[max_parts];
+      float v[max_parts];
+      for (uint i = 0; i < max_parts; i++)
+        {
+          k[i] = i < parts ? float (key[i * SIMD_WIDTH]) : 0.0f;
+          v[i] = i < parts ? float (value[i * SIMD_WIDTH]) : 0.0f;
+        }
+      for (uint g = 0; g < group; g++)
+        {
+          float s = 0.0f;
+          for (uint i = 0; i < max_parts; i++)
+            s += query[g][i] * k[i];
+          s = simd_sum (s);
+          float grown = max (best[g], s);
+          float rescale = precise::exp (best[g] - grown);
+          float weight = precise::exp (s - grown);
+          total[g] = total[g] * rescale + weight;
+          for (uint i = 0; i < max_parts; i++)
+            acc[g][i] = acc[g][i] * rescale + weight * v[i];
+          best[g] = grown;
+        }
+    }
+
+  for (uint g = 0; g < group; g++)
+    {
+      uint slot = simdgroup * ATTENTION_MAX_GROUP + g;
+      if (lane == 0)
+        {
+          merged_max[slot] = best[g];
+          merged_sum[slot] = total[g];
+        }
+      for (uint i = 0; i < parts; i++)
+        merged_acc[slot * ATTENTION_MAX_HEAD_DIM + lane + i * SIMD_WIDTH]
+            = acc[g][i];
+    }
+  threadgroup_barrier (mem_flags::mem_threadgroup);
+
+  /* Each thread merges one element of one head's weighted sum.  */
+  device float *chunk_max = scratch + n_heads * max_chunks * head_dim;
+  device float *chunk_sum = chunk_max + n_heads * max_chunks;
+  uint tid = simdgroup * SIMD_WIDTH + lane;
+  for (uint i = tid; i < group * head_dim;
+       i += ATTENTION_WIDE_SIMDGROUPS * SIMD_WIDTH)
+    {
+      uint g = i / head_dim;
+      uint d = i % head_dim;
+      float grand = -INFINITY;
+      for (uint s = 0; s < ATTENTION_WIDE_SIMDGROUPS; s++)
+        grand = max (grand, merged_max[s * ATTENTION_MAX_GROUP + g]);
+      float sum = 0.0f;
+      float weighted = 0.0f;
+      for (uint s = 0; s < ATTENTION_WIDE_SIMDGROUPS; s++)
+        {
+          uint slot = s * ATTENTION_MAX_GROUP + g;
+          /* A simdgroup that saw no position holds no scores.  */
+          float rescale = merged_sum[slot] > 0.0f
+                              ? precise::exp (merged_max[slot] - grand)
+                              : 0.0f;
+          sum += merged_sum[slot] * rescale;
+          weighted += merged_acc[slot * ATTENTION_MAX_HEAD_DIM + d] * rescale;
+        }
+      uint slot = (first_head + g) * max_chunks + chunk;
+      scratch[slot * head_dim + d] = weighted;
+      if (d == 0)
+        {
+          chunk_max[slot] = grand;
+          chunk_sum[slot] = sum;
+        }
+    }
+}
+
+template [[host_name (
+    "attention_wide_f32")]] kernel decltype (attention_wide<float>)
+    attention_wide<float>;
+template
+    [[host_name ("attention_wide_f16")]] kernel decltype (attention_wide<half>)
+        attention_wide<half>;
+
 template [[host_name (
     "attention_chunk_f32")]] kernel decltype (attention_chunk<float>)
     attention_chunk<float>;

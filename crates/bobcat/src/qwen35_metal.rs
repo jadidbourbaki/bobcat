@@ -991,13 +991,6 @@ impl<'r> Recorder<'r> {
             n,
         )?;
         self.metal.barrier();
-        self.metal.gdn_qk_norm(
-            b.conv_out.floats(0),
-            shape,
-            n,
-            1.0 / (hp.k_head_dim as f32).sqrt(),
-        )?;
-        self.metal.barrier();
         self.metal.gdn_recurrence(
             b.conv_out.floats(0),
             b.beta.floats(0),
@@ -1006,20 +999,18 @@ impl<'r> Recorder<'r> {
             b.delta_out.floats(0),
             shape,
             n,
+            1.0 / (hp.k_head_dim as f32).sqrt(),
         )?;
         self.metal.barrier();
         // The output norm scales each value head, and SiLU of the gate multiplies it.
-        self.metal.rms_norm(
+        self.metal.gdn_gated_norm(
             b.delta_out.floats(0),
             b.weights(&delta.norm.tensor),
-            b.delta_out.floats(0),
+            b.z.floats(0),
             hp.v_head_dim,
             n * hp.n_v_heads,
             hp.norm_eps,
         )?;
-        self.metal.barrier();
-        self.metal
-            .silu_mul(b.delta_out.floats(0), b.z.floats(0), n * hp.value_dim())?;
         self.metal.barrier();
         if n == 1 {
             self.matvec(
