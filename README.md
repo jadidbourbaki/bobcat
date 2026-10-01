@@ -138,5 +138,46 @@ bobcat pull lfm2.5:2.6b
 bobcat pull lfm2.5:8b
 ```
 
+**[Qwen3.5-0.8B](https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF)**
+
+```sh
+bobcat pull qwen3.5:0.8b
+```
+
+**[Qwen3.5-2B](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF)**
+
+```sh
+bobcat pull qwen3.5:2b
+```
+
+**[Qwen3.5-4B](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF)**
+
+```sh
+bobcat pull qwen3.5:4b
+```
+
+**[Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)**
+
+```sh
+bobcat pull qwen3.5:9b
+```
+
+**[Clef-Flash](https://huggingface.co/Cloudflare/clef-flash)**
+
+```sh
+hf download Cloudflare/clef-flash --local-dir clef-flash
+python llama.cpp/convert_hf_to_gguf.py clef-flash --no-mtp --outtype q8_0 \
+  --outfile clef-flash-backbone.gguf
+cd tools && uv run python clef_gguf.py --backbone ../clef-flash-backbone.gguf \
+  --release ../clef-flash --out ../clef-flash-Q8_0.gguf
+```
+
+```sh
+echo '{"model": "clef-flash", "state": "Checkout is down.",
+  "questions": {"outage": {"type": "noul"}}}' | bobcat decide -m clef-flash-Q8_0.gguf
+```
+
+`bobcat serve -m clef-flash-Q8_0.gguf` also answers `POST /v1/systemone`.
+
 bobcat is still in alpha. We are rapidly adding support for more models
 and model families. Please stay tuned!
