@@ -54,6 +54,14 @@ impl Model {
         }
     }
 
+    /// Return the boolean metadata value `key` of the model file.
+    pub(crate) fn metadata_bool(&self, key: &str) -> Option<bool> {
+        match self {
+            Self::Lfm2(model) => model.gguf().bool(key),
+            Self::Qwen35(model) => model.gguf().bool(key),
+        }
+    }
+
     /// Return the number of tokens in the vocabulary.
     pub(crate) fn n_vocab(&self) -> u32 {
         match self {

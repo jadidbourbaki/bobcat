@@ -381,6 +381,14 @@ impl<B: AsRef<[u8]>> Gguf<B> {
         }
     }
 
+    /// Return the boolean metadata value `key` when it exists.
+    pub fn bool(&self, key: &str) -> Option<bool> {
+        match self.metadata.get(key)? {
+            Value::Bool(value) => Some(*value),
+            _ => None,
+        }
+    }
+
     /// Return the bytes of the string metadata value `key` when it exists.
     pub fn string(&self, key: &str) -> Option<&[u8]> {
         match self.metadata.get(key)? {

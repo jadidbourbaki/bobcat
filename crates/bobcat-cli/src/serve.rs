@@ -1,5 +1,5 @@
 //! The HTTP server of `bobcat serve`, which answers OpenAI Chat Completions and Anthropic
-//! Messages requests with one model.
+//! Messages requests with one model, and decision requests as [`crate::decisions`] describes.
 //!
 //! One worker thread owns the model and the GPU and answers requests one at a time. The HTTP
 //! handlers translate each request into the engine's messages, queue it for the worker, and send
@@ -24,6 +24,7 @@ use tokio::sync::{mpsc as channel, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::Error;
+use crate::decisions::{self, Refusal};
 use crate::engine::{Engine, Event, Finish, Message, Part, Request, Role};
 use crate::sampler::Sampler;
 use crate::tools::ToolCall;
@@ -54,7 +55,12 @@ pub(crate) fn run(
     let (ready, started) = mpsc::channel();
     let context = options.context;
     let max_tokens = options.max_tokens;
-    std::thread::spawn(move || worker(&model, &tokenizer, context, max_tokens, &queue, &ready));
+    let name = options.name.clone();
+    std::thread::spawn(move || {
+        worker(
+            &model, &name, &tokenizer, context, max_tokens, &queue, &ready,
+        );
+    });
     started
         .recv()
         .map_err(|_| "the model worker stopped while loading")??;
@@ -69,7 +75,9 @@ pub(crate) fn run(
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
+        .route("/v1/decisions", post(decisions))
         .route("/v1/systemone", post(systemone))
+        .route("/v1/score", post(score))
         .with_state(shared);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -99,8 +107,9 @@ enum Job {
     },
     /// Answer a Jev/SystemOne decision request.
     Decide {
+        route: Route,
         request: Value,
-        reply: oneshot::Sender<Result<Value, String>>,
+        reply: oneshot::Sender<Result<Value, Refusal>>,
     },
     /// Count the tokens of a prompt.
     Count {
@@ -136,9 +145,19 @@ enum Update {
     Failed(String),
 }
 
+/// The decision routes, which share one job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    Decisions,
+    SystemOne,
+    Score,
+}
+
 /// Load `model` onto the GPU, report on `ready`, and answer the jobs on `queue` one at a time.
+/// SystemOne answers name the model `name`.
 fn worker(
     model: &crate::backend::Model,
+    name: &str,
     tokenizer: &tokenizers::Tokenizer,
     context: u32,
     max_tokens: usize,
@@ -187,8 +206,16 @@ fn worker(
                     .map_err(|error| error.to_string());
                 let _ = reply.send(count);
             }
-            Job::Decide { request, reply } => {
-                let response = engine.decide(&request).map_err(|error| error.to_string());
+            Job::Decide {
+                route,
+                request,
+                reply,
+            } => {
+                let response = match route {
+                    Route::Decisions => decisions::decisions(&mut engine, &request),
+                    Route::SystemOne => decisions::systemone(&mut engine, &request, name),
+                    Route::Score => decisions::score_request(&mut engine, &request),
+                };
                 let _ = reply.send(response);
             }
         }
@@ -845,16 +872,31 @@ async fn messages(State(shared): State<Arc<Shared>>, body: Bytes) -> Response {
     })
 }
 
+async fn decisions(State(shared): State<Arc<Shared>>, body: Bytes) -> Response {
+    decide(&shared, &body, Route::Decisions).await
+}
+
 async fn systemone(State(shared): State<Arc<Shared>>, body: Bytes) -> Response {
-    let request: Value = match serde_json::from_slice(&body) {
+    decide(&shared, &body, Route::SystemOne).await
+}
+
+async fn score(State(shared): State<Arc<Shared>>, body: Bytes) -> Response {
+    decide(&shared, &body, Route::Score).await
+}
+
+/// Queue the decision request in `body` for the worker under `route` and return its response.
+async fn decide(shared: &Shared, body: &Bytes, route: Route) -> Response {
+    let request: Value = match serde_json::from_slice(body) {
         Ok(request) => request,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, &error.to_string()),
     };
-    if let Err(error) = crate::systemone::validate(&request) {
-        return openai_error(StatusCode::BAD_REQUEST, &error);
-    }
     let (reply, receiver) = oneshot::channel();
-    if shared.jobs.send(Job::Decide { request, reply }).is_err() {
+    let job = Job::Decide {
+        route,
+        request,
+        reply,
+    };
+    if shared.jobs.send(job).is_err() {
         return openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "the model worker has stopped",
@@ -862,7 +904,16 @@ async fn systemone(State(shared): State<Arc<Shared>>, body: Bytes) -> Response {
     }
     match receiver.await {
         Ok(Ok(response)) => axum::Json(response).into_response(),
-        Ok(Err(error)) => openai_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+        // SystemOne's SDKs expect 422 for a request that breaks the schema, as SGLang answers.
+        Ok(Err(Refusal::Invalid(message))) if route == Route::SystemOne => {
+            openai_error(StatusCode::UNPROCESSABLE_ENTITY, &message)
+        }
+        Ok(Err(Refusal::Invalid(message) | Refusal::Refused(message))) => {
+            openai_error(StatusCode::BAD_REQUEST, &message)
+        }
+        Ok(Err(Refusal::Failed(error))) => {
+            openai_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())
+        }
         Err(_) => openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "the model worker has stopped",

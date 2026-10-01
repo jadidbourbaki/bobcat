@@ -296,6 +296,142 @@ impl<'a> Engine<'a> {
         Ok(prompt)
     }
 
+    /// Render one user message holding `content` through the chat template with the extra
+    /// template arguments `kwargs`. With `reply`, the result holds the assistant's finished reply
+    /// too. Without it, the result ends where the reply begins.
+    pub(crate) fn render_message(
+        &self,
+        content: &str,
+        reply: Option<&str>,
+        kwargs: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<String, Error> {
+        let mut messages = vec![context! { role => "user", content => content }];
+        if let Some(reply) = reply {
+            messages.push(context! { role => "assistant", content => reply });
+        }
+        let base = context! {
+            messages => messages,
+            bos_token => &self.bos_token,
+            add_generation_prompt => reply.is_none(),
+        };
+        let extra = minijinja::Value::from_serialize(kwargs);
+        // The fixed arguments come first, so a request cannot replace the messages.
+        Ok(self
+            .template
+            .get_template("chat")?
+            .render(context! { ..base, ..extra })?)
+    }
+
+    /// Report whether the model file holds a Clef decision head.
+    pub(crate) fn has_decision_head(&self) -> bool {
+        self.head.is_some()
+    }
+
+    /// Return the model's tokenizer.
+    pub(crate) fn tokenizer(&self) -> &Tokenizer {
+        self.tokenizer
+    }
+
+    /// Return the most tokens one sequence holds.
+    pub(crate) fn context(&self) -> u32 {
+        self.context
+    }
+
+    /// Return the number of tokens in the model's vocabulary.
+    pub(crate) fn n_vocab(&self) -> u32 {
+        self.model.n_vocab()
+    }
+
+    /// Return the token the model file says begins every sequence, if the tokenizer adds one.
+    pub(crate) fn added_bos(&self) -> Option<u32> {
+        if self.model.metadata_bool("tokenizer.ggml.add_bos_token") == Some(true) {
+            self.model.metadata_u32("tokenizer.ggml.bos_token_id")
+        } else {
+            None
+        }
+    }
+
+    /// Return the log-probability over the whole vocabulary of each of the `labels[i]` tokens
+    /// after the sequence `prompts[i]`, for every `i`.
+    ///
+    /// The prompts share their longest common prefix, which runs once. Each prompt then
+    /// continues from the state after that prefix.
+    pub(crate) fn score(
+        &mut self,
+        prompts: &[Vec<u32>],
+        labels: &[Vec<u32>],
+    ) -> Result<Vec<Vec<f64>>, Error> {
+        let n_vocab = self.model.n_vocab();
+        for prompt in prompts {
+            if prompt.is_empty() {
+                return Err("a scored sequence needs at least one token".into());
+            }
+            if prompt.len() >= self.context as usize {
+                return Err(format!(
+                    "the prompt has {} tokens, which does not fit the context of {} tokens",
+                    prompt.len(),
+                    self.context
+                )
+                .into());
+            }
+            if let Some(&token) = prompt.iter().find(|&&token| token >= n_vocab) {
+                return Err(format!("token {token} lies outside the vocabulary").into());
+            }
+        }
+        // Scoring runs sequences of its own, so the next reply starts over.
+        self.consumed.clear();
+        self.history = None;
+        self.gpu.reset()?;
+        // Each prompt keeps at least its last token, whose logits the score reads.
+        let shared = prompts
+            .iter()
+            .map(|prompt| prompt.len() - 1)
+            .min()
+            .unwrap_or(0);
+        let shared = prompts.iter().skip(1).fold(shared, |shared, prompt| {
+            prompts[0]
+                .iter()
+                .zip(prompt)
+                .take(shared)
+                .take_while(|(a, b)| a == b)
+                .count()
+        });
+        let start = if shared > 0 {
+            self.gpu.prefill(&prompts[0][..shared], None)?;
+            Some(self.gpu.checkpoint()?)
+        } else {
+            None
+        };
+        let mut logits = vec![0.0_f32; n_vocab as usize];
+        let mut scores = Vec::with_capacity(prompts.len());
+        for (prompt, labels) in prompts.iter().zip(labels) {
+            match &start {
+                Some(checkpoint) => self.gpu.restore(checkpoint)?,
+                None => self.gpu.reset()?,
+            }
+            self.gpu.prefill(&prompt[shared..], Some(&mut logits))?;
+            let max = logits
+                .iter()
+                .fold(f64::NEG_INFINITY, |m, &v| m.max(f64::from(v)));
+            let log_sum = max
+                + logits
+                    .iter()
+                    .map(|&v| (f64::from(v) - max).exp())
+                    .sum::<f64>()
+                    .ln();
+            let mut row = Vec::with_capacity(labels.len());
+            for &label in labels {
+                let logit = logits
+                    .get(label as usize)
+                    .ok_or_else(|| format!("label token {label} lies outside the vocabulary"))?;
+                row.push(f64::from(*logit) - log_sum);
+            }
+            scores.push(row);
+        }
+        self.gpu.reset()?;
+        Ok(scores)
+    }
+
     /// Return the tokens of the prompt that `messages` and `tools` render to.
     fn encode(&self, messages: &[Message], tools: &[serde_json::Value]) -> Result<Vec<u32>, Error> {
         let prompt = self.render(messages, tools)?;

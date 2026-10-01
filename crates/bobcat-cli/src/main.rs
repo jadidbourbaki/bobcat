@@ -17,6 +17,8 @@ mod backend;
 #[cfg(target_os = "macos")]
 mod conversation;
 #[cfg(target_os = "macos")]
+mod decisions;
+#[cfg(target_os = "macos")]
 mod engine;
 mod models;
 #[cfg(target_os = "macos")]
@@ -66,10 +68,11 @@ enum Command {
         #[command(flatten)]
         reply: ReplyOptions,
     },
-    /// Answer a Jev/SystemOne decision request with a Clef model and write the response.
+    /// Answer a SystemOne decision request and write the response.
     ///
     /// The request is a JSON object with `model`, `state`, and `questions`, given as an argument
-    /// or on standard input.
+    /// or on standard input. A Clef model answers with its decision head, and any other model
+    /// reads the probabilities of answer labels after each question.
     Decide {
         #[command(flatten)]
         model: ModelOptions,
@@ -79,7 +82,7 @@ enum Command {
     /// Answer OpenAI and Anthropic API requests over HTTP, for agents and other tools.
     ///
     /// The server answers `/v1/chat/completions`, `/v1/messages`, `/v1/messages/count_tokens`,
-    /// and `/v1/models`. A Clef model also answers Jev/SystemOne decisions at `/v1/systemone`.
+    /// and `/v1/models`, and decisions at `/v1/decisions`, `/v1/systemone`, and `/v1/score`.
     Serve {
         #[command(flatten)]
         model: ModelOptions,
@@ -380,14 +383,27 @@ fn respond(
 /// Answer the decision `request`, or the request on stdin, and write the response to stdout.
 #[cfg(target_os = "macos")]
 fn decide(model_options: &ModelOptions, request: &str) -> Result<(), Error> {
-    let text = full_prompt(request)?;
+    // One JSON request comes from the argument or, without one, from stdin.
+    let text = if request.trim().is_empty() {
+        let mut input = String::new();
+        io::stdin().read_to_string(&mut input)?;
+        input
+    } else {
+        request.to_owned()
+    };
     let request: serde_json::Value =
         serde_json::from_str(&text).map_err(|error| format!("the request is not JSON: {error}"))?;
     let (model, tokenizer) = load(model_options)?;
     let mut metal = bobcat::metal::Metal::open()?;
     let context = u32::try_from(systemone::MAX_TOKENS)?;
     let mut engine = engine::Engine::new(&model, &mut metal, &tokenizer, context)?;
-    let response = engine.decide(&request)?;
+    let response = match decisions::systemone(&mut engine, &request, &model_options.model) {
+        Ok(response) => response,
+        Err(decisions::Refusal::Invalid(message) | decisions::Refusal::Refused(message)) => {
+            return Err(message.into());
+        }
+        Err(decisions::Refusal::Failed(error)) => return Err(error),
+    };
     writeln!(io::stdout(), "{response:#}")?;
     Ok(())
 }
