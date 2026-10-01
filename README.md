@@ -48,7 +48,7 @@ bobcat respond -m lfm2.5:2.6b "Name three primes."
 ## Performance results
 
 <p align="center">
-  <img src="docs/performance/lfm2.5-2.6b.svg" alt="Prompt processing and generation throughput of bobcat, llama.cpp, mlx-lm, mistral.rs, and candle on LFM2.5-2.6B">
+  <img src="docs/performance/lfm2.5-2.6b.svg" alt="Prompt processing and generation throughput on LFM2.5-2.6B">
 </p>
 
 LFM2.5-2.6B on an M4 Pro, with a 512-token prompt and 128 generated
@@ -98,11 +98,19 @@ aider --model openai/lfm2.5:2.6b
 
 ## Supported models
 
+<p align="center">
+  <img src="docs/performance/lfm2.5-350m.svg" alt="Prompt processing and generation throughput on LFM2.5-350M">
+</p>
+
 **[LFM2.5-350M](https://huggingface.co/LiquidAI/LFM2.5-350M-GGUF)**
 
 ```sh
 bobcat pull lfm2.5:350m
 ```
+
+<p align="center">
+  <img src="docs/performance/lfm2.5-1.2b.svg" alt="Prompt processing and generation throughput on LFM2.5-1.2B-Instruct">
+</p>
 
 **[LFM2.5-1.2B-Instruct](https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct-GGUF)**
 
@@ -110,10 +118,24 @@ bobcat pull lfm2.5:350m
 bobcat pull lfm2.5:1.2b
 ```
 
+<p align="center">
+  <img src="docs/performance/lfm2.5-2.6b.svg" alt="Prompt processing and generation throughput on LFM2.5-2.6B">
+</p>
+
 **[LFM2.5-2.6B](https://huggingface.co/LiquidAI/LFM2.5-2.6B-GGUF)**
 
 ```sh
 bobcat pull lfm2.5:2.6b
+```
+
+<p align="center">
+  <img src="docs/performance/lfm2.5-8b.svg" alt="Prompt processing and generation throughput on LFM2.5-8B-A1B">
+</p>
+
+**[LFM2.5-8B-A1B](https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-GGUF)**
+
+```sh
+bobcat pull lfm2.5:8b
 ```
 
 bobcat is still in alpha. We are rapidly adding support for more models

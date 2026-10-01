@@ -2,9 +2,10 @@
 
 Usage:
 
-    uv run python performance_bench.py --out ../docs/performance/lfm2.5-2.6b.csv
+    uv run python performance_bench.py --model 2.6b
 
-Every engine runs LFM2.5-2.6B on a 512-token prompt and then generates 128 tokens greedily.
+Every engine that runs the model runs it on a 512-token prompt and then generates 128 tokens
+greedily. The CSV goes to `docs/performance/lfm2.5-MODEL.csv`.
 bobcat, llama.cpp, and mlx-lm run through matched streaming harnesses. ExecuTorch and Cactus
 run through their harnesses in tools/. mistral.rs and candle run through their own benchmark
 tools. Each round runs every engine once, after the tool's own warmup, and the order rotates
@@ -29,13 +30,10 @@ from pydantic import BaseModel, PositiveFloat, PositiveInt
 
 ROOT = Path(__file__).resolve().parent.parent
 TOOLS = ROOT / "tools"
-GGUF = ROOT / "models/LFM2.5-2.6B-QAD-Q4_0.gguf"
-MLX = ROOT / "models/LFM2.5-2.6B-MLX-4bit"
+MODELS = ROOT / "models"
 EXECUTORCH = ROOT / "bench/executorch"
-EXECUTORCH_MODEL = EXECUTORCH / "lfm2_5_2_6b_mlx_4w.pte"
 CACTUS = ROOT / "bench/cactus"
 CACTUS_LIBRARY = CACTUS / "cactus-engine/build/libcactus_engine.dylib"
-CACTUS_BUNDLE = CACTUS / "weights/lfm2.5-2.6b-cq4"
 PROMPT_TOKENS = 512
 GENERATED_TOKENS = 128
 MISTRALRS_TTFT = re.compile(r"┆\s*([\d.]+) ms TTFT")
@@ -62,12 +60,62 @@ class LatencyRow(BaseModel):
 
 
 @dataclass(frozen=True)
+class Weights:
+    """The weights each engine reads for one model. An engine without weights skips the model."""
+
+    gguf: Path
+    mlx: Path
+    executorch: Path | None
+    cactus: Path | None
+    mistral_rs: bool
+    candle: bool
+
+
+WEIGHTS = {
+    "350m": Weights(
+        gguf=MODELS / "LFM2.5-350M-QAD-Q4_0.gguf",
+        mlx=MODELS / "LFM2.5-350M-MLX-4bit",
+        executorch=EXECUTORCH / "lfm2_5_350m_mlx_4w.pte",
+        cactus=CACTUS / "weights/lfm2.5-350m-cq4",
+        mistral_rs=True,
+        candle=True,
+    ),
+    "1.2b": Weights(
+        gguf=MODELS / "LFM2.5-1.2B-Instruct-QAD-Q4_0.gguf",
+        mlx=MODELS / "LFM2.5-1.2B-Instruct-MLX-4bit",
+        executorch=EXECUTORCH / "lfm2_5_1_2b_mlx_4w.pte",
+        cactus=CACTUS / "weights/lfm2.5-1.2b-cq4",
+        mistral_rs=True,
+        candle=True,
+    ),
+    "2.6b": Weights(
+        gguf=MODELS / "LFM2.5-2.6B-QAD-Q4_0.gguf",
+        mlx=MODELS / "LFM2.5-2.6B-MLX-4bit",
+        executorch=EXECUTORCH / "lfm2_5_2_6b_mlx_4w.pte",
+        cactus=CACTUS / "weights/lfm2.5-2.6b-cq4",
+        mistral_rs=True,
+        candle=True,
+    ),
+    "8b": Weights(
+        gguf=MODELS / "LFM2.5-8B-A1B-Q4_0.gguf",
+        mlx=MODELS / "LFM2.5-8B-A1B-MLX-4bit",
+        # ExecuTorch's LFM2 model has no mixture-of-experts layers. mistral.rs decodes the 8B at
+        # about 0.2 tokens per second, and candle's LFM2 example reads only dense models.
+        executorch=None,
+        cactus=CACTUS / "weights/lfm2.5-8b-cq4",
+        mistral_rs=False,
+        candle=False,
+    ),
+}
+
+
+@dataclass(frozen=True)
 class Engine:
-    """An engine, its version, and the command that measures it once."""
+    """An engine, its version, and the command that measures it once on some weights."""
 
     name: str
     version: str
-    measure: Callable[[], tuple[float, float]]
+    measure: Callable[[Weights], tuple[float, float]]
 
 
 def output(command: list[str], cwd: Path = ROOT) -> str:
@@ -91,27 +139,40 @@ def latency(command: list[str], engine: str, cwd: Path = ROOT) -> tuple[float, f
     return rows[0].ttft_ms, rows[0].tpot_ms
 
 
-def bobcat() -> tuple[float, float]:
+def bobcat(weights: Weights) -> tuple[float, float]:
     return latency(
-        ["target/release/bobcat-bench", "--latency", "--latency-only", "-r", "1", str(GGUF)],
+        [
+            "target/release/bobcat-bench",
+            "--latency",
+            "--latency-only",
+            "-r",
+            "1",
+            str(weights.gguf),
+        ],
         "bobcat",
     )
 
 
-def llama_cpp() -> tuple[float, float]:
+def llama_cpp(weights: Weights) -> tuple[float, float]:
     return latency(
-        ["target/llama-latency", str(GGUF), str(PROMPT_TOKENS), str(GENERATED_TOKENS), "1"],
+        [
+            "target/llama-latency",
+            str(weights.gguf),
+            str(PROMPT_TOKENS),
+            str(GENERATED_TOKENS),
+            "1",
+        ],
         "llama.cpp",
     )
 
 
-def mlx_lm() -> tuple[float, float]:
+def mlx_lm(weights: Weights) -> tuple[float, float]:
     return latency(
         [
             "uv",
             "run",
             "mlx_latency.py",
-            str(MLX),
+            str(weights.mlx),
             "--prompt",
             str(PROMPT_TOKENS),
             "--generate",
@@ -124,12 +185,12 @@ def mlx_lm() -> tuple[float, float]:
     )
 
 
-def executorch() -> tuple[float, float]:
+def executorch(weights: Weights) -> tuple[float, float]:
     return latency(
         [
             str(EXECUTORCH / ".venv/bin/python"),
             "executorch_latency.py",
-            str(EXECUTORCH_MODEL),
+            str(weights.executorch),
             "--prompt",
             str(PROMPT_TOKENS),
             "--generate",
@@ -142,14 +203,14 @@ def executorch() -> tuple[float, float]:
     )
 
 
-def cactus() -> tuple[float, float]:
+def cactus(weights: Weights) -> tuple[float, float]:
     return latency(
         [
             "uv",
             "run",
             "cactus_latency.py",
             str(CACTUS_LIBRARY),
-            str(CACTUS_BUNDLE),
+            str(weights.cactus),
             "--prompt",
             str(PROMPT_TOKENS),
             "--generate",
@@ -162,13 +223,13 @@ def cactus() -> tuple[float, float]:
     )
 
 
-def mistral_rs() -> tuple[float, float]:
+def mistral_rs(weights: Weights) -> tuple[float, float]:
     text = output(
         [
             "bench/mistral.rs/target/release/mistralrs",
             "bench",
             "-f",
-            str(GGUF),
+            str(weights.gguf),
             "--prompt-len",
             str(PROMPT_TOKENS),
             "--gen-len",
@@ -188,7 +249,7 @@ def mistral_rs() -> tuple[float, float]:
     return float(ttft[1]), float(tpot[1])
 
 
-def candle() -> tuple[float, float]:
+def candle(weights: Weights) -> tuple[float, float]:
     text = output(
         [
             "uv",
@@ -198,9 +259,9 @@ def candle() -> tuple[float, float]:
             "--binary",
             str(ROOT / "bench/candle/target/release/examples/quantized-lfm2"),
             "--model",
-            str(GGUF),
+            str(weights.gguf),
             "--tokenizer",
-            str(MLX / "tokenizer.json"),
+            str(weights.mlx / "tokenizer.json"),
             "--prompt",
             str(PROMPT_TOKENS),
             "--generate",
@@ -234,10 +295,11 @@ def machine() -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Measure the engines' latency.")
-    parser.add_argument("--out", required=True, type=Path, help="the CSV to write")
+    parser.add_argument("--model", required=True, choices=list(WEIGHTS))
     parser.add_argument("--rounds", type=int, default=5)
     arguments = parser.parse_args()
-    out: Path = arguments.out
+    weights = WEIGHTS[arguments.model]
+    out = ROOT / f"docs/performance/lfm2.5-{arguments.model}.csv"
 
     output(["cargo", "build", "--release", "--locked", "-p", "bobcat-bench"])
     mlx_version = output(
@@ -250,20 +312,30 @@ def main() -> None:
             "import executorch.version; print(executorch.version.__version__)",
         ]
     ).strip()
+    supported = {
+        "ExecuTorch": weights.executorch is not None,
+        "Cactus": weights.cactus is not None,
+        "mistral.rs": weights.mistral_rs,
+        "candle": weights.candle,
+    }
     engines = [
-        Engine("bobcat", git_version(ROOT), bobcat),
-        Engine("mlx-lm", mlx_version, mlx_lm),
-        Engine("llama.cpp", git_version(ROOT / "bench/llama.cpp"), llama_cpp),
-        Engine("ExecuTorch", executorch_version, executorch),
-        Engine("Cactus", git_version(CACTUS), cactus),
-        Engine("mistral.rs", git_version(ROOT / "bench/mistral.rs"), mistral_rs),
-        Engine("candle", git_version(ROOT / "bench/candle"), candle),
+        engine
+        for engine in [
+            Engine("bobcat", git_version(ROOT), bobcat),
+            Engine("mlx-lm", mlx_version, mlx_lm),
+            Engine("llama.cpp", git_version(ROOT / "bench/llama.cpp"), llama_cpp),
+            Engine("ExecuTorch", executorch_version, executorch),
+            Engine("Cactus", git_version(CACTUS), cactus),
+            Engine("mistral.rs", git_version(ROOT / "bench/mistral.rs"), mistral_rs),
+            Engine("candle", git_version(ROOT / "bench/candle"), candle),
+        ]
+        if supported.get(engine.name, True)
     ]
     runs: list[Run] = []
     for round_index in range(arguments.rounds):
         shift = round_index % len(engines)
         for engine in engines[shift:] + engines[:shift]:
-            ttft_ms, tpot_ms = engine.measure()
+            ttft_ms, tpot_ms = engine.measure(weights)
             run = Run(
                 engine=engine.name,
                 version=engine.version,
