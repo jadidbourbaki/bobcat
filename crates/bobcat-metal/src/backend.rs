@@ -70,6 +70,11 @@ const MATVEC_Q8_0_WIDE_COLS: u32 = 2048;
 /// `K_ROWS_PER_SIMDGROUP` in `quant.metal`.
 const K_QUANT_SIMDGROUPS: u32 = 2;
 const K_QUANT_ROWS_PER_SIMDGROUP: u32 = 4;
+/// Q4_0 rows of at least `Q4_0_WIDE_COLS` columns split over `Q4_0_WIDE_SIMDGROUPS`
+/// simdgroups. On an M4 Pro, four simdgroups lifted the 4096-column matrices of Qwen3.5-9B from
+/// 203 to 214 GB/s and its decode by 1.3%, and slowed Qwen3.5-0.8B's 1024-column matrices by 11%.
+const Q4_0_WIDE_COLS: u32 = 4096;
+const Q4_0_WIDE_SIMDGROUPS: u32 = 4;
 
 /// Threads per threadgroup for the reduction and elementwise kernels.
 const REDUCE_THREADS: usize = 256;
@@ -2741,9 +2746,14 @@ fn matvec_dispatch(format: Format, n_rows: u32, n_cols: u32) -> Dispatch {
         format,
         Format::Q4_0 | Format::Q4K | Format::Q5K | Format::Q6K
     ) {
+        let simdgroups = if format == Format::Q4_0 && n_cols >= Q4_0_WIDE_COLS {
+            Q4_0_WIDE_SIMDGROUPS
+        } else {
+            K_QUANT_SIMDGROUPS
+        };
         return Dispatch::Threadgroups(
             [to_usize(n_rows.div_ceil(K_QUANT_ROWS_PER_SIMDGROUP)), 1, 1],
-            [SIMD_WIDTH * to_usize(K_QUANT_SIMDGROUPS), 1, 1],
+            [SIMD_WIDTH * to_usize(simdgroups), 1, 1],
         );
     }
     matvec_rows_dispatch(n_rows, n_cols)
