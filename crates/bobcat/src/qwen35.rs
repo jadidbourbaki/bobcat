@@ -6,9 +6,9 @@
 //! through a sigmoid gate. Each layer normalizes its input, adds its mixer's output to the residual
 //! stream, and then applies a SwiGLU block the same way.
 //!
-//! llama.cpp's converter writes the GGUF files. It bakes the one that Qwen3.5's zero-centered norms
-//! add into their weights, stores `-exp(A_log)` as `ssm_a`, and appends a multi-token prediction
-//! block after the model's layers, which the forward pass skips.
+//! llama.cpp's converter writes the GGUF files. The converter bakes the one that Qwen3.5's
+//! zero-centered norms add into their weights, stores `-exp(A_log)` as `ssm_a`, and appends a
+//! multi-token prediction block after the model's layers, which the forward pass skips.
 
 use std::path::Path;
 
@@ -69,18 +69,18 @@ pub struct Hyperparameters {
 
 impl Hyperparameters {
     /// Return the number of query and key elements of one DeltaNet token.
-    pub fn key_dim(&self) -> u32 {
+    pub(crate) fn key_dim(&self) -> u32 {
         self.n_k_heads * self.k_head_dim
     }
 
     /// Return the number of value elements of one DeltaNet token.
-    pub fn value_dim(&self) -> u32 {
+    pub(crate) fn value_dim(&self) -> u32 {
         self.n_v_heads * self.v_head_dim
     }
 
     /// Return the number of channels of a DeltaNet layer's convolution: the queries, the keys, and
     /// the values.
-    pub fn conv_dim(&self) -> u32 {
+    pub(crate) fn conv_dim(&self) -> u32 {
         2 * self.key_dim() + self.value_dim()
     }
 }
@@ -199,7 +199,8 @@ impl Model {
         };
         hp.n_vocab = u32::try_from(embd_rows).map_err(|_| Error::Hyperparameters)?;
 
-        let mut layers = Vec::with_capacity(to_usize(hp.n_layers));
+        // The layer count comes from the file, so the list grows as layers load.
+        let mut layers = Vec::new();
         for il in 0..hp.n_layers {
             let layer = load_layer(&gguf, &hp, il)?;
             match layer.mixer {
@@ -278,7 +279,7 @@ impl Model {
 
     /// Run the model on `token` at the next position of `state`.
     ///
-    /// When `logits` is given, it receives the `n_vocab` logits. When `trace` is given, it
+    /// When the caller passes `logits`, it receives the `n_vocab` logits. When the caller passes `trace`, it
     /// receives the activations of this token, so it must hold one token.
     pub fn step(
         &self,
@@ -683,6 +684,16 @@ fn load_hyperparameters(gguf: &Gguf<Storage>) -> Result<Hyperparameters, Error> 
         || hp.v_head_dim == 0
         || hp.n_v_heads.checked_mul(hp.v_head_dim) != Some(inner_size)
     {
+        return Err(Error::Hyperparameters);
+    }
+    // `key_dim`, `conv_dim`, and the DeltaNet state of each value head multiply counts from the
+    // file, so their products must fit before anything sizes a buffer with them.
+    let key_dim = hp.n_k_heads.checked_mul(hp.k_head_dim);
+    let conv_dim = key_dim
+        .and_then(|key_dim| key_dim.checked_mul(2))
+        .and_then(|keys| keys.checked_add(inner_size));
+    let state = hp.k_head_dim.checked_mul(hp.v_head_dim);
+    if conv_dim.is_none() || state.is_none() {
         return Err(Error::Hyperparameters);
     }
     Ok(hp)

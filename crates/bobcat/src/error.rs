@@ -8,7 +8,7 @@ use bobcat_gguf::TensorType;
 /// Why loading or running a model failed.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The model file could not be read.
+    /// Reading the model file failed.
     #[error("{}: {source}", path.display())]
     Io {
         /// The model file.
@@ -27,8 +27,8 @@ pub enum Error {
     /// A metadata entry the model needs is missing or has the wrong type.
     #[error("missing or invalid {0}")]
     Metadata(String),
-    /// The file holds a model of another architecture.
-    #[error("architecture {0} is neither lfm2 nor lfm2moe")]
+    /// The file holds a model of an architecture the loader does not read.
+    #[error("the loader reads no models of architecture {0}")]
     Architecture(String),
     /// The hyperparameters contradict each other.
     #[error("inconsistent hyperparameters")]

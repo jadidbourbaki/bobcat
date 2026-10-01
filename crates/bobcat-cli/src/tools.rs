@@ -3,8 +3,8 @@
 //! LFM2 writes tool calls between its tool call tokens as a Python list of calls, as in
 //! `[get_weather(city='Paris', days=3)]`. Keyword arguments hold Python literals: quoted
 //! strings, numbers, `True`, `False`, `None`, and lists and dicts. When a system prompt asks for
-//! JSON, the model writes a JSON list of `{"name", "arguments"}` objects in place of the
-//! Python list, so the parser accepts both. Qwen3.5 writes each call between its own tool call
+//! JSON, the model writes a JSON list of `{"name", "arguments"}` objects, and the parser accepts
+//! that form too. Qwen3.5 writes each call between its own tool call
 //! tags as a `<function=NAME>` block of `<parameter=NAME>` blocks, one per argument, with each
 //! value on its own lines.
 

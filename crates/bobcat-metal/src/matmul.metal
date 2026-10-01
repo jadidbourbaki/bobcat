@@ -1,4 +1,5 @@
-/* Matrix-matrix kernels for Q8_0, Q4_0, Q4_K, and Q6_K weights.  */
+/* Matrix-matrix kernels for F16, F32, Q8_0, Q4_0, Q4_K, Q5_K, and Q6_K
+   weights.  */
 
 /* Multiply the Q8_0 matrix WEIGHTS, which has N_ROWS rows of N_COLS
    elements, by each of the N_TOKENS rows of N_COLS floats at X.  Token
@@ -55,14 +56,14 @@ matmul_q8_0 (device const uchar *weights [[buffer (0)]],
   ushort input_token = tid / LANES_PER_BLOCK;
   ushort input_part = tid % LANES_PER_BLOCK;
 
-  /* Threads past the matrix edge load the last valid row or token
-     instead of branching.  Their results fall outside the tile's valid
-     part, and the stores skip them.  */
+  /* Threads past the matrix edge load the last valid row or token, so no
+     thread branches.  Their results fall outside the tile's valid part,
+     and the stores skip them.  */
   uint row = min (first_row + weight_row, n_rows - 1);
   uint token = min (first_token + input_token, n_tokens - 1);
 
-  /* Where this thread's weights and inputs land in the blocked tiles.
-     Weight K of a block goes to block K / 8, row K % 8.  */
+  /* Each thread finds where its weights and inputs land in the blocked
+     tiles.  Weight K of a block goes to block K / 8, row K % 8.  */
   ushort weight_base
       = 64 * (weight_row / 8) + weight_row % 8 + 64 * 8 * (2 * weight_half);
   threadgroup float4 *input_slot

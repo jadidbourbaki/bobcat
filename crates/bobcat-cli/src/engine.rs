@@ -52,7 +52,9 @@ impl Role {
 /// One message of a conversation.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Message {
+    /// The message's author.
     pub(crate) role: Role,
+    /// The message's text.
     pub(crate) content: String,
     /// The tools an assistant message called.
     pub(crate) tool_calls: Vec<ToolCall>,
@@ -85,11 +87,15 @@ pub(crate) enum Finish {
 /// What a reply produced.
 #[derive(Debug, Clone)]
 pub(crate) struct Reply {
+    /// The reply's answer, without its thinking.
     pub(crate) answer: String,
+    /// Why the reply ended.
     pub(crate) finish: Finish,
+    /// The tokens of the prompt.
     pub(crate) prompt_tokens: usize,
     /// The prompt tokens that an earlier reply had already run.
     pub(crate) cached_tokens: usize,
+    /// The tokens the reply generated, thinking included.
     pub(crate) completion_tokens: usize,
     /// The time from the start of the reply to its first token.
     pub(crate) first_token: Duration,
@@ -110,9 +116,11 @@ pub(crate) enum Event<'e> {
 
 /// What to generate.
 pub(crate) struct Request<'r> {
+    /// The conversation so far, which the reply continues.
     pub(crate) messages: &'r [Message],
     /// The tools the model may call, as JSON objects with a name, a description, and parameters.
     pub(crate) tools: &'r [serde_json::Value],
+    /// The sampler that picks each token of the reply.
     pub(crate) sampler: &'r mut Sampler,
     /// The most tokens in the reply.
     pub(crate) max_tokens: usize,
@@ -143,8 +151,8 @@ pub(crate) struct Engine<'a> {
 /// The ids of the tokens that change how the engine reads the model's output.
 struct Special {
     stop: u32,
-    /// The token that ends a document in pretraining. Clef ends its replies with the token in
-    /// place of the end-of-turn token its file names.
+    /// The token that ends a document in pretraining, `<|endoftext|>`. Clef ends its replies with
+    /// `<|endoftext|>`, and its file names a different end-of-turn token.
     end_of_text: Option<u32>,
     think_open: Option<u32>,
     think_close: Option<u32>,

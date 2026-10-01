@@ -73,7 +73,10 @@ impl Linear {
     /// Return the products of the `x.len() / n_cols` rows of `x` with the matrix, plus the bias.
     ///
     /// The rows of `x` split across the CPU's cores. The memory projections multiply every token
-    /// of the request, which took four fifths of a 300-token decision on one core.
+    /// of the request, which took four fifths of a 300-token decision on one core. Each product
+    /// starts scoped threads of its own, about 50 times per decision, which costs far less than
+    /// the products. A decision runs once per request, outside the decode loop that keeps a
+    /// thread pool alive.
     fn apply(&self, x: &[f32]) -> Vec<f32> {
         let rows = x.len() / self.n_cols;
         let mut out = vec![0.0; rows * self.n_rows];
@@ -334,18 +337,25 @@ impl Head {
             feedforward,
         } = *config;
         if hidden_size != to_usize(model.hyperparameters().n_embd)
+            || width == 0
+            || feedforward == 0
             || heads == 0
             || !width.is_multiple_of(heads)
         {
             return Err(Error::Hyperparameters);
         }
+        // The configuration comes from the model file, so the multiples of the width it names
+        // must fit before any shape uses them.
+        let three_widths = width.checked_mul(3).ok_or(Error::Hyperparameters)?;
+        let four_widths = width.checked_mul(4).ok_or(Error::Hyperparameters)?;
         let linear = |name: &str, n_cols: usize, n_rows: usize, bias: bool| {
             loader.linear(name, n_cols, n_rows, bias)
         };
         let norm = |name: &str, n: usize| loader.layer_norm(name, n);
         let attention = |name: &str| -> Result<Attention, Error> {
-            let weight = loader.values(&format!("{name}.in_proj_weight"), &[width, 3 * width])?;
-            let bias = loader.values(&format!("{name}.in_proj_bias"), &[3 * width])?;
+            let weight =
+                loader.values(&format!("{name}.in_proj_weight"), &[width, three_widths])?;
+            let bias = loader.values(&format!("{name}.in_proj_bias"), &[three_widths])?;
             let part = |i: usize| Linear {
                 weight: weight[i * width * width..(i + 1) * width * width].to_vec(),
                 bias: Some(bias[i * width..(i + 1) * width].to_vec()),
@@ -425,7 +435,7 @@ impl Head {
             field_norm: norm("field_norm", width)?,
             option_norm: norm("option_norm", width)?,
             scorer: FeedForward {
-                up: linear("residual_scorer.0", 4 * width, width, true)?,
+                up: linear("residual_scorer.0", four_widths, width, true)?,
                 down: linear("residual_scorer.3", width, 1, true)?,
             },
             prior_logit_scale: loader.scalar("prior_logit_scale")?,
@@ -452,6 +462,11 @@ impl Head {
             return Err(Error::Argument(
                 "the hidden states must hold hidden_size floats per token",
             ));
+        }
+        // The options read rows of the output matrix by token.
+        let n_vocab = model.hyperparameters().n_vocab;
+        if let Some(&token) = tokens.iter().find(|&&token| token >= n_vocab) {
+            return Err(Error::Token { token, n_vocab });
         }
         let spans = questions
             .iter()
@@ -611,7 +626,7 @@ impl Head {
     }
 }
 
-/// Reads the head's tensors out of the GGUF file.
+/// Reads the head's tensors out of a GGUF file or a safetensors file.
 enum Loader<'s> {
     /// A GGUF file that holds the head's tensors under `clef.` names.
     Gguf(&'s Gguf<Storage>),
@@ -704,7 +719,7 @@ impl Loader<'_> {
         })
     }
 
-    /// Return the single value of the tensor `clef.NAME`.
+    /// Return the single value of the head tensor `NAME`.
     fn scalar(&self, name: &str) -> Result<f32, Error> {
         Ok(self.values(name, &[1])?[0])
     }

@@ -35,6 +35,7 @@ fn head_matches_reference() -> TestResult {
     let head = Head::load(&model)?.ok_or("the model file holds no Clef head")?;
     let hidden = read_f32s(&reference.dir, "hidden.f32")?;
     let logits = head.logits(&model, &hidden, &reference.tokens, &reference.questions)?;
+    same_shape(&logits, &reference.logits)?;
     for (got, want) in logits.iter().zip(&reference.logits) {
         let scale = want.iter().fold(1.0_f64, |m, &v| m.max(f64::from(v).abs()));
         for (&got, &want) in got.iter().zip(want) {
@@ -96,6 +97,7 @@ fn decision_matches_reference() -> TestResult {
     let mut hidden = vec![0.0; n_tokens * n_embd];
     gpu.prefill(&reference.tokens, None, Some(&mut hidden), None)?;
     let logits = head.logits(&model, &hidden, &reference.tokens, &reference.questions)?;
+    same_shape(&logits, &reference.logits)?;
     for (got, want) in logits.iter().zip(&reference.logits) {
         let got = softmax(got);
         let want = softmax(want);
@@ -173,6 +175,21 @@ fn load() -> Result<Option<(Model, Reference)>, Box<dyn Error>> {
         logits,
     };
     Ok(Some((Model::load(model_path)?, reference)))
+}
+
+/// Check that `got` holds as many questions as `want`, each with as many options, so the
+/// comparisons that zip them miss no logit.
+fn same_shape(got: &[Vec<f32>], want: &[Vec<f32>]) -> TestResult {
+    let shape = |logits: &[Vec<f32>]| logits.iter().map(Vec::len).collect::<Vec<_>>();
+    if shape(got) != shape(want) {
+        return Err(format!(
+            "the head gives logits of shape {:?}, and the reference {:?}",
+            shape(got),
+            shape(want)
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Return the floats in the file `name` of `dir`.

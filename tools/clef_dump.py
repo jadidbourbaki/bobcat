@@ -33,6 +33,8 @@ import torch
 import transformers
 from safetensors.torch import load_file
 
+from clef_gguf import HeadConfig
+
 REQUEST = {
     "model": "clef-flash",
     "state": "Our checkout started returning errors and orders are blocked.",
@@ -70,8 +72,10 @@ def main() -> None:
     backbone = transformers.Qwen3_5ForConditionalGeneration.from_pretrained(
         args.release, dtype=torch.bfloat16, device_map={"": "cpu"}
     )
-    head_config = json.loads((args.release / "joint_head_config.json").read_text())
-    joint_head = clef.JointSchemaHead(**head_config)
+    head_config = HeadConfig.model_validate_json(
+        (args.release / "joint_head_config.json").read_text()
+    )
+    joint_head = clef.JointSchemaHead(**head_config.model_dump())
     joint_head.load_state_dict(load_file(args.release / "joint_head.safetensors"), strict=True)
     model = clef.ClefModel(backbone, joint_head.to(torch.bfloat16)).eval()
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.release)

@@ -172,7 +172,7 @@ fn tag_of(file: &str, files: &[&str]) -> String {
 
 /// The GGUF repositories of decision models whose decision head lives in the model's own release,
 /// with that release's repository. The GGUF file holds the backbone, and the release holds the
-/// head and the tokenizer the head was trained with.
+/// head and the tokenizer that the head's authors trained it with.
 const DECISION_HEADS: [(&str, &str, &str); 1] = [(
     "bartowski/Cloudflare_clef-flash-GGUF",
     "Cloudflare",
@@ -188,6 +188,7 @@ const HEAD_FILES: [&str; 3] = [
 
 /// The files of a model.
 pub(crate) struct Files {
+    /// The GGUF file of the model.
     pub(crate) gguf: PathBuf,
     /// The decision head from the model's release, for a model that has one there.
     pub(crate) head: Option<HeadFiles>,
@@ -195,8 +196,11 @@ pub(crate) struct Files {
 
 /// The files of a decision head from a Clef release.
 pub(crate) struct HeadFiles {
+    /// The head's `joint_head.safetensors`.
     pub(crate) weights: PathBuf,
+    /// The head's `joint_head_config.json`.
     pub(crate) config: PathBuf,
+    /// The release's `tokenizer.json`.
     pub(crate) tokenizer: PathBuf,
 }
 
@@ -239,27 +243,26 @@ fn head_files(name: &Name) -> Result<Option<HeadFiles>, Error> {
         .find(|cached| cached.repo_id == release)
         .map(cached_files)
         .unwrap_or_default();
-    let mut paths = Vec::new();
-    for file in HEAD_FILES {
-        let path = match cached.iter().find(|cached| cached.file_name == file) {
-            Some(cached) => cached.file_path.clone(),
-            None => HFClientSync::new()?
-                .model(owner, repo)
-                .download_file()
-                .filename(file)
-                .progress(Progress::new(ProgressLine::new(format!(
-                    "{release}/{file}"
-                ))))
-                .send()?,
-        };
-        paths.push(path);
-    }
-    let [weights, config, tokenizer] =
-        <[PathBuf; 3]>::try_from(paths).map_err(|_| "the release lists a head file twice")?;
+    let fetch = |file: &str| -> Result<PathBuf, Error> {
+        Ok(
+            match cached.iter().find(|cached| cached.file_name == file) {
+                Some(cached) => cached.file_path.clone(),
+                None => HFClientSync::new()?
+                    .model(owner, repo)
+                    .download_file()
+                    .filename(file)
+                    .progress(Progress::new(ProgressLine::new(format!(
+                        "{release}/{file}"
+                    ))))
+                    .send()?,
+            },
+        )
+    };
+    let [weights, config, tokenizer] = HEAD_FILES.map(fetch);
     Ok(Some(HeadFiles {
-        weights,
-        config,
-        tokenizer,
+        weights: weights?,
+        config: config?,
+        tokenizer: tokenizer?,
     }))
 }
 

@@ -46,9 +46,10 @@ gdn_conv (device const float *x [[buffer (0)]],
 /* The convolution of gdn_conv for a batch of at least KERNEL_SIZE - 1
    tokens, with thread (C, T) computing channel C of token T.  HISTORY
    holds the inputs before the batch, and gdn_conv_history moves it
-   forward after every thread has read it.  One thread per channel ran
-   the 512 tokens of a Qwen3.5-0.8B prefill one after another, which
-   took 5 percent of the prefill.  */
+   forward after every thread has read it.  Running every token at once
+   raised a 512-token Qwen3.5-0.8B prefill from 4263 to 4409 tokens per
+   second on an M4 Pro, because gdn_conv walks the tokens of a channel
+   one after another.  */
 kernel void
 gdn_conv_batch (device const float *x [[buffer (0)]],
                 device const float *taps [[buffer (1)]],
@@ -98,9 +99,9 @@ gdn_conv_history (device const float *x [[buffer (0)]],
 
 /* Normalize each of the N_ROWS rows of V_DIM floats at X by its root mean
    square, scale it by WEIGHT, and multiply it by SiLU of the matching
-   floats at GATE: the gated output norm of a DeltaNet layer, one row per
-   value head of each token.  Threadgroup R of one simdgroup handles row
-   R.  */
+   floats at GATE.  The kernel computes the gated output norm of a
+   DeltaNet layer, with one row per value head of each token.
+   Threadgroup R of one simdgroup handles row R.  */
 kernel void
 gdn_gated_norm (device float *x [[buffer (0)]],
                 device const float *weight [[buffer (1)]],
@@ -214,8 +215,9 @@ gdn_qk_norm (device float *y [[buffer (0)]],
    whole batch, and simd_sum finishes each token's two dot products over
    the rows.  Threadgroup (B, J) of
    GDN_COLUMNS simdgroups handles columns GDN_COLUMNS B onward of value
-   head J.  One column per simdgroup gives the 9B model's 32 heads of 128
-   columns 4096 simdgroups, where one column per lane gave 128.  */
+   head J.  The 9B model's 32 heads of 128 columns give 4096
+   simdgroups, which cut its recurrence in a 512-token prefill from 462
+   to 148 ms on an M4 Pro, with each launch on its own command buffer.  */
 kernel void
 gdn_recurrence (device const float *y [[buffer (0)]],
                 device const float *beta [[buffer (1)]],
@@ -252,7 +254,7 @@ gdn_recurrence (device const float *y [[buffer (0)]],
 
   /* Each step loads and normalizes the next token's query and key, which
      do not depend on the state, so they overlap the current token's
-     update instead of delaying it.  */
+     update.  */
   float4 query;
   float4 key;
   load_query_key (y, key_head * k_dim + first, key_dim, active, q_scale,

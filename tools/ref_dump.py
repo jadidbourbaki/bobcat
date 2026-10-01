@@ -19,8 +19,7 @@ reads LFM2 GGUF files itself. For the mixture-of-experts `lfm2moe`
 files, which transformers cannot read, the script builds the model from
 the configuration of `--model` and copies in each tensor that the gguf
 package dequantizes. The float32 8B model needs about 33 GB of memory.
-The script runs
-the model in float32 on the CPU and writes raw
+The script runs the model in float32 on the CPU and writes raw
 little-endian files to the output directory. `tokens.i32` holds the
 prompt token ids. `embedding.f32`, `layer_NN.f32`, and `final_norm.f32`
 hold one row of hidden size per prompt token. `logits.f32` holds one
@@ -34,6 +33,7 @@ import argparse
 import json
 import pathlib
 import re
+from collections.abc import Callable
 
 import gguf
 import numpy as np
@@ -111,8 +111,10 @@ def write_raw(path: pathlib.Path, array: np.ndarray) -> None:
 
 def gguf_architecture(path: pathlib.Path) -> str:
     reader = gguf.GGUFReader(path)
-    field = reader.fields["general.architecture"]
-    return field.contents()
+    architecture = reader.fields["general.architecture"].contents()
+    if not isinstance(architecture, str):
+        raise TypeError(f"{path} names no architecture")
+    return architecture
 
 
 def dequantized(tensor: gguf.ReaderTensor) -> torch.Tensor:
@@ -262,7 +264,7 @@ def main() -> None:
         input_ids = torch.cat([bos, input_ids], dim=1)
     captured: dict[str, torch.Tensor] = {}
 
-    def capture(name: str):
+    def capture(name: str) -> Callable[[nn.Module, tuple, torch.Tensor | tuple], None]:
         def hook(_module: nn.Module, _inputs: tuple, output: torch.Tensor | tuple) -> None:
             # Some decoder layers return a tuple whose first item is the hidden state.
             hidden = output[0] if isinstance(output, tuple) else output

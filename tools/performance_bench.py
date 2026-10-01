@@ -51,6 +51,13 @@ class Run(BaseModel):
     tpot_ms: PositiveFloat
 
 
+class Timing(BaseModel):
+    """The time to first token and the time per output token that a benchmark tool printed."""
+
+    ttft_ms: PositiveFloat
+    tpot_ms: PositiveFloat
+
+
 class LatencyRow(BaseModel):
     """A row of the latency CSV that the streaming harnesses print."""
 
@@ -71,19 +78,13 @@ class Weights:
     candle: bool
 
 
-def unsloth(size: str) -> Path:
-    """Return the Q4_K_M file of Unsloth's Qwen3.5 GGUF repository of `size` in the Hugging Face
-    cache, where `bobcat pull qwen3.5:SIZE` puts it. Before the pull, the path names no file."""
-    repo = Path.home() / f".cache/huggingface/hub/models--unsloth--Qwen3.5-{size}-GGUF"
-    files = sorted(repo.glob(f"snapshots/*/Qwen3.5-{size}-Q4_K_M.gguf"))
-    return files[-1] if files else repo / f"Qwen3.5-{size}-Q4_K_M.gguf"
-
-
 def qwen35(size: str) -> Weights:
-    """Return the weights of Qwen3.5 of `size`. ExecuTorch and candle have no Qwen3.5 model, and
-    Cactus converts only from the full-precision release."""
+    """Return the weights of Qwen3.5 of `size`. The GGUF file holds every matrix in Q4_0, which
+    reads the same bytes per weight as mlx-community's 4-bit weights, and `eval.md` gives the
+    command that makes it. ExecuTorch and candle have no Qwen3.5 model, and Cactus converts only
+    from the full-precision release."""
     return Weights(
-        gguf=unsloth(size),
+        gguf=MODELS / f"Qwen3.5-{size}-Q4_0.gguf",
         mlx=MODELS / f"Qwen3.5-{size}-MLX-4bit",
         executorch=None,
         cactus=None,
@@ -271,7 +272,8 @@ def mistral_rs(weights: Weights) -> tuple[float, float]:
     tpot = MISTRALRS_TPOT.search(text)
     if ttft is None or tpot is None:
         raise RuntimeError(f"unexpected output from mistralrs bench:\n{text}")
-    return float(ttft[1]), float(tpot[1])
+    timing = Timing(ttft_ms=float(ttft[1]), tpot_ms=float(tpot[1]))
+    return timing.ttft_ms, timing.tpot_ms
 
 
 def candle(weights: Weights) -> tuple[float, float]:
@@ -300,7 +302,8 @@ def candle(weights: Weights) -> tuple[float, float]:
     if set(rates) != {"prefill", "decode"}:
         raise RuntimeError(f"unexpected output from candle_bench.py:\n{text}")
     # candle reports rates, so the prompt's duration stands in for the time to first token.
-    return PROMPT_TOKENS / rates["prefill"] * 1000, 1000 / rates["decode"]
+    timing = Timing(ttft_ms=PROMPT_TOKENS / rates["prefill"] * 1000, tpot_ms=1000 / rates["decode"])
+    return timing.ttft_ms, timing.tpot_ms
 
 
 def machine() -> str:
@@ -310,10 +313,12 @@ def machine() -> str:
     memory = int(output(["sysctl", "-n", "hw.memsize"])) // 2**30
     gpu = output(["system_profiler", "SPDisplaysDataType"])
     gpu_cores = re.search(r"Total Number of Cores: (\d+)", gpu)
+    if gpu_cores is None:
+        raise RuntimeError("system_profiler reports no GPU core count")
     macos = platform.mac_ver()[0]
     return (
         f"{chip}, {cpu_cores} CPU cores, "
-        f"{gpu_cores[1] if gpu_cores else 'unknown'} GPU cores, {memory} GiB memory.\n"
+        f"{gpu_cores[1]} GPU cores, {memory} GiB memory.\n"
         f"macOS {macos}.\n"
     )
 

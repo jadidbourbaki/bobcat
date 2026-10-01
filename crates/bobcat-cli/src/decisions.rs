@@ -7,8 +7,8 @@
 //! to `9` for score levels, and `yes` and `no`. One prefill reads the next-token log-probabilities
 //! of the labels. The prompt wording, the labels, the checks, and the response shapes follow
 //! SGLang's `serving_decisions.py` and `systemone/serving.py`, so clients of either server work
-//! unchanged. A model file that holds a Clef decision head answers `/v1/systemone` with the head
-//! instead, as [`crate::systemone`] describes.
+//! unchanged. A model file that holds a Clef decision head answers `/v1/systemone` with that
+//! head, as [`crate::systemone`] describes.
 
 use std::collections::HashSet;
 
@@ -86,7 +86,7 @@ pub(crate) fn decisions(engine: &mut Engine<'_>, request: &Value) -> Result<Valu
     let object = request
         .as_object()
         .ok_or_else(|| invalid("the request must be a JSON object"))?;
-    allow_keys(
+    check_keys(
         object,
         &[
             "input",
@@ -97,8 +97,8 @@ pub(crate) fn decisions(engine: &mut Engine<'_>, request: &Value) -> Result<Valu
             "return_prompt_token_ids",
             "model",
         ],
-        "the request",
-    )?;
+    )
+    .map_err(|error| invalid(format!("the request: {error}")))?;
     let input = &request["input"];
     text_field(input, "input", true).map_err(Refusal::Invalid)?;
     let questions = request["questions"]
@@ -118,13 +118,7 @@ pub(crate) fn decisions(engine: &mut Engine<'_>, request: &Value) -> Result<Valu
         ids.push(id);
         views.push(view);
     }
-    let temperature = match &request["temperature"] {
-        Value::Null => 1.0,
-        value => value
-            .as_f64()
-            .filter(|t| t.is_finite() && *t > 0.0)
-            .ok_or_else(|| invalid("temperature must be a number above 0"))?,
-    };
+    let temperature = temperature(&request["temperature"])?;
     match &request["prompt_format_version"] {
         Value::Null => {}
         value if value.as_u64() == Some(PROMPT_FORMAT_VERSION) => {}
@@ -141,11 +135,7 @@ pub(crate) fn decisions(engine: &mut Engine<'_>, request: &Value) -> Result<Valu
         Value::Bool(value) => *value,
         _ => return Err(invalid("return_prompt_token_ids must be a boolean")),
     };
-    let model = match &request["model"] {
-        Value::Null => "default".to_owned(),
-        Value::String(model) => model.clone(),
-        _ => return Err(invalid("model must be a string")),
-    };
+    let model = model_name(&request["model"])?;
     let kwargs = template_kwargs(&request["chat_template_kwargs"])?;
 
     let text = render_text(input);
@@ -458,8 +448,8 @@ fn systemone_question(question: &Value) -> Result<View, String> {
     }
 }
 
-/// Answer the `/v1/score` request `request`: the probabilities of label tokens after each item,
-/// joined to the query.
+/// Answer the `/v1/score` request `request`. The response holds the probability of each label
+/// token after each item joined to the query.
 pub(crate) fn score_request(engine: &mut Engine<'_>, request: &Value) -> Result<Value, Refusal> {
     if !request.is_object() {
         return Err(invalid("the request must be a JSON object"));
@@ -487,21 +477,11 @@ pub(crate) fn score_request(engine: &mut Engine<'_>, request: &Value) -> Result<
     let apply_softmax = flag("apply_softmax")?;
     let return_logprobs = flag("return_token_logprobs")?;
     let item_first = flag("item_first")?;
-    let temperature = match &request["temperature"] {
-        Value::Null => 1.0,
-        value => value
-            .as_f64()
-            .filter(|t| t.is_finite() && *t > 0.0)
-            .ok_or_else(|| invalid("temperature must be a number above 0"))?,
-    };
+    let temperature = temperature(&request["temperature"])?;
     if (temperature - 1.0).abs() > 0.0 && !apply_softmax {
         return Err(invalid("temperature requires apply_softmax=True"));
     }
-    let model = match &request["model"] {
-        Value::Null => "default".to_owned(),
-        Value::String(model) => model.clone(),
-        _ => return Err(invalid("model must be a string")),
-    };
+    let model = model_name(&request["model"])?;
 
     let tokenizer = engine.tokenizer();
     let encode = |text: &str| -> Result<Vec<u32>, Refusal> {
@@ -611,6 +591,28 @@ pub(crate) fn score_request(engine: &mut Engine<'_>, request: &Value) -> Result<
         response["token_logprobs"] = json!(logprobs);
     }
     Ok(response)
+}
+
+/// Return the request's `temperature`, which divides the label logits before their softmax and
+/// defaults to 1.
+fn temperature(value: &Value) -> Result<f64, Refusal> {
+    match value {
+        Value::Null => Ok(1.0),
+        value => value
+            .as_f64()
+            .filter(|t| t.is_finite() && *t > 0.0)
+            .ok_or_else(|| invalid("temperature must be a number above 0")),
+    }
+}
+
+/// Return the request's `model`, which the response echoes, as SGLang's `default` when the
+/// request names none.
+fn model_name(value: &Value) -> Result<String, Refusal> {
+    match value {
+        Value::Null => Ok("default".to_owned()),
+        Value::String(model) => Ok(model.clone()),
+        _ => Err(invalid("model must be a string")),
+    }
 }
 
 /// Return the token ids in `value`, a list of nonnegative integers.
@@ -888,11 +890,6 @@ fn check_keys(object: &Map<String, Value>, allowed: &[&str]) -> Result<(), Strin
     }
 }
 
-/// Refuse any key of `object`, which `place` names, outside `allowed`.
-fn allow_keys(object: &Map<String, Value>, allowed: &[&str], place: &str) -> Result<(), Refusal> {
-    check_keys(object, allowed).map_err(|error| invalid(format!("{place}: {error}")))
-}
-
 fn invalid(message: impl Into<String>) -> Refusal {
     Refusal::Invalid(message.into())
 }
@@ -916,7 +913,7 @@ fn by_name(view: &View, probabilities: &[f64]) -> Map<String, Value> {
 
 /// Return the softmax of the log-probabilities `logprobs` divided by `temperature`. The
 /// vocabulary normalizer cancels, so the result is the softmax of the label logits.
-fn softmax(logprobs: &[f64], temperature: f64) -> Vec<f64> {
+pub(crate) fn softmax(logprobs: &[f64], temperature: f64) -> Vec<f64> {
     let max = logprobs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let weights: Vec<f64> = logprobs
         .iter()
@@ -986,10 +983,11 @@ fn score_confidence(q: &[f64]) -> f64 {
 mod tests {
     use super::*;
 
-    /// Check the wording of version 1 against the messages SGLang renders for the questions of
-    /// its documentation, so a change to the wording fails until the version changes too.
+    /// Check the wording of `PROMPT_FORMAT_VERSION` 1 against the messages SGLang renders for the
+    /// questions of its documentation. A change to the wording needs a new version and new
+    /// expected messages.
     #[test]
-    fn questions_render_as_sglang_version_1() {
+    fn questions_render_as_sglang_version_1() -> Result<(), String> {
         let request = json!([
             {"id": "team", "type": "choice", "question": "Which team?", "options": [
                 {"name": "billing", "description": "Payments"}, {"name": "sales"}]},
@@ -1005,10 +1003,15 @@ mod tests {
             "Ticket text\n\nIs the following true? It is urgent.\nno: It can wait.\nAnswer with \
              yes or no only.",
         ];
-        assert_eq!(PROMPT_FORMAT_VERSION, 1);
-        for (question, want) in request.as_array().unwrap().iter().zip(want) {
-            let (_, view) = decisions_question(question).unwrap();
+        for (question, want) in request
+            .as_array()
+            .ok_or("the questions form a list")?
+            .iter()
+            .zip(want)
+        {
+            let (_, view) = decisions_question(question)?;
             assert_eq!(render_question("Ticket text", &view, &labels(&view)), want);
         }
+        Ok(())
     }
 }

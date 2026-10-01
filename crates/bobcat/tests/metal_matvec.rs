@@ -165,8 +165,6 @@ fn launch_error(
     let norm_weight: Vec<f32> = (0..cols).map(|_| 1.0 + 0.5 * random.unit()).collect();
     let prior: Vec<f32> = (0..rows).map(|_| random.unit()).collect();
 
-    // The scalar reference: normalize when the mode fuses the norm, then multiply, then combine
-    // with the prior output or the up matrix.
     let mut input = x.clone();
     if matches!(mode, Mode::Norm | Mode::Swiglu) {
         scalar::rms_norm(&x, &norm_weight, NORM_EPS, &mut input);

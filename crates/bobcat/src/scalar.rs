@@ -1,7 +1,7 @@
 //! The scalar reference implementation of every op.
 //!
 //! The code favors plain loops and double-precision sums, so it defines the correct output for
-//! faster kernels to match. Every faster kernel is tested against these functions.
+//! faster kernels to match. The kernel tests check every faster kernel against these functions.
 
 use bobcat_gguf::TensorType;
 use half::{bf16, f16};

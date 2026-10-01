@@ -19,11 +19,10 @@ use axum::http::StatusCode;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use bobcat::clef::Head;
 use serde_json::{Map, Value, json};
 use tokio::sync::{mpsc as channel, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-
-use bobcat::clef::Head;
 
 use crate::Error;
 use crate::decisions::{self, Refusal};
@@ -106,7 +105,7 @@ enum Job {
         settings: Settings,
         updates: channel::UnboundedSender<Update>,
     },
-    /// Answer a Jev/SystemOne decision request.
+    /// Answer a request to one of the decision routes.
     Decide {
         route: Route,
         request: Value,
@@ -785,7 +784,8 @@ async fn messages(State(shared): State<Arc<Shared>>, body: Bytes) -> Response {
     }
     event_stream(move |events| async move {
         let mut updates = updates;
-        // The index of the next content block, and whether a text block is open.
+        // Anthropic events number each content block. A text block stays open until a tool call
+        // or the end of the reply closes it.
         let mut index = 0;
         let mut text_open = false;
         while let Some(update) = updates.recv().await {

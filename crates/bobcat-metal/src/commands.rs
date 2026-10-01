@@ -18,9 +18,11 @@ use super::{Arg, Dispatch, Error, Ticket, describe, size, to_u64};
 
 // A decode step uses a small fraction of one arena. Extra arenas accommodate large recordings.
 const CONSTANT_BYTES: usize = 1024 * 1024;
+// Metal aligns each constant argument to 16 bytes.
 const CONSTANT_STRIDE: usize = 16;
+// A compute argument table binds at most 31 buffers.
 const BUFFER_BINDINGS: usize = 31;
-// Covers GENERATE_IN_FLIGHT in bobcat's lfm2_metal.rs without allocating during decode.
+// Decode keeps three command buffers in flight, so three slots let it run without allocating.
 const INITIAL_COMMAND_SLOTS: usize = 3;
 
 #[derive(Debug)]
@@ -379,8 +381,8 @@ impl Commands {
                 if self.bindings[index] == Some(address) {
                     continue;
                 }
-                // SAFETY: Each index is below the table's binding count. Buffer ranges were
-                // checked by the launch. The slot retains all buffers through completion.
+                // SAFETY: Each index is below the table's binding count. `Metal::launch` checked
+                // each buffer range. The slot retains all buffers through completion.
                 unsafe { self.table.setAddress_atIndex(address, index) };
                 self.bindings[index] = Some(address);
             }

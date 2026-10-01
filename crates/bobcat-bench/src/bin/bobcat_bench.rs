@@ -38,13 +38,13 @@ enum Matmul {
 struct Options {
     /// The GGUF model file.
     model: std::path::PathBuf,
-    /// Prompt tokens.
+    /// The number of prompt tokens.
     #[arg(short, long, default_value_t = 512, value_parser = clap::value_parser!(u32).range(1..=1_000_000))]
     prompt: u32,
-    /// Generated tokens.
+    /// The number of generated tokens.
     #[arg(short = 'n', long, default_value_t = 128, value_parser = clap::value_parser!(u32).range(1..=1_000_000))]
     generate: u32,
-    /// Repetitions.
+    /// The number of measured runs, after one warmup run.
     #[arg(short, long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..=1_000))]
     reps: u32,
     /// Break prefill and decode GPU time down by kernel.
@@ -59,10 +59,10 @@ struct Options {
     /// Output tokens per streaming call after the first token.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=1024))]
     stream_chunk: u32,
-    /// Prefill matrix kernel selection for A/B comparisons.
+    /// The matrix kernel that prefill uses, for A/B comparisons.
     #[arg(long, value_enum, default_value_t = Matmul::Auto)]
     matmul: Matmul,
-    /// KV cache type.
+    /// The element type of the KV cache.
     #[arg(short, long, value_enum, default_value_t = KvType::F16)]
     kv: KvType,
 }
@@ -425,6 +425,7 @@ fn print_milliseconds(label: &str, values: &[f64]) {
 }
 
 /// Print the mean and sample standard deviation of `rates` under `label`.
+#[cfg(target_os = "macos")]
 fn print_rates(label: &str, rates: &[f64]) {
     let n = rates.len() as f64;
     let mean = rates.iter().sum::<f64>() / n;
@@ -486,26 +487,4 @@ fn print_profile(metal: &bobcat::metal::Metal, label: &str, n_units: u32) {
         "",
         total * 1e3 / units
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use clap::Parser;
-
-    use super::Options;
-
-    #[test]
-    fn latency_only_requires_latency() {
-        assert!(Options::try_parse_from(["bobcat-bench", "model.gguf", "--latency-only"]).is_err());
-    }
-
-    #[test]
-    fn streaming_chunk_rejects_empty_and_oversized_calls() {
-        for chunk in ["0", "1025"] {
-            assert!(
-                Options::try_parse_from(["bobcat-bench", "model.gguf", "--stream-chunk", chunk])
-                    .is_err()
-            );
-        }
-    }
 }

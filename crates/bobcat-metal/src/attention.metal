@@ -331,8 +331,8 @@ attention_flash (device const float *q [[buffer (0)]],
   uint load_column = 4 * (tid % row_vectors);
   uint load_keys = threads / row_vectors;
 
-  /* Rows past the last query hold zeros, and their results are
-     discarded.  */
+  /* Rows past the last query hold zeros, and the final store skips their
+     results.  */
   for (uint row = load_key; row < FLASH_QUERIES; row += load_keys)
     {
       float4 value = 0.0f;
@@ -488,9 +488,10 @@ template [[host_name (
 
 /* Combine the chunk results of attention_chunk in SCRATCH into the
    result of each query head of each query at OUT, as the second of two
-   passes.  Query I sits at position FIRST_POS + I.  Each chunk's sums
-   are rescaled from its own largest score to the largest score of all
-   chunks.  One threadgroup of HEAD_DIM threads handles one query head of
+   passes.  Query I sits at position FIRST_POS + I.  The kernel rescales
+   each chunk's sums from its own largest score to the largest score of
+   all chunks.  attention_chunk and attention_wide write the same chunk
+   results.  One threadgroup of HEAD_DIM threads handles one query head of
    one query.  */
 kernel void
 attention_combine (device const float *scratch [[buffer (0)]],

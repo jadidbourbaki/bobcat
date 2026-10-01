@@ -17,12 +17,10 @@ use crate::lfm2::{
 };
 use crate::storage::Storage;
 
-/// Each lane of the attention kernel holds a whole number of elements of a head, and a
-/// threadgroup serves at most four query heads of up to 256 elements. Must match
-/// `ATTENTION_MAX_GROUP` and `ATTENTION_MAX_HEAD_DIM` in `common.metal`.
+/// The lanes of a simdgroup. Each lane of the attention kernels holds a whole number of elements
+/// of a head.
 pub(crate) const SIMD_WIDTH: u32 = 32;
-pub(crate) const ATTENTION_MAX_GROUP: u32 = 4;
-pub(crate) const ATTENTION_MAX_HEAD_DIM: u32 = 256;
+pub(crate) use bobcat_metal::{ATTENTION_MAX_GROUP, ATTENTION_MAX_HEAD_DIM};
 
 /// `short_conv_history` in `conv.metal` keeps up to 8 history inputs per channel in
 /// registers.
@@ -240,9 +238,7 @@ impl<'a> Lfm2Metal<'a> {
     pub fn reset(&mut self) -> Result<(), Error> {
         // A new sequence starts from zero convolution history. The KV cache needs no clearing,
         // because attention reads only the positions a sequence has written.
-        let hp = self.model.hyperparameters();
-        let conv_floats =
-            to_usize(hp.n_conv_layers) * to_usize(hp.conv_kernel - 1) * to_usize(hp.n_embd);
+        let conv_floats = self.conv_floats();
         self.metal
             .write(self.buffers.conv_state.at(0), &vec![0.0_f32; conv_floats])?;
         self.n_past = 0;
@@ -423,7 +419,7 @@ impl<'a> Lfm2Metal<'a> {
     /// of the GPU, so the GPU never waits for the CPU, and a token reaches `emit` when the step
     /// that selects it finishes. Steps already submitted when `emit` stops still run.
     ///
-    /// Return the tokens the sequence gained, in order. They start with every emitted token but
+    /// Return the tokens the sequence gained, in order. The returned tokens start with every emitted token but
     /// the last, whose forward pass never runs, and may include tokens past the last emitted
     /// one.
     pub fn generate_stream(
@@ -660,8 +656,8 @@ impl<'a> Lfm2Metal<'a> {
 
     /// Run the model on `tokens` at the next positions, in batches of up to 512 tokens.
     ///
-    /// When `logits` is given, it receives the logits of the last token. The logits buffer
-    /// receives them either way, for [`Lfm2Metal::generate`]. When `trace` is given, it must
+    /// When the caller passes `logits`, it receives the logits of the last token. The logits buffer
+    /// receives them either way, for [`Lfm2Metal::generate`]. When the caller passes `trace`, it must
     /// hold `tokens.len()` tokens and receives every token's activations.
     pub fn prefill(
         &mut self,
@@ -728,7 +724,7 @@ impl<'a> Lfm2Metal<'a> {
             let ticket = self.metal.commit()?;
             encode_seconds += encode_start.elapsed().as_secs_f64();
 
-            // A traced batch waits so its activations can be copied out before the next batch
+            // A traced batch waits, so the CPU copies its activations out before the next batch
             // overwrites them. Other batches run back to back.
             if trace.is_some() || last {
                 gpu_seconds += self.metal.wait(ticket)?;
@@ -782,7 +778,6 @@ impl<'a> Lfm2Metal<'a> {
     }
 }
 
-/// Return the dense feed-forward block of `layer`.
 /// Return the matrices of `layer` that batches multiply with [`Recorder::matmul`]. The experts
 /// of a mixture-of-experts block multiply through their own launches.
 fn matmul_matrices(layer: &Layer) -> Vec<&Matrix> {
@@ -1330,7 +1325,6 @@ impl<'r> Recorder<'r> {
         self.metal
             .moe_group(route, offsets, entries, hp.n_experts, hp.n_experts_used, n)?;
         self.metal.barrier();
-        // One launch multiplies the gate and up projections and applies the SwiGLU.
         self.metal.matmul_experts(
             format(&moe.gate)?,
             b.weights(&moe.gate.tensor),
@@ -1456,7 +1450,7 @@ impl<'r> Recorder<'r> {
     /// Record the forward pass of the `n` tokens at positions `pos` onward of the token buffer.
     ///
     /// When `want_logits` is true, the last token's logits go to the logits buffer. When
-    /// `trace_layer_stride` is given, the trace buffers receive the batch's activations, with
+    /// the caller passes `trace_layer_stride`, the trace buffers receive the batch's activations, with
     /// layer `il`'s outputs starting `il * trace_layer_stride` floats into the layer trace buffer.
     fn record_batch(
         &mut self,

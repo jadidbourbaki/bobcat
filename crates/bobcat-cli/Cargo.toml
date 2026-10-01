@@ -1,6 +1,6 @@
 [package]
 name = "bobcat-cli"
-description = "The bobcat command, which chats with a model on the Metal GPU"
+description = "The bobcat command, which runs language models on the Metal GPU"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

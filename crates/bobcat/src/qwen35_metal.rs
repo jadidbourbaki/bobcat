@@ -406,7 +406,7 @@ impl<'a> Qwen35Metal<'a> {
     /// of the GPU, and a token reaches `emit` when the step that selects it finishes. Steps
     /// already submitted when `emit` stops still run.
     ///
-    /// Return the tokens the sequence gained, in order. They start with every emitted token but
+    /// Return the tokens the sequence gained, in order. The returned tokens start with every emitted token but
     /// the last, whose forward pass never runs, and may include tokens past the last emitted
     /// one.
     pub fn generate_stream(
@@ -550,9 +550,9 @@ impl<'a> Qwen35Metal<'a> {
 
     /// Run the model on `tokens` at the next positions, in batches of up to 512 tokens.
     ///
-    /// When `logits` is given, it receives the logits of the last token. The logits buffer
-    /// receives them either way, for generation. When `final_norm` is given, it receives every
-    /// token's normalized last hidden state, `n_embd` floats per token. When `trace` is given, it
+    /// When the caller passes `logits`, it receives the logits of the last token. The logits buffer
+    /// receives them either way, for generation. When the caller passes `final_norm`, it receives every
+    /// token's normalized last hidden state, `n_embd` floats per token. When the caller passes `trace`, it
     /// must hold `tokens.len()` tokens and receives every token's activations.
     pub fn prefill(
         &mut self,

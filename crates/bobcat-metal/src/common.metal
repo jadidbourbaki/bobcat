@@ -12,8 +12,7 @@ constant uint rows_per_threadgroup [[function_constant (0)]];
    by NORM_WEIGHT before multiplying.  */
 constant bool fuse_norm [[function_constant (1)]];
 
-/* Whether a matrix kernel adds its product to Y instead of overwriting
-   Y.  */
+/* Whether a matrix kernel adds its product to what Y holds.  */
 constant bool accumulate [[function_constant (2)]];
 
 /* Whether the matrix-matrix kernel stores SiLU of what Y holds times its
@@ -46,14 +45,19 @@ enum
   ATTENTION_MAX_GROUP = 4,
   ATTENTION_MAX_HEAD_DIM = 256,
   /* The simdgroups of an attention_wide threadgroup, which split a
-     chunk's positions.  backend.rs keeps the same value.  */
+     chunk's positions.  Two and four measured within 2 percent of each
+     other on Qwen3.5-0.8B and 9B on an M4 Pro, and eight overflow the
+     threadgroup memory of the merge.  ATTENTION_WIDE_SIMDGROUPS in
+     backend.rs keeps the same value.  */
   ATTENTION_WIDE_SIMDGROUPS = 4,
   /* The Gated DeltaNet kernels' limits.  The host checks the model
      against both.  */
   GDN_MAX_KERNEL = 8,
   GDN_MAX_K_DIM = 128,
   /* The state columns, one per simdgroup, of a gdn_recurrence
-     threadgroup.  */
+     threadgroup.  On an M4 Pro, four columns decoded Qwen3.5-0.8B at 335
+     tokens per second, against 327 for two and 334 for eight.
+     GDN_COLUMNS in backend.rs keeps the same value.  */
   GDN_COLUMNS = 4,
   /* A threadgroup of attention_flash covers FLASH_QUERIES queries of one
      head with four simdgroups of 8 queries each, over FLASH_KEYS keys at

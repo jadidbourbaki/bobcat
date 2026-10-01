@@ -383,18 +383,18 @@ impl<B: AsRef<[u8]>> Gguf<B> {
 
     /// Return the boolean metadata value `key` when it exists.
     pub fn bool(&self, key: &str) -> Option<bool> {
-        match self.metadata.get(key)? {
-            Value::Bool(value) => Some(*value),
-            _ => None,
-        }
+        let Value::Bool(value) = self.metadata.get(key)? else {
+            return None;
+        };
+        Some(*value)
     }
 
     /// Return the bytes of the string metadata value `key` when it exists.
     pub fn string(&self, key: &str) -> Option<&[u8]> {
-        match self.metadata.get(key)? {
-            Value::String(range) => self.bytes().get(range.clone()),
-            _ => None,
-        }
+        let Value::String(range) = self.metadata.get(key)? else {
+            return None;
+        };
+        self.bytes().get(range.clone())
     }
 
     /// Return the elements of the string array metadata value `key` when it exists.
@@ -420,10 +420,10 @@ impl<B: AsRef<[u8]>> Gguf<B> {
 
     /// Return the element count of the array metadata value `key` when it exists.
     pub fn array_len(&self, key: &str) -> Option<u64> {
-        match self.metadata.get(key)? {
-            Value::Array { count, .. } => Some(*count),
-            _ => None,
-        }
+        let Value::Array { count, .. } = self.metadata.get(key)? else {
+            return None;
+        };
+        Some(*count)
     }
 
     /// Return element `index` of the integer array metadata value `key` when the element exists

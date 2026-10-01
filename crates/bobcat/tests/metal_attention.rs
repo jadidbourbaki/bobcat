@@ -22,6 +22,8 @@ fn attention_query_batches_preserve_causal_tails() -> Result<(), Box<dyn Error>>
         (64, 73, 4, 1, 128),
         (63, 70, 4, 2, 64),
         (129, 5, 2, 2, 32),
+        (63, 9, 8, 2, 256),
+        (65, 70, 8, 2, 256),
     ] {
         for half_cache in [false, true] {
             let keys = first + queries;

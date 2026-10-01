@@ -1,9 +1,10 @@
-/* Matrix-vector kernels for Q8_0, Q4_0, Q4_K, and Q6_K weights.  */
+/* Matrix-vector kernels for F16, F32, Q8_0, Q4_0, Q4_K, Q5_K, and Q6_K
+   weights.  */
 
 /* Multiply the Q8_0 matrix WEIGHTS, which has N_ROWS rows of N_COLS
    elements, by the N_COLS floats at X and store the N_ROWS results at Y.
-   With fuse_norm, X is first RMS-normalized with epsilon EPS and scaled
-   by NORM_WEIGHT.  With accumulate, the results add to Y.
+   With fuse_norm, the kernel first RMS-normalizes X with epsilon EPS and
+   scales it by NORM_WEIGHT.  With accumulate, the results add to Y.
 
    The layout follows llama.cpp's Q8_0 matrix-vector kernel.  Each
    threadgroup computes ROWS_PER_THREADGROUP consecutive rows, and its
@@ -72,8 +73,9 @@ matvec_q8_0 (device const uchar *weights [[buffer (0)]],
 
 /* Multiply the Q8_0 matrices GATE and UP, which each have N_ROWS rows of
    N_COLS elements, by the N_COLS floats at X, and store SiLU of each
-   gate result times the matching up result at Y.  With fuse_norm, X is
-   first RMS-normalized with epsilon EPS and scaled by NORM_WEIGHT.  The
+   gate result times the matching up result at Y.  With fuse_norm, the
+   kernel first RMS-normalizes X with epsilon EPS and scales it by
+   NORM_WEIGHT.  The
    layout follows matvec_q8_0, with each lane reading both matrices.  */
 kernel void
 matvec_q8_0_swiglu (device const uchar *gate [[buffer (0)]],

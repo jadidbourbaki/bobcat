@@ -1,4 +1,6 @@
-//! Checks full and partial Metal matrix tiles against the scalar reference.
+//! Checks full and partial Metal matrix tiles against the scalar reference, the half-precision
+//! expansion of quantized matrices against the quantized kernels, and the tensor prefill path
+//! against the standard one.
 
 #![cfg(target_os = "macos")]
 #![expect(clippy::print_stderr, reason = "tests report skips on stderr")]
@@ -48,7 +50,9 @@ fn check_shape(
                     *quant = u8::try_from((block * 17 + i * 13) % 251)?;
                 }
             }
-            _ => unreachable!("the tile test uses F16, F32, Q8_0, Q4_K, and Q5_K weights"),
+            TensorType::Q4_0 | TensorType::Q6K | TensorType::Bf16 => {
+                unreachable!("the tile test uses F16, F32, Q8_0, Q4_K, and Q5_K weights")
+            }
         }
         weights.extend_from_slice(&bytes);
     }
@@ -244,7 +248,7 @@ fn f16_matrix_tiles_match_scalar() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn f32_matrix_tiles_match_scalar() -> Result<(), Box<dyn Error>> {
+fn quantized_matrix_tiles_match_scalar() -> Result<(), Box<dyn Error>> {
     let mut metal = match Metal::open() {
         Ok(metal) => metal,
         Err(error) => {
@@ -252,92 +256,18 @@ fn f32_matrix_tiles_match_scalar() -> Result<(), Box<dyn Error>> {
             return Ok(());
         }
     };
-    for (rows, cols, tokens) in [(64, 64, 32), (70, 96, 33)] {
-        for store in [Store::Overwrite, Store::Accumulate, Store::Swiglu] {
-            check_shape(
-                &mut metal,
-                TensorType::F32,
-                Format::F32,
-                rows,
-                cols,
-                tokens,
-                store,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-#[test]
-fn q8_0_matrix_tiles_match_scalar() -> Result<(), Box<dyn Error>> {
-    let mut metal = match Metal::open() {
-        Ok(metal) => metal,
-        Err(error) => {
-            eprintln!("skip: {error}");
-            return Ok(());
-        }
-    };
-    for (rows, cols, tokens) in [(64, 64, 32), (70, 96, 33)] {
-        for store in [Store::Overwrite, Store::Accumulate, Store::Swiglu] {
-            check_shape(
-                &mut metal,
-                TensorType::Q8_0,
-                Format::Q8_0,
-                rows,
-                cols,
-                tokens,
-                store,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-#[test]
-fn q4k_matrix_tiles_match_scalar() -> Result<(), Box<dyn Error>> {
-    let mut metal = match Metal::open() {
-        Ok(metal) => metal,
-        Err(error) => {
-            eprintln!("skip: {error}");
-            return Ok(());
-        }
-    };
-    for (rows, cols, tokens) in [(64, 256, 32), (70, 256, 33)] {
-        for store in [Store::Overwrite, Store::Accumulate, Store::Swiglu] {
-            check_shape(
-                &mut metal,
-                TensorType::Q4K,
-                Format::Q4K,
-                rows,
-                cols,
-                tokens,
-                store,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-#[test]
-fn q5k_matrix_tiles_match_scalar() -> Result<(), Box<dyn Error>> {
-    let mut metal = match Metal::open() {
-        Ok(metal) => metal,
-        Err(error) => {
-            eprintln!("skip: {error}");
-            return Ok(());
-        }
-    };
-    for (rows, cols, tokens) in [(64, 256, 32), (70, 256, 33)] {
-        for store in [Store::Overwrite, Store::Accumulate, Store::Swiglu] {
-            check_shape(
-                &mut metal,
-                TensorType::Q5K,
-                Format::Q5K,
-                rows,
-                cols,
-                tokens,
-                store,
-            )?;
+    // Each format runs one shape of whole tiles and one with partial tiles, in whole blocks.
+    let cases = [
+        (TensorType::F32, Format::F32, [(64, 64, 32), (70, 96, 33)]),
+        (TensorType::Q8_0, Format::Q8_0, [(64, 64, 32), (70, 96, 33)]),
+        (TensorType::Q4K, Format::Q4K, [(64, 256, 32), (70, 256, 33)]),
+        (TensorType::Q5K, Format::Q5K, [(64, 256, 32), (70, 256, 33)]),
+    ];
+    for (tensor_type, format, shapes) in cases {
+        for (rows, cols, tokens) in shapes {
+            for store in [Store::Overwrite, Store::Accumulate, Store::Swiglu] {
+                check_shape(&mut metal, tensor_type, format, rows, cols, tokens, store)?;
+            }
         }
     }
     Ok(())
@@ -401,7 +331,9 @@ fn check_expansion(tensor_type: TensorType, format: Format) -> Result<(), Box<dy
                     *quant = u8::try_from((block * 17 + i * 13) % 251)?;
                 }
             }
-            _ => unreachable!("only Q4_0 and the K-quants expand"),
+            TensorType::F32 | TensorType::F16 | TensorType::Q8_0 | TensorType::Bf16 => {
+                unreachable!("only Q4_0 and the K-quants expand")
+            }
         }
     }
     let input: Vec<f32> = (0..tokens * cols)

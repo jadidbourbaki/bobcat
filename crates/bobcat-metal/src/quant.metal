@@ -1,5 +1,5 @@
-/* Q4_0, Q4_K, and Q6_K formats and K-quant lane helpers.  The backend
-   compiles this source after common.metal.
+/* The F16, F32, Q4_0, Q4_K, Q5_K, and Q6_K formats and K-quant lane
+   helpers.  The backend compiles this source after common.metal.
 
    Each format supplies a load8 function that dequantizes 8 consecutive
    weights of a row, following ggml's reference dequantization in
@@ -106,6 +106,32 @@ struct q4_0_format
   }
 };
 
+/* Set GROUP_SCALE and GROUP_MIN to the scale and minimum of the group
+   of weight O of the super-block BLOCK.  */
+static void
+k_group (device const uchar *block, uint o, thread float &group_scale,
+         thread float &group_min)
+{
+  float d = float (*(device const half *)block);
+  float dmin = float (*(device const half *)(block + 2));
+  device const uchar *scales = block + 4;
+  uint j = o / 32;
+  uint scale;
+  uint min;
+  if (j < 4)
+    {
+      scale = scales[j] & 63;
+      min = scales[j + 4] & 63;
+    }
+  else
+    {
+      scale = (scales[j + 4] & 0xf) | ((scales[j - 4] >> 6) << 4);
+      min = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+    }
+  group_scale = d * float (scale);
+  group_min = dmin * float (min);
+}
+
 /* The Q4_K format: super-blocks of 256 weights.  Each holds fp16 scales
    D and DMIN, 12 bytes of packed 6-bit scales and minimums for its
    eight 32-weight groups, and 128 bytes of 4-bit quants.  Each 32 bytes
@@ -119,25 +145,11 @@ struct q4k_format
   load8 (device const uchar *row, uint e)
   {
     device const uchar *block = row + (e / 256) * block_bytes;
-    float d = float (*(device const half *)block);
-    float dmin = float (*(device const half *)(block + 2));
-    device const uchar *scales = block + 4;
     uint o = e % 256;
     uint j = o / 32;
-    uint scale;
-    uint min;
-    if (j < 4)
-      {
-        scale = scales[j] & 63;
-        min = scales[j + 4] & 63;
-      }
-    else
-      {
-        scale = (scales[j + 4] & 0xf) | ((scales[j - 4] >> 6) << 4);
-        min = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
-      }
-    float group_scale = d * float (scale);
-    float group_min = dmin * float (min);
+    float group_scale;
+    float group_min;
+    k_group (block, o, group_scale, group_min);
     device const uchar *quants = block + 16 + (j / 2) * 32 + o % 32;
     uint shift = j % 2 == 0 ? 0 : 4;
     float w[8];
@@ -151,25 +163,11 @@ struct q4k_format
   load16 (device const uchar *row, uint e, thread half4 *out)
   {
     device const uchar *block = row + (e / 256) * block_bytes;
-    float d = float (*(device const half *)block);
-    float dmin = float (*(device const half *)(block + 2));
-    device const uchar *scales = block + 4;
     uint o = e % 256;
     uint j = o / 32;
-    uint scale;
-    uint min;
-    if (j < 4)
-      {
-        scale = scales[j] & 63;
-        min = scales[j + 4] & 63;
-      }
-    else
-      {
-        scale = (scales[j + 4] & 0xf) | ((scales[j - 4] >> 6) << 4);
-        min = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
-      }
-    float group_scale = d * float (scale);
-    float group_min = dmin * float (min);
+    float group_scale;
+    float group_min;
+    k_group (block, o, group_scale, group_min);
     /* Rows span whole 144-byte blocks, and 16 divides E, so the 16
        quant bytes start on a 16-byte boundary.  */
     device const uchar4 *quants
@@ -191,32 +189,6 @@ struct q5k_format
   static constant constexpr uint block_weights = 256;
   static constant constexpr uint block_bytes = 176;
 
-  /* Set GROUP_SCALE and GROUP_MIN to the scale and minimum of the group
-     of weight O of the super-block BLOCK.  */
-  static void
-  group (device const uchar *block, uint o, thread float &group_scale,
-         thread float &group_min)
-  {
-    float d = float (*(device const half *)block);
-    float dmin = float (*(device const half *)(block + 2));
-    device const uchar *scales = block + 4;
-    uint j = o / 32;
-    uint scale;
-    uint min;
-    if (j < 4)
-      {
-        scale = scales[j] & 63;
-        min = scales[j + 4] & 63;
-      }
-    else
-      {
-        scale = (scales[j + 4] & 0xf) | ((scales[j - 4] >> 6) << 4);
-        min = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
-      }
-    group_scale = d * float (scale);
-    group_min = dmin * float (min);
-  }
-
   static weights8
   load8 (device const uchar *row, uint e)
   {
@@ -225,7 +197,7 @@ struct q5k_format
     uint j = o / 32;
     float group_scale;
     float group_min;
-    group (block, o, group_scale, group_min);
+    k_group (block, o, group_scale, group_min);
     device const uchar *high = block + 16 + o % 32;
     device const uchar *quants = block + 48 + (j / 2) * 32 + o % 32;
     uint shift = j % 2 == 0 ? 0 : 4;

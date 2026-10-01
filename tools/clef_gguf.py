@@ -18,7 +18,6 @@ tokenize with Qwen2's. The script sets `tokenizer.ggml.pre` from the release's `
 from __future__ import annotations
 
 import argparse
-import json
 import pathlib
 
 import gguf
@@ -71,12 +70,37 @@ def head_arrays(release: pathlib.Path) -> dict[str, tuple[np.ndarray, gguf.GGMLQ
     return arrays
 
 
+class SplitPattern(BaseModel):
+    """The regex of a `Split` pre-tokenizer step."""
+
+    Regex: str
+
+
+class PreTokenizerStep(BaseModel):
+    """One step of a `Sequence` pre-tokenizer. Only `Split` steps carry a pattern."""
+
+    type: str
+    pattern: SplitPattern | None = None
+
+
+class PreTokenizer(BaseModel):
+    """The `Sequence` pre-tokenizer of a Hugging Face `tokenizer.json`."""
+
+    pretokenizers: list[PreTokenizerStep]
+
+
+class TokenizerJson(BaseModel):
+    """The part of a Hugging Face `tokenizer.json` that names its pre-tokenizer."""
+
+    pre_tokenizer: PreTokenizer
+
+
 def pre_tokenizer(release: pathlib.Path) -> str:
     """Return the GGUF name of the pre-tokenizer in the release's `tokenizer.json`."""
-    tokenizer = json.loads((release / "tokenizer.json").read_text())
-    for step in tokenizer["pre_tokenizer"]["pretokenizers"]:
-        if step["type"] == "Split":
-            pattern = step["pattern"]["Regex"]
+    tokenizer = TokenizerJson.model_validate_json((release / "tokenizer.json").read_text())
+    for step in tokenizer.pre_tokenizer.pretokenizers:
+        if step.type == "Split" and step.pattern is not None:
+            pattern = step.pattern.Regex
             if pattern not in PRE_TOKENIZERS:
                 raise ValueError(f"the release splits text with an unknown regex {pattern!r}")
             return PRE_TOKENIZERS[pattern]
@@ -106,7 +130,7 @@ def main() -> None:
         sub_type = field.types[-1] if value_type == gguf.GGUFValueType.ARRAY else None
         writer.add_key_value(field.name, field.contents(), value_type, sub_type=sub_type)
     writer.add_string(gguf.Keys.Tokenizer.PRE, pre_tokenizer(args.release))
-    for key, value in json.loads(config.model_dump_json()).items():
+    for key, value in config.model_dump().items():
         writer.add_uint32(f"clef.{key}", value)
 
     head = head_arrays(args.release)

@@ -153,7 +153,7 @@ mod tests {
     /// Check that the tokenizer rebuilt from each model file matches the model's own
     /// `tokenizer.json` on the whole vocabulary and on every sample.
     #[test]
-    fn gguf_tokenizer_matches_tokenizer_json() {
+    fn gguf_tokenizer_matches_tokenizer_json() -> Result<(), Error> {
         let models = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models");
         let lfm2 = ["LFM2.5-350M", "LFM2.5-1.2B-Instruct", "LFM2.5-2.6B"].map(|name| {
             (
@@ -177,10 +177,10 @@ mod tests {
                 );
                 continue;
             }
-            let storage = std::fs::read(&gguf_path).unwrap();
-            let gguf = Gguf::parse(storage).unwrap();
-            let rebuilt = from_gguf(&gguf).unwrap();
-            let reference = Tokenizer::from_file(&json_path).unwrap();
+            let storage = std::fs::read(&gguf_path)?;
+            let gguf = Gguf::parse(storage)?;
+            let rebuilt = from_gguf(&gguf)?;
+            let reference = Tokenizer::from_file(&json_path)?;
 
             // llama.cpp's converter appends Qwen3.5's audio control tokens after the
             // vocabulary of its tokenizer.json, and no text maps to them.
@@ -189,7 +189,7 @@ mod tests {
                 rebuilt.get_vocab_size(true) >= vocab_size,
                 "{name} vocabulary size"
             );
-            for id in 0..u32::try_from(vocab_size).unwrap() {
+            for id in 0..u32::try_from(vocab_size)? {
                 assert_eq!(
                     rebuilt.id_to_token(id),
                     reference.id_to_token(id),
@@ -197,15 +197,16 @@ mod tests {
                 );
             }
             for sample in SAMPLES {
-                let got = rebuilt.encode(*sample, false).unwrap();
-                let want = reference.encode(*sample, false).unwrap();
+                let got = rebuilt.encode(*sample, false)?;
+                let want = reference.encode(*sample, false)?;
                 assert_eq!(got.get_ids(), want.get_ids(), "{name} encodes {sample:?}");
                 assert_eq!(
-                    rebuilt.decode(got.get_ids(), false).unwrap(),
-                    reference.decode(want.get_ids(), false).unwrap(),
+                    rebuilt.decode(got.get_ids(), false)?,
+                    reference.decode(want.get_ids(), false)?,
                     "{name} decodes {sample:?}"
                 );
             }
         }
+        Ok(())
     }
 }

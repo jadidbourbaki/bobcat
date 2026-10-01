@@ -128,7 +128,7 @@ struct ModelOptions {
     /// `LiquidAI/LFM2.5-2.6B-GGUF:Q8_0`, or a GGUF file. A named model downloads on first use.
     #[arg(short, long, env = "BOBCAT_MODEL")]
     model: String,
-    /// A Hugging Face `tokenizer.json` to use in place of the tokenizer inside the model file.
+    /// A Hugging Face `tokenizer.json` that overrides the tokenizer inside the model file.
     #[arg(short, long)]
     tokenizer: Option<PathBuf>,
 }
@@ -281,8 +281,8 @@ type Loaded = (
 
 /// Load the model, tokenizer, and decision head that `options` name.
 ///
-/// A decision model whose head comes from its release also takes the release's tokenizer, which
-/// the head was trained with.
+/// A decision model whose head comes from its release also takes the release's tokenizer,
+/// because the head's authors trained it with that tokenizer.
 #[cfg(target_os = "macos")]
 fn load(options: &ModelOptions) -> Result<Loaded, Error> {
     let files = models::resolve(&options.model)?;
@@ -410,13 +410,24 @@ fn respond(
 /// Answer the decision `request`, or the request on stdin, and write the response to stdout.
 #[cfg(target_os = "macos")]
 fn decide(model_options: &ModelOptions, request: &str) -> Result<(), Error> {
-    // One JSON request comes from the argument or, without one, from stdin.
-    let text = if request.trim().is_empty() {
-        let mut input = String::new();
-        io::stdin().read_to_string(&mut input)?;
-        input
-    } else {
-        request.to_owned()
+    let mut input = String::new();
+    let mut stdin = io::stdin();
+    if !stdin.is_terminal() {
+        stdin.read_to_string(&mut input)?;
+    }
+    // A request is one JSON value, so two sources cannot join the way a prompt and its input do.
+    let text = match (request.trim().is_empty(), input.trim().is_empty()) {
+        (true, true) => {
+            return Err("no request, so pass one as an argument or on standard input".into());
+        }
+        (false, true) => request.to_owned(),
+        (true, false) => input,
+        (false, false) => {
+            return Err(
+                "the request came both as an argument and on standard input, so pass just one"
+                    .into(),
+            );
+        }
     };
     let request: serde_json::Value =
         serde_json::from_str(&text).map_err(|error| format!("the request is not JSON: {error}"))?;

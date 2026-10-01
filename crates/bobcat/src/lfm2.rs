@@ -195,7 +195,8 @@ impl Model {
         })?;
         let (mut hyperparameters, n_dense_layers) = load_hyperparameters(&gguf)?;
 
-        let mut layers = Vec::with_capacity(to_usize(hyperparameters.n_layers));
+        // The layer count comes from the file, so the list grows as layers load.
+        let mut layers = Vec::new();
         for il in 0..hyperparameters.n_layers {
             layers.push(load_layer(
                 &gguf,
@@ -302,7 +303,7 @@ impl Model {
 
     /// Run the model on `token` at the next position of `state`.
     ///
-    /// When `logits` is given, it receives the `n_vocab` logits. When `trace` is given, it
+    /// When the caller passes `logits`, it receives the `n_vocab` logits. When the caller passes `trace`, it
     /// receives the activations of this token, so it must hold one token.
     pub fn step(
         &self,

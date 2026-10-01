@@ -12,6 +12,7 @@ use serde_json::{Map, Value, json};
 use tokenizers::Tokenizer;
 
 use crate::Error;
+use crate::decisions;
 
 /// The longest request Clef reads, in tokens. Longer states lose their tail.
 pub(crate) const MAX_TOKENS: usize = 16384;
@@ -22,7 +23,9 @@ const SYSTEM_PROMPT: &str = "Read the complete state and schema. Decide every fi
 
 /// A request encoded for the model.
 pub(crate) struct Encoded {
+    /// The tokens of the whole request.
     pub(crate) tokens: Vec<u32>,
+    /// Each question's kind and the spans of its instructions and options in `tokens`.
     pub(crate) questions: Vec<Question>,
     /// Each question's id and its options' ids, in the order of `questions`.
     ids: Vec<(String, Vec<String>)>,
@@ -225,7 +228,13 @@ pub(crate) fn response(request: &Value, encoded: &Encoded, logits: &[Vec<f32>]) 
         let probabilities: Map<String, Value> = option_ids
             .iter()
             .cloned()
-            .zip(softmax(logits))
+            .zip(decisions::softmax(
+                &logits
+                    .iter()
+                    .map(|&logit| f64::from(logit))
+                    .collect::<Vec<_>>(),
+                1.0,
+            ))
             .map(|(option, probability)| (option, json!(probability)))
             .collect();
         let probability = |option: &str| probabilities.get(option).and_then(Value::as_f64);
@@ -306,16 +315,6 @@ pub(crate) fn response(request: &Value, encoded: &Encoded, logits: &[Vec<f32>]) 
     })
 }
 
-/// Return the softmax of `logits`.
-fn softmax(logits: &[f32]) -> Vec<f64> {
-    let max = logits
-        .iter()
-        .fold(f64::NEG_INFINITY, |m, &v| m.max(f64::from(v)));
-    let exps: Vec<f64> = logits.iter().map(|&v| (f64::from(v) - max).exp()).collect();
-    let sum: f64 = exps.iter().sum();
-    exps.iter().map(|e| e / sum).collect()
-}
-
 /// Return `value` rounded to four decimal places, as the release's answers are.
 fn round(value: f64) -> f64 {
     (value * 1e4).round() / 1e4
@@ -331,7 +330,7 @@ mod tests {
 
     /// Check that the reference request encodes to the release's tokens and spans.
     #[test]
-    fn request_encodes_as_reference() {
+    fn request_encodes_as_reference() -> Result<(), Error> {
         let models = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models");
         let model_path = models.join("clef-flash-Q8_0.gguf");
         let dir = models.join("ref/clef-flash");
@@ -341,52 +340,53 @@ mod tests {
                 model_path.display(),
                 dir.display()
             );
-            return;
+            return Ok(());
         }
-        let gguf = Gguf::parse(std::fs::read(&model_path).unwrap()).unwrap();
-        let tokenizer = crate::tokenizer::from_gguf(&gguf).unwrap();
-        let request: Value =
-            serde_json::from_slice(&std::fs::read(dir.join("request.json")).unwrap()).unwrap();
-        validate(&request).unwrap();
-        let encoded = encode(&tokenizer, &request, MAX_TOKENS).unwrap();
+        let gguf = Gguf::parse(std::fs::read(&model_path)?)?;
+        let tokenizer = crate::tokenizer::from_gguf(&gguf)?;
+        let request: Value = serde_json::from_slice(&std::fs::read(dir.join("request.json"))?)?;
+        validate(&request)?;
+        let encoded = encode(&tokenizer, &request, MAX_TOKENS)?;
 
-        let want: Vec<u32> = std::fs::read(dir.join("tokens.i32"))
-            .unwrap()
+        let want: Vec<u32> = std::fs::read(dir.join("tokens.i32"))?
             .as_chunks::<4>()
             .0
             .iter()
             .map(|&word| u32::from_le_bytes(word))
             .collect();
         assert_eq!(encoded.tokens, want);
-        let reference: Value =
-            serde_json::from_slice(&std::fs::read(dir.join("encoded.json")).unwrap()).unwrap();
-        let span = |value: &Value| {
-            let start = usize::try_from(value[0].as_u64().unwrap()).unwrap();
-            let end = usize::try_from(value[1].as_u64().unwrap()).unwrap();
-            start..end
+        let reference: Value = serde_json::from_slice(&std::fs::read(dir.join("encoded.json"))?)?;
+        let span = |value: &Value| -> Result<Range<usize>, Error> {
+            let bound = |index: usize| -> Result<usize, Error> {
+                let bound = value[index].as_u64().ok_or("a span needs two bounds")?;
+                Ok(usize::try_from(bound)?)
+            };
+            Ok(bound(0)?..bound(1)?)
         };
-        for ((question, (id, option_ids)), want) in encoded
-            .questions
-            .iter()
-            .zip(&encoded.ids)
-            .zip(reference.as_array().unwrap())
+        let reference = reference.as_array().ok_or("encoded.json holds a list")?;
+        assert_eq!(encoded.questions.len(), reference.len());
+        for ((question, (id, option_ids)), want) in
+            encoded.questions.iter().zip(&encoded.ids).zip(reference)
         {
-            assert_eq!(id, want["id"].as_str().unwrap());
-            assert_eq!(question.span, span(&want["span"]));
-            let want_spans: Vec<_> = want["option_spans"]
+            assert_eq!(Some(id.as_str()), want["id"].as_str());
+            assert_eq!(question.span, span(&want["span"])?);
+            let want_spans = want["option_spans"]
                 .as_array()
-                .unwrap()
+                .ok_or("a question needs option spans")?
                 .iter()
                 .map(span)
-                .collect();
+                .collect::<Result<Vec<_>, _>>()?;
             assert_eq!(question.options, want_spans);
-            let want_ids: Vec<&str> = want["option_ids"]
+            let want_ids: Vec<Option<&str>> = want["option_ids"]
                 .as_array()
-                .unwrap()
+                .ok_or("a question needs option ids")?
                 .iter()
-                .map(|id| id.as_str().unwrap())
+                .map(Value::as_str)
                 .collect();
-            assert_eq!(option_ids, &want_ids);
+            let got_ids: Vec<Option<&str>> =
+                option_ids.iter().map(|id| Some(id.as_str())).collect();
+            assert_eq!(got_ids, want_ids);
         }
+        Ok(())
     }
 }

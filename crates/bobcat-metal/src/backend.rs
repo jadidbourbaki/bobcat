@@ -82,9 +82,12 @@ const ELEMENTWISE_THREADS: usize = 256;
 
 /// Must match `ATTENTION_CHUNK` in `common.metal`.
 const ATTENTION_CHUNK: u32 = 64;
-/// Heads at least this wide take `attention_wide` for the chunked pass.
+/// Heads at least this wide take `attention_wide` for the chunked pass. LFM2.5's heads of 64
+/// keep `attention_chunk`, which chose its chunk size on them. Qwen3.5's heads of 256 run
+/// `attention_wide`, which cut Qwen3.5-0.8B's decode from 4.49 to 3.92 ms per token on an
+/// M4 Pro. No model has heads between the two.
 const ATTENTION_WIDE_HEAD_DIM: u32 = 128;
-/// Must match `ATTENTION_WIDE_SIMDGROUPS` in `common.metal`.
+/// `common.metal` gives the measurement. Must match `ATTENTION_WIDE_SIMDGROUPS` there.
 const ATTENTION_WIDE_SIMDGROUPS: usize = 4;
 /// A 64-query batch cuts 512-query scratch by eight times. The 4096-token screen held GPU time.
 const ATTENTION_QUERY_BATCH: u32 = 64;
@@ -95,14 +98,20 @@ pub const MOE_MAX_EXPERTS: u32 = 128;
 /// The most experts the router may pick for a token. Must match `MOE_MAX_USED` in
 /// `common.metal`.
 pub const MOE_MAX_USED: u32 = 8;
+/// The most query heads that share one KV head in an attention launch. `common.metal` holds the
+/// same value as `ATTENTION_MAX_GROUP`.
+pub const ATTENTION_MAX_GROUP: u32 = 4;
+/// The widest head the attention kernels read. `common.metal` holds the same value as
+/// `ATTENTION_MAX_HEAD_DIM`.
+pub const ATTENTION_MAX_HEAD_DIM: u32 = 256;
 /// The longest causal convolution of a Gated DeltaNet layer. Must match `GDN_MAX_KERNEL` in
 /// `common.metal`.
 pub const GDN_MAX_KERNEL: u32 = 8;
 /// The largest key head of a Gated DeltaNet layer. Must match `GDN_MAX_K_DIM` in
 /// `common.metal`.
 pub const GDN_MAX_K_DIM: u32 = 128;
-/// The state columns, one per simdgroup, of a `gdn_recurrence` threadgroup. Must match
-/// `GDN_COLUMNS` in `common.metal`.
+/// The state columns, one per simdgroup, of a `gdn_recurrence` threadgroup. `common.metal` gives
+/// the measurement. Must match `GDN_COLUMNS` there.
 const GDN_COLUMNS: u32 = 4;
 
 /// Must match `MOE_ROUTE_SIMDGROUPS`, `MOE_ROUTE_TOKENS`, and `MOE_GROUP_SIMDGROUPS` in
@@ -221,6 +230,33 @@ pub enum Error {
         needed: usize,
         /// The buffer's length.
         len: usize,
+    },
+    /// An attention launch names heads or positions the attention kernels cannot serve.
+    #[error(
+        "the attention kernels need KV heads that divide the query heads into groups of up to \
+         {ATTENTION_MAX_GROUP}, heads of a multiple of 32 floats up to {ATTENTION_MAX_HEAD_DIM}, \
+         and positions inside the context, got {n_heads} and {n_kv_heads} heads of {head_dim} \
+         floats at positions up to {last_pos} of {n_ctx}"
+    )]
+    AttentionLimits {
+        /// The query heads.
+        n_heads: u32,
+        /// The KV heads.
+        n_kv_heads: u32,
+        /// The size of each head.
+        head_dim: u32,
+        /// The position after the last query.
+        last_pos: u64,
+        /// The positions the KV cache holds.
+        n_ctx: u32,
+    },
+    /// An attention gate launch names heads that do not tile its queries.
+    #[error("attention gates need heads of {head_dim} floats to tile {q_dim} query floats")]
+    GateShape {
+        /// The size of each head.
+        head_dim: u32,
+        /// The query floats of one token.
+        q_dim: u32,
     },
     /// The format has no kernel that fuses a short convolution into its input projection.
     #[error("{0:?} matrices have no fused short convolution kernel")]
@@ -1595,7 +1631,7 @@ impl Metal {
     /// `n_rows` rows of `n_cols` weights of `format` each, with the inputs routed to it.
     ///
     /// `offsets` and `entries` hold the groups [`Metal::moe_group`] wrote for `n_tokens` tokens
-    /// that each pick `n_used` experts. Entry `v` writes row `v` of `y`. It reads row `v` of `x`,
+    /// that each pick `n_used` experts. Entry `v` writes row `v` of `y` and reads row `v` of `x`,
     /// or row `v / n_used` when `shared_input` is true, so the slots of a token share its input.
     /// The products overwrite `y`. With `up`, `weights` holds gate projections and `up` the
     /// matching up projections of a SwiGLU, and `y` receives SiLU of each gate result times the
@@ -1777,9 +1813,9 @@ impl Metal {
         })
     }
 
-    /// Record the gated output norm of a DeltaNet layer: each of the `n_rows` rows of `v_dim`
-    /// floats at `x` divided by its root mean square with `eps`, scaled by `weight`, and
-    /// multiplied by SiLU of the matching floats at `gate`.
+    /// Record the gated output norm of a DeltaNet layer. The norm divides each of the `n_rows`
+    /// rows of `v_dim` floats at `x` by its root mean square with `eps`, scales it by `weight`,
+    /// and multiplies it by SiLU of the matching floats at `gate`.
     pub fn gdn_gated_norm(
         &mut self,
         x: View<'_>,
@@ -1849,10 +1885,6 @@ impl Metal {
     /// norm and scales the queries by `q_scale`. `state` holds `n_v_heads` matrices of `k_dim`
     /// rows of `v_dim` floats, which the tokens update in order. Each token's `n_v_heads * v_dim`
     /// outputs go to `out`.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "a launch binds each buffer and shape the kernel reads"
-    )]
     pub fn gdn_recurrence(
         &mut self,
         y: View<'_>,
@@ -1974,6 +2006,11 @@ impl Metal {
         q_dim: u32,
         n_tokens: u32,
     ) -> Result<(), Error> {
+        // The kernel finds each gate from the head of its query, so the heads must tile the
+        // queries.
+        if head_dim == 0 || !q_dim.is_multiple_of(head_dim) {
+            return Err(Error::GateShape { head_dim, q_dim });
+        }
         let n = n_tokens.saturating_mul(q_dim);
         let args = [
             buffer(out, product(&[to_usize(n), FLOAT_BYTES])),
@@ -2125,6 +2162,24 @@ impl Metal {
         n_queries: u32,
         n_ctx: u32,
     ) -> Result<(), Error> {
+        // The kernels size their arrays and their scratch for these limits.
+        let last_pos = u64::from(first_pos) + u64::from(n_queries);
+        if n_kv_heads == 0
+            || !n_heads.is_multiple_of(n_kv_heads)
+            || n_heads / n_kv_heads > ATTENTION_MAX_GROUP
+            || head_dim == 0
+            || !head_dim.is_multiple_of(32)
+            || head_dim > ATTENTION_MAX_HEAD_DIM
+            || last_pos > u64::from(n_ctx)
+        {
+            return Err(Error::AttentionLimits {
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                last_pos,
+                n_ctx,
+            });
+        }
         let scale = 1.0 / (head_dim as f32).sqrt();
         let cache_element = if kv_half { HALF_BYTES } else { FLOAT_BYTES };
         if n_queries >= FLASH_QUERIES && head_dim == FLASH_HEAD_DIM {
@@ -2271,10 +2326,6 @@ impl Metal {
     /// the input that [`Metal::short_conv`] reads from its `bcx`. The launch applies `norm` to
     /// `x` first when given, and it updates `history` and writes `out` as
     /// [`Metal::short_conv`] does for one token. Only formats that [`Format::fuses_conv`] run.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the launch binds every buffer it reads"
-    )]
     pub fn matvec_conv(
         &mut self,
         format: Format,
@@ -2464,7 +2515,7 @@ impl Metal {
         })
     }
 
-    /// Expand a Q4_0, Q4_K, or Q6_K matrix of `format` into contiguous half-precision rows.
+    /// Expand a Q4_0, Q4_K, Q5_K, or Q6_K matrix of `format` into contiguous half-precision rows.
     pub fn expand(
         &mut self,
         format: Format,
@@ -2487,7 +2538,10 @@ impl Metal {
         self.launch(&Launch {
             kernel: Kernel::Expand(format),
             args: &args,
-            dispatch: Dispatch::Threads([product(&[rows, cols / 16]), 1, 1], [256, 1, 1]),
+            dispatch: Dispatch::Threads(
+                [product(&[rows, cols / 16]), 1, 1],
+                [ELEMENTWISE_THREADS, 1, 1],
+            ),
             n_rows,
             n_cols,
             weight_bytes: to_u64(format.matrix_bytes(rows, cols)),
@@ -2739,8 +2793,8 @@ fn check_range(
 /// weights of `format`.
 ///
 /// Every kernel splits the columns of each threadgroup's rows among its simdgroups. The Q4_0 and
-/// K-quant kernels give each threadgroup `K_QUANT_ROWS_PER_SIMDGROUP` rows. The Q8_0 and F16
-/// kernels give wider rows more simdgroups.
+/// K-quant kernels give each threadgroup `K_QUANT_ROWS_PER_SIMDGROUP` rows, and wide Q4_0 rows more
+/// simdgroups. The Q8_0, F16, and F32 kernels give wider rows more simdgroups.
 fn matvec_dispatch(format: Format, n_rows: u32, n_cols: u32) -> Dispatch {
     if matches!(
         format,
@@ -2759,7 +2813,7 @@ fn matvec_dispatch(format: Format, n_rows: u32, n_cols: u32) -> Dispatch {
     matvec_rows_dispatch(n_rows, n_cols)
 }
 
-/// Return the dispatch of the Q8_0 and F16 matrix-vector kernels, which split each
+/// Return the dispatch of the Q8_0, F16, and F32 matrix-vector kernels, which split each
 /// threadgroup's rows among its simdgroups by columns.
 fn matvec_rows_dispatch(n_rows: u32, n_cols: u32) -> Dispatch {
     let threadgroups = n_rows.div_ceil(MATVEC_Q8_0_ROWS_PER_THREADGROUP);
