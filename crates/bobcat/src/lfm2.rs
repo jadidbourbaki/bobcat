@@ -644,19 +644,31 @@ pub struct Trace {
 impl Trace {
     /// Return a zeroed trace of `n_tokens` tokens of a model with `hyperparameters`.
     pub fn new(hyperparameters: &Hyperparameters, n_tokens: u32) -> Self {
-        let rows = to_usize(n_tokens) * to_usize(hyperparameters.n_embd);
+        Self::with_shape(hyperparameters.n_embd, hyperparameters.n_layers, n_tokens)
+    }
+
+    /// Return a zeroed trace of `n_tokens` tokens of a model of `n_layers` layers of width
+    /// `n_embd`.
+    pub(crate) fn with_shape(n_embd: u32, n_layers: u32, n_tokens: u32) -> Self {
+        let rows = to_usize(n_tokens) * to_usize(n_embd);
         Self {
             embedding: vec![0.0; rows],
-            layers: vec![0.0; to_usize(hyperparameters.n_layers) * rows],
+            layers: vec![0.0; to_usize(n_layers) * rows],
             final_norm: vec![0.0; rows],
         }
     }
 
     /// Report whether the trace holds `n_tokens` tokens of a model with `hyperparameters`.
     pub(crate) fn holds(&self, hyperparameters: &Hyperparameters, n_tokens: u32) -> bool {
-        let rows = to_usize(n_tokens) * to_usize(hyperparameters.n_embd);
+        self.holds_shape(hyperparameters.n_embd, hyperparameters.n_layers, n_tokens)
+    }
+
+    /// Report whether the trace holds `n_tokens` tokens of a model of `n_layers` layers of width
+    /// `n_embd`.
+    pub(crate) fn holds_shape(&self, n_embd: u32, n_layers: u32, n_tokens: u32) -> bool {
+        let rows = to_usize(n_tokens) * to_usize(n_embd);
         self.embedding.len() == rows
-            && self.layers.len() == to_usize(hyperparameters.n_layers) * rows
+            && self.layers.len() == to_usize(n_layers) * rows
             && self.final_norm.len() == rows
     }
 }
@@ -709,12 +721,12 @@ pub(crate) fn to_usize(n: u32) -> usize {
 }
 
 /// Return the integer metadata value `key` of `gguf`.
-fn require_u32(gguf: &Gguf<Storage>, key: &str) -> Result<u32, Error> {
+pub(crate) fn require_u32(gguf: &Gguf<Storage>, key: &str) -> Result<u32, Error> {
     gguf.u32(key).ok_or_else(|| Error::Metadata(key.to_owned()))
 }
 
 /// Return the floating-point metadata value `key` of `gguf`.
-fn require_f32(gguf: &Gguf<Storage>, key: &str) -> Result<f32, Error> {
+pub(crate) fn require_f32(gguf: &Gguf<Storage>, key: &str) -> Result<f32, Error> {
     gguf.f32(key).ok_or_else(|| Error::Metadata(key.to_owned()))
 }
 
@@ -818,7 +830,7 @@ fn layer_kv_heads(
 }
 
 /// Find the tensor `name` in `gguf` and check that its shape is `want`.
-fn require_tensor<'g>(
+pub(crate) fn require_tensor<'g>(
     gguf: &'g Gguf<Storage>,
     name: &str,
     want: &[u64],
@@ -837,7 +849,7 @@ fn require_tensor<'g>(
 }
 
 /// Find the matrix `name` in `gguf`, which must have `n_rows` rows of `n_cols` elements.
-fn require_matrix(
+pub(crate) fn require_matrix(
     gguf: &Gguf<Storage>,
     name: &str,
     n_cols: u64,
@@ -879,7 +891,11 @@ fn require_experts(
 
 /// Find the F32 tensor `name` in `gguf`, which must have the shape `want`, and copy out its
 /// values.
-fn require_vector(gguf: &Gguf<Storage>, name: &str, want: &[u64]) -> Result<Vector, Error> {
+pub(crate) fn require_vector(
+    gguf: &Gguf<Storage>,
+    name: &str,
+    want: &[u64],
+) -> Result<Vector, Error> {
     let tensor = require_tensor(gguf, name, want)?;
     if tensor.data_type() != TensorType::F32 {
         return Err(Error::TensorType {

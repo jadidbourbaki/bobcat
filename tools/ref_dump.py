@@ -63,6 +63,36 @@ LAYER_TENSOR_NAMES = {
     "ffn_down_exps.weight": "feed_forward.experts.down_proj",
 }
 LAYER_TENSOR_PATTERN = re.compile(r"blk\.(?P<layer>\d+)\.(?P<name>.+)")
+# The names transformers gives the tensors of one Qwen3.5 layer, by their GGUF names.
+QWEN35_TENSOR_NAMES = {
+    "attn_norm.weight": "input_layernorm.weight",
+    "post_attention_norm.weight": "post_attention_layernorm.weight",
+    "ffn_gate.weight": "mlp.gate_proj.weight",
+    "ffn_up.weight": "mlp.up_proj.weight",
+    "ffn_down.weight": "mlp.down_proj.weight",
+    "attn_q.weight": "self_attn.q_proj.weight",
+    "attn_k.weight": "self_attn.k_proj.weight",
+    "attn_v.weight": "self_attn.v_proj.weight",
+    "attn_output.weight": "self_attn.o_proj.weight",
+    "attn_q_norm.weight": "self_attn.q_norm.weight",
+    "attn_k_norm.weight": "self_attn.k_norm.weight",
+    "attn_qkv.weight": "linear_attn.in_proj_qkv.weight",
+    "attn_gate.weight": "linear_attn.in_proj_z.weight",
+    "ssm_beta.weight": "linear_attn.in_proj_b.weight",
+    "ssm_alpha.weight": "linear_attn.in_proj_a.weight",
+    "ssm_conv1d.weight": "linear_attn.conv1d.weight",
+    "ssm_dt.bias": "linear_attn.dt_bias",
+    "ssm_a": "linear_attn.A_log",
+    "ssm_norm.weight": "linear_attn.norm.weight",
+    "ssm_out.weight": "linear_attn.out_proj.weight",
+}
+# llama.cpp's converter adds 1 to these zero-centered norm weights.
+QWEN35_CENTERED_NORMS = {
+    "attn_norm.weight",
+    "post_attention_norm.weight",
+    "attn_q_norm.weight",
+    "attn_k_norm.weight",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -140,6 +170,63 @@ def load_moe_from_gguf(model_name: str, path: pathlib.Path) -> transformers.Lfm2
     return model
 
 
+def load_qwen35_from_gguf(model_name: str, path: pathlib.Path) -> transformers.Qwen3_5ForCausalLM:
+    """Return the Qwen3.5 text model of `model_name` with the weights in `path`.
+
+    The script undoes the converter's changes: the +1 baked into the zero-centered norms and the
+    -exp(A_log) stored as `ssm_a`. Models with as many value heads as key heads have no reordered
+    heads, and the script rejects the others.
+    """
+    config = transformers.AutoConfig.from_pretrained(model_name)
+    config = getattr(config, "text_config", config)
+    if config.linear_num_value_heads != config.linear_num_key_heads:
+        raise ValueError("the converter reorders value heads, which this loader does not undo")
+    with torch.device("meta"):
+        model = transformers.Qwen3_5ForCausalLM(config)
+
+    reader = gguf.GGUFReader(path)
+    n_layers = config.num_hidden_layers
+    state: dict[str, torch.Tensor] = {}
+    for tensor in reader.tensors:
+        values = dequantized(tensor)
+        if tensor.name == "token_embd.weight":
+            state["model.embed_tokens.weight"] = values
+            continue
+        if tensor.name == "output_norm.weight":
+            state["model.norm.weight"] = values - 1
+            continue
+        if tensor.name == "output.weight":
+            state["lm_head.weight"] = values
+            continue
+        match = LAYER_TENSOR_PATTERN.fullmatch(tensor.name)
+        if match is None:
+            raise ValueError(f"unexpected tensor {tensor.name}")
+        layer = int(match["layer"])
+        suffix = match["name"]
+        # The multi-token prediction block follows the model's layers.
+        if layer >= n_layers:
+            continue
+        if suffix in QWEN35_CENTERED_NORMS:
+            values = values - 1
+        elif suffix == "ssm_a":
+            values = torch.log(-values)
+        elif suffix == "ssm_conv1d.weight":
+            # GGUF holds [channels, taps], and transformers holds [channels, 1, taps].
+            values = values.unsqueeze(1)
+        state[f"model.layers.{layer}.{QWEN35_TENSOR_NAMES[suffix]}"] = values
+
+    model.load_state_dict(state, strict=False, assign=True)
+    if "lm_head.weight" not in state:
+        model.tie_weights()
+    rotary = model.model.rotary_emb
+    model.model.rotary_emb = type(rotary)(config=config)
+    missing = [name for name, parameter in model.named_parameters() if parameter.is_meta]
+    missing += [name for name, buffer in model.named_buffers() if buffer.is_meta]
+    if missing:
+        raise ValueError(f"the GGUF file lacks {missing}")
+    return model
+
+
 def main() -> None:
     args = parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
@@ -147,8 +234,11 @@ def main() -> None:
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.model)
     if tokenizer is None:
         raise RuntimeError(f"no tokenizer found for {args.model}")
-    if args.gguf is not None and gguf_architecture(args.gguf) == "lfm2moe":
+    architecture = gguf_architecture(args.gguf) if args.gguf is not None else None
+    if args.gguf is not None and architecture == "lfm2moe":
         model = load_moe_from_gguf(args.model, args.gguf)
+    elif args.gguf is not None and architecture == "qwen35":
+        model = load_qwen35_from_gguf(args.model, args.gguf)
     elif args.gguf is not None:
         gguf_path = args.gguf.resolve()
         model = transformers.AutoModelForCausalLM.from_pretrained(
@@ -166,21 +256,28 @@ def main() -> None:
     input_ids = tokenizer(args.prompt, return_tensors="pt").input_ids
     # The LFM2.5-8B-A1B tokenizer adds no BOS token of its own, and the model repeats itself
     # without one, so the prompt starts with BOS as the chat template's prompts do.
-    bos = torch.tensor([[tokenizer.bos_token_id]])
-    if input_ids[0, 0] != tokenizer.bos_token_id:
+    # Qwen3.5 has no BOS token at all.
+    if tokenizer.bos_token_id is not None and input_ids[0, 0] != tokenizer.bos_token_id:
+        bos = torch.tensor([[tokenizer.bos_token_id]])
         input_ids = torch.cat([bos, input_ids], dim=1)
     captured: dict[str, torch.Tensor] = {}
 
     def capture(name: str):
-        def hook(_module: nn.Module, _inputs: tuple, output: torch.Tensor) -> None:
-            captured[name] = output.detach()
+        def hook(_module: nn.Module, _inputs: tuple, output: torch.Tensor | tuple) -> None:
+            # Some decoder layers return a tuple whose first item is the hidden state.
+            hidden = output[0] if isinstance(output, tuple) else output
+            captured[name] = hidden.detach()
 
         return hook
 
     decoder = model.model
+    # LFM2 names its final norm embedding_norm, and Qwen3.5 names it norm.
+    final_norm = getattr(decoder, "embedding_norm", None) or decoder.norm
+    if not isinstance(final_norm, nn.Module):
+        raise TypeError("the model's final norm is not a module")
     handles = [
         decoder.embed_tokens.register_forward_hook(capture("embedding")),
-        decoder.embedding_norm.register_forward_hook(capture("final_norm")),
+        final_norm.register_forward_hook(capture("final_norm")),
     ]
     for index, layer in enumerate(decoder.layers):
         handles.append(layer.register_forward_hook(capture(f"layer_{index:02d}")))

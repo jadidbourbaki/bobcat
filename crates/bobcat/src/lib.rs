@@ -8,6 +8,7 @@ mod error;
 mod lfm2;
 #[cfg(target_os = "macos")]
 mod lfm2_metal;
+pub mod qwen35;
 pub mod scalar;
 mod storage;
 
