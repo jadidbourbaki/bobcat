@@ -111,6 +111,9 @@ pub enum TensorType {
     /// Super-blocks of 256 elements: fp16 scales for the scales and the minimums, eight 6-bit
     /// scales and minimums of 32-element blocks, and 256 4-bit quants.
     Q4K,
+    /// Super-blocks of 256 elements laid out as in Q4_K, with a fifth bit of each quant in 32
+    /// bytes between the scales and the 4-bit quants.
+    Q5K,
     /// Super-blocks of 256 elements: 256 6-bit quants, sixteen int8 scales of 16-element blocks,
     /// and an fp16 scale.
     Q6K,
@@ -127,6 +130,7 @@ impl TensorType {
             2 => Some(Self::Q4_0),
             8 => Some(Self::Q8_0),
             12 => Some(Self::Q4K),
+            13 => Some(Self::Q5K),
             14 => Some(Self::Q6K),
             30 => Some(Self::Bf16),
             _ => None,
@@ -141,6 +145,7 @@ impl TensorType {
             Self::Q4_0 => 2,
             Self::Q8_0 => 8,
             Self::Q4K => 12,
+            Self::Q5K => 13,
             Self::Q6K => 14,
             Self::Bf16 => 30,
         }
@@ -155,6 +160,7 @@ impl TensorType {
             Self::Q4_0 => (32, 18),
             Self::Q8_0 => (32, 34),
             Self::Q4K => (256, 144),
+            Self::Q5K => (256, 176),
             Self::Q6K => (256, 210),
         }
     }

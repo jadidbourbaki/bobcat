@@ -522,5 +522,7 @@ template [[host_name ("matmul_f16")]] kernel decltype (matmul_q<f16_format>)
     matmul_q<f16_format>;
 template [[host_name ("matmul_q4k")]] kernel decltype (matmul_q<q4k_format>)
     matmul_q<q4k_format>;
+template [[host_name ("matmul_q5k")]] kernel decltype (matmul_q<q5k_format>)
+    matmul_q<q5k_format>;
 template [[host_name ("matmul_q6k")]] kernel decltype (matmul_q<q6k_format>)
     matmul_q<q6k_format>;

@@ -159,6 +159,74 @@ struct q4k_format
   }
 };
 
+/* The Q5_K format: the Q4_K layout with 32 bytes of high bits between
+   the packed scales and the 4-bit quants.  Bit J of high byte L is the
+   fifth bit of weight L of group J.  */
+struct q5k_format
+{
+  static constant constexpr uint block_weights = 256;
+  static constant constexpr uint block_bytes = 176;
+
+  /* Set GROUP_SCALE and GROUP_MIN to the scale and minimum of the group
+     of weight O of the super-block BLOCK.  */
+  static void
+  group (device const uchar *block, uint o, thread float &group_scale,
+         thread float &group_min)
+  {
+    float d = float (*(device const half *)block);
+    float dmin = float (*(device const half *)(block + 2));
+    device const uchar *scales = block + 4;
+    uint j = o / 32;
+    uint scale;
+    uint min;
+    if (j < 4)
+      {
+        scale = scales[j] & 63;
+        min = scales[j + 4] & 63;
+      }
+    else
+      {
+        scale = (scales[j + 4] & 0xf) | ((scales[j - 4] >> 6) << 4);
+        min = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+      }
+    group_scale = d * float (scale);
+    group_min = dmin * float (min);
+  }
+
+  static weights8
+  load8 (device const uchar *row, uint e)
+  {
+    device const uchar *block = row + (e / 256) * block_bytes;
+    uint o = e % 256;
+    uint j = o / 32;
+    float group_scale;
+    float group_min;
+    group (block, o, group_scale, group_min);
+    device const uchar *high = block + 16 + o % 32;
+    device const uchar *quants = block + 48 + (j / 2) * 32 + o % 32;
+    uint shift = j % 2 == 0 ? 0 : 4;
+    float w[8];
+    for (uint i = 0; i < 8; i++)
+      {
+        uint q = ((quants[i] >> shift) & 0xf) | (((high[i] >> j) & 1) << 4);
+        w[i] = group_scale * float (q) - group_min;
+      }
+    return { float4 (w[0], w[1], w[2], w[3]),
+             float4 (w[4], w[5], w[6], w[7]) };
+  }
+
+  static void
+  load16 (device const uchar *row, uint e, thread half4 *out)
+  {
+    weights8 first = load8 (row, e);
+    weights8 second = load8 (row, e + 8);
+    out[0] = half4 (first.low);
+    out[1] = half4 (first.high);
+    out[2] = half4 (second.low);
+    out[3] = half4 (second.high);
+  }
+};
+
 /* The Q6_K format: super-blocks of 256 weights.  Each holds 128 bytes
    of low 4-bit halves, 64 bytes of high 2-bit pairs, 16 int8 scales of
    16-weight groups, and an fp16 scale D.  Each 128-weight half of the
@@ -236,6 +304,8 @@ template [[host_name (
     "expand_q4_0")]] kernel decltype (expand<q4_0_format>) expand<q4_0_format>;
 template [[host_name (
     "expand_q4k")]] kernel decltype (expand<q4k_format>) expand<q4k_format>;
+template [[host_name (
+    "expand_q5k")]] kernel decltype (expand<q5k_format>) expand<q5k_format>;
 template [[host_name (
     "expand_q6k")]] kernel decltype (expand<q6k_format>) expand<q6k_format>;
 
@@ -369,6 +439,71 @@ struct q4k_lanes
                   + (acc1[2] + acc1[3] / 256.0f) * float (s[1]) / 16.0f
                   + (acc2[0] + acc2[1] / 256.0f) * float (s[4])
                   + (acc2[2] + acc2[3] / 256.0f) * float (s[5]) / 16.0f)
+           - dmin
+                 * (in.sums[0] * float (s[2]) + in.sums[1] * float (s[3])
+                    + in.sums[2] * float (s[6]) + in.sums[3] * float (s[7]));
+  }
+};
+
+/* Q5_K lanes cover the weights of Q4_K lanes and load the same inputs.
+   Bit 2 IQ, 2 IQ + 1, 2 IQ + 4, and 2 IQ + 5 of each high byte hold
+   the fifth bits of the lane's four groups.  */
+struct q5k_lanes
+{
+  static constant constexpr uint block_weights = 256;
+  static constant constexpr uint blocks_per_pass = 4;
+  static constant constexpr uint block_bytes = 176;
+
+  typedef q4k_lanes::inputs inputs;
+
+  static uint
+  first_block (uint lane)
+  {
+    return q4k_lanes::first_block (lane);
+  }
+
+  static void
+  load (device const float *x, device const float *norm_weight, uint block,
+        uint lane, thread inputs &in, thread float &sum_squares)
+  {
+    q4k_lanes::load (x, norm_weight, block, lane, in, sum_squares);
+  }
+
+  static float
+  dot_part (device const uchar *row, uint block, uint lane,
+            thread const inputs &in)
+  {
+    uint iq = (lane % 8) / 4;
+    uint ir = lane % 4;
+    device const uchar *b = row + block * block_bytes;
+    float d = float (*(device const half *)b);
+    float dmin = float (*(device const half *)(b + 2));
+    device const ushort *sc = (device const ushort *)(b + 4) + iq;
+    device const uchar *qh = b + 16 + 8 * ir;
+    device const uchar *q1 = b + 48 + 32 * iq + 8 * ir;
+    device const uchar *q2 = q1 + 64;
+
+    /* The scales and minimums unpack as in q4k_lanes.  */
+    ushort packed[4];
+    packed[0] = sc[0] & 0x3f3f;
+    packed[1] = sc[2] & 0x3f3f;
+    packed[2] = ((sc[4] >> 0) & 0x0f0f) | ((sc[0] & 0xc0c0) >> 2);
+    packed[3] = ((sc[4] >> 4) & 0x0f0f) | ((sc[2] & 0xc0c0) >> 2);
+    thread const uchar *s = (thread const uchar *)packed;
+
+    uint shift = 2 * iq;
+    float4 acc = 0.0f;
+    for (uint i = 0; i < 8; i++)
+      {
+        uint h = qh[i] >> shift;
+        acc[0] += in.low[i] * float ((q1[i] & 0xf) | ((h & 1) << 4));
+        acc[1] += in.low[i + 8] * float ((q1[i] >> 4) | ((h & 2) << 3));
+        acc[2] += in.high[i] * float ((q2[i] & 0xf) | ((h & 16) << 0));
+        acc[3] += in.high[i + 8] * float ((q2[i] >> 4) | ((h & 32) >> 1));
+      }
+    return d
+               * (acc[0] * float (s[0]) + acc[1] * float (s[1])
+                  + acc[2] * float (s[4]) + acc[3] * float (s[5]))
            - dmin
                  * (in.sums[0] * float (s[2]) + in.sums[1] * float (s[3])
                     + in.sums[2] * float (s[6]) + in.sums[3] * float (s[7]));

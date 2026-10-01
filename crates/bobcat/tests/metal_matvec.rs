@@ -36,10 +36,11 @@ const SHAPES: [(u32, u32); 9] = [
 ];
 
 /// Each format with its tensor type and the byte offsets of the fp16 scales in each block.
-const FORMATS: [(Format, TensorType, &[usize]); 4] = [
+const FORMATS: [(Format, TensorType, &[usize]); 5] = [
     (Format::Q8_0, TensorType::Q8_0, &[0]),
     (Format::Q4_0, TensorType::Q4_0, &[0]),
     (Format::Q4K, TensorType::Q4K, &[0, 2]),
+    (Format::Q5K, TensorType::Q5K, &[0, 2]),
     (Format::Q6K, TensorType::Q6K, &[208]),
 ];
 

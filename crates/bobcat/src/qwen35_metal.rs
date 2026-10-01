@@ -107,7 +107,7 @@ pub struct Qwen35Metal<'a> {
 impl<'a> Qwen35Metal<'a> {
     /// Prepare to decode sequences of up to `n_ctx` tokens of `model` on `metal`.
     ///
-    /// Every matrix of `model` must be Q8_0, Q4_0, Q4_K, or Q6_K. The KV cache holds half precision
+    /// Every matrix of `model` must be Q8_0, Q4_0, Q4_K, Q5_K, or Q6_K. The KV cache holds half precision
     /// when `kv_half` is true and floats otherwise.
     pub fn new(
         model: &'a Model,

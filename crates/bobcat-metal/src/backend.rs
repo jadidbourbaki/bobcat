@@ -366,12 +366,21 @@ pub enum Format {
     Q4_0,
     /// Super-blocks of 256 weights with 4-bit quants and 6-bit group scales and minimums.
     Q4K,
+    /// Super-blocks of 256 weights with 5-bit quants and 6-bit group scales and minimums.
+    Q5K,
     /// Super-blocks of 256 weights with 6-bit quants and int8 group scales.
     Q6K,
 }
 
 impl Format {
-    const ALL: [Self; 5] = [Self::F16, Self::Q8_0, Self::Q4_0, Self::Q4K, Self::Q6K];
+    const ALL: [Self; 6] = [
+        Self::F16,
+        Self::Q8_0,
+        Self::Q4_0,
+        Self::Q4K,
+        Self::Q5K,
+        Self::Q6K,
+    ];
 
     fn index(self) -> usize {
         match self {
@@ -379,7 +388,8 @@ impl Format {
             Self::Q8_0 => 1,
             Self::Q4_0 => 2,
             Self::Q4K => 3,
-            Self::Q6K => 4,
+            Self::Q5K => 4,
+            Self::Q6K => 5,
         }
     }
 
@@ -395,6 +405,7 @@ impl Format {
         match self {
             Self::Q4_0 => Some("matvec_conv_q4_0"),
             Self::Q4K => Some("matvec_conv_q4k"),
+            Self::Q5K => Some("matvec_conv_q5k"),
             Self::Q6K => Some("matvec_conv_q6k"),
             Self::F16 | Self::Q8_0 => None,
         }
@@ -425,7 +436,7 @@ impl Format {
                 "matvec_experts_down_q6k",
                 "matmul_experts_q6k",
             ]),
-            Self::F16 | Self::Q8_0 => None,
+            Self::F16 | Self::Q8_0 | Self::Q5K => None,
         }
     }
 
@@ -435,6 +446,7 @@ impl Format {
         match self {
             Self::Q4_0 => Some("expand_q4_0"),
             Self::Q4K => Some("expand_q4k"),
+            Self::Q5K => Some("expand_q5k"),
             Self::Q6K => Some("expand_q6k"),
             Self::F16 | Self::Q8_0 => None,
         }
@@ -447,6 +459,7 @@ impl Format {
             Self::Q8_0 => (32, 34),
             Self::Q4_0 => (32, 18),
             Self::Q4K => (256, 144),
+            Self::Q5K => (256, 176),
             Self::Q6K => (256, 210),
         }
     }
@@ -475,6 +488,7 @@ impl Format {
                 "embed_q4_0",
             ],
             Self::Q4K => ["matvec_q4k", "matvec_q4k_swiglu", "matmul_q4k", "embed_q4k"],
+            Self::Q5K => ["matvec_q5k", "matvec_q5k_swiglu", "matmul_q5k", "embed_q5k"],
             Self::Q6K => ["matvec_q6k", "matvec_q6k_swiglu", "matmul_q6k", "embed_q6k"],
         }
     }
@@ -2394,7 +2408,7 @@ impl Metal {
         // The Q8_0 kernel dequantizes one weight per thread, and the others 8.
         let per_thread = match format {
             Format::Q8_0 => 1,
-            Format::F16 | Format::Q4_0 | Format::Q4K | Format::Q6K => 8,
+            Format::F16 | Format::Q4_0 | Format::Q4K | Format::Q5K | Format::Q6K => 8,
         };
         let args = [
             buffer(
@@ -2610,7 +2624,10 @@ fn check_range(
 /// K-quant kernels give each threadgroup `K_QUANT_ROWS_PER_SIMDGROUP` rows. The Q8_0 and F16
 /// kernels give wider rows more simdgroups.
 fn matvec_dispatch(format: Format, n_rows: u32, n_cols: u32) -> Dispatch {
-    if matches!(format, Format::Q4_0 | Format::Q4K | Format::Q6K) {
+    if matches!(
+        format,
+        Format::Q4_0 | Format::Q4K | Format::Q5K | Format::Q6K
+    ) {
         return Dispatch::Threadgroups(
             [to_usize(n_rows.div_ceil(K_QUANT_ROWS_PER_SIMDGROUP)), 1, 1],
             [SIMD_WIDTH * to_usize(K_QUANT_SIMDGROUPS), 1, 1],

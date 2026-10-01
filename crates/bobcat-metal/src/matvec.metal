@@ -360,6 +360,8 @@ matvec_k (device const uchar *weights [[buffer (0)]],
 template [[host_name (
     "matvec_q4k")]] kernel decltype (matvec_k<q4k_lanes>) matvec_k<q4k_lanes>;
 template [[host_name (
+    "matvec_q5k")]] kernel decltype (matvec_k<q5k_lanes>) matvec_k<q5k_lanes>;
+template [[host_name (
     "matvec_q6k")]] kernel decltype (matvec_k<q6k_lanes>) matvec_k<q6k_lanes>;
 template [[host_name ("matvec_q4_0")]] kernel decltype (matvec_k<q4_0_lanes>)
     matvec_k<q4_0_lanes>;
@@ -450,6 +452,9 @@ template [[host_name (
 template
     [[host_name ("matvec_conv_q4k")]] kernel decltype (matvec_conv<q4k_lanes>)
         matvec_conv<q4k_lanes>;
+template
+    [[host_name ("matvec_conv_q5k")]] kernel decltype (matvec_conv<q5k_lanes>)
+        matvec_conv<q5k_lanes>;
 template
     [[host_name ("matvec_conv_q6k")]] kernel decltype (matvec_conv<q6k_lanes>)
         matvec_conv<q6k_lanes>;
@@ -562,6 +567,9 @@ matvec_k_swiglu (device const uchar *gate [[buffer (0)]],
 template [[host_name (
     "matvec_q4k_swiglu")]] kernel decltype (matvec_k_swiglu<q4k_lanes>)
     matvec_k_swiglu<q4k_lanes>;
+template [[host_name (
+    "matvec_q5k_swiglu")]] kernel decltype (matvec_k_swiglu<q5k_lanes>)
+    matvec_k_swiglu<q5k_lanes>;
 template [[host_name (
     "matvec_q6k_swiglu")]] kernel decltype (matvec_k_swiglu<q6k_lanes>)
     matvec_k_swiglu<q6k_lanes>;

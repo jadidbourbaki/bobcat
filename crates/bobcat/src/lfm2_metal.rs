@@ -122,7 +122,7 @@ pub struct Lfm2Metal<'a> {
 impl<'a> Lfm2Metal<'a> {
     /// Prepare to decode sequences of up to `n_ctx` tokens of `model` on `metal`.
     ///
-    /// Every matrix of `model` must be Q8_0, Q4_0, Q4_K, or Q6_K. The KV cache holds half precision
+    /// Every matrix of `model` must be Q8_0, Q4_0, Q4_K, Q5_K, or Q6_K. The KV cache holds half precision
     /// when `kv_half` is true and floats otherwise.
     pub fn new(
         model: &'a Model,
@@ -874,7 +874,10 @@ fn check_experts(moe: &Moe, n_experts: u32, n_used: u32) -> Result<(), Error> {
 /// multiplying, which lets the multiply use the Metal 4 tensor path. Q4_0 multiplies faster from
 /// its blocks with half inputs.
 pub(crate) fn expands(data_type: TensorType) -> bool {
-    matches!(data_type, TensorType::Q4K | TensorType::Q6K)
+    matches!(
+        data_type,
+        TensorType::Q4K | TensorType::Q5K | TensorType::Q6K
+    )
 }
 
 /// Return the kernel format of `matrix`.
@@ -883,10 +886,11 @@ pub(crate) fn format(matrix: &Matrix) -> Result<Format, Error> {
         TensorType::Q8_0 => Ok(Format::Q8_0),
         TensorType::Q4_0 => Ok(Format::Q4_0),
         TensorType::Q4K => Ok(Format::Q4K),
+        TensorType::Q5K => Ok(Format::Q5K),
         TensorType::Q6K => Ok(Format::Q6K),
         other @ (TensorType::F32 | TensorType::F16 | TensorType::Bf16) => {
             Err(Error::MetalUnsupported(format!(
-                "matrices in Q8_0, Q4_0, Q4_K, or Q6_K, got {other:?}"
+                "matrices in Q8_0, Q4_0, Q4_K, Q5_K, or Q6_K, got {other:?}"
             )))
         }
     }

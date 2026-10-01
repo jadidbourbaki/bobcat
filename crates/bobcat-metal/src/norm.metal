@@ -225,4 +225,6 @@ template [[host_name (
 template [[host_name (
     "embed_q4k")]] kernel decltype (embed_q<q4k_format>) embed_q<q4k_format>;
 template [[host_name (
+    "embed_q5k")]] kernel decltype (embed_q<q5k_format>) embed_q<q5k_format>;
+template [[host_name (
     "embed_q6k")]] kernel decltype (embed_q<q6k_format>) embed_q<q6k_format>;

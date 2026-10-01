@@ -9,6 +9,7 @@ use half::{bf16, f16};
 const Q4_0_BYTES: usize = TensorType::Q4_0.block().1;
 const Q8_0_BYTES: usize = TensorType::Q8_0.block().1;
 const Q4K_BYTES: usize = TensorType::Q4K.block().1;
+const Q5K_BYTES: usize = TensorType::Q5K.block().1;
 const Q6K_BYTES: usize = TensorType::Q6K.block().1;
 const BLOCK_ELEMENTS: usize = TensorType::Q8_0.block().0;
 const SUPER_BLOCK_ELEMENTS: usize = TensorType::Q4K.block().0;
@@ -75,6 +76,7 @@ pub fn dequantize(data_type: TensorType, bytes: &[u8], out: &mut [f32]) {
         TensorType::Q4_0 => blocks(bytes, out, dequantize_q4_0),
         TensorType::Q8_0 => blocks(bytes, out, dequantize_q8_0),
         TensorType::Q4K => blocks(bytes, out, dequantize_q4k),
+        TensorType::Q5K => blocks(bytes, out, dequantize_q5k),
         TensorType::Q6K => blocks(bytes, out, dequantize_q6k),
     }
 }
@@ -145,6 +147,32 @@ fn dequantize_q4k(block: &[u8; Q4K_BYTES], out: &mut [f32; SUPER_BLOCK_ELEMENTS]
         for ((&q, low), high) in quants.iter().zip(low).zip(high) {
             *low = d_low * f32::from(q & 0xf) - m_low;
             *high = d_high * f32::from(q >> 4) - m_high;
+        }
+    }
+}
+
+/// Dequantize a Q5_K super-block: fp16 `d` and `dmin`, 12 bytes of packed 6-bit scales and
+/// minimums as in Q4_K, 32 bytes of high bits, then 128 bytes of 4-bit quants laid out as in Q4_K.
+/// Bit `j` of high byte `l` is the fifth bit of element `l` of 32-element block `j`.
+fn dequantize_q5k(block: &[u8; Q5K_BYTES], out: &mut [f32; SUPER_BLOCK_ELEMENTS]) {
+    let d = f16_at(block, 0);
+    let dmin = f16_at(block, 2);
+    let scales = &block[4..16];
+    let high = &block[16..48];
+    let quants = &block[48..];
+    for (j, out) in out
+        .as_chunks_mut::<BLOCK_ELEMENTS>()
+        .0
+        .iter_mut()
+        .enumerate()
+    {
+        let (scale, min) = q4k_scale_min(j, scales);
+        let (scale, min) = (d * f32::from(scale), dmin * f32::from(min));
+        let quants = &quants[j / 2 * BLOCK_ELEMENTS..(j / 2 + 1) * BLOCK_ELEMENTS];
+        let shift = 4 * (j % 2);
+        for ((&q, &h), out) in quants.iter().zip(high).zip(out) {
+            let q = ((q >> shift) & 0xf) | (((h >> j) & 1) << 4);
+            *out = scale * f32::from(q) - min;
         }
     }
 }
