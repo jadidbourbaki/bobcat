@@ -16,5 +16,8 @@ thiserror = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 bobcat-metal = { workspace = true }
 
+[dev-dependencies]
+serde_json = { workspace = true }
+
 [lints]
 workspace = true

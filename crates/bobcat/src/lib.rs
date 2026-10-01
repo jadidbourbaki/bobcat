@@ -5,6 +5,7 @@
 //! [`Lfm2Metal`] runs the same model on the GPU. [`qwen35`] holds the same pieces for Qwen3.5
 //! models.
 
+pub mod clef;
 mod error;
 mod lfm2;
 #[cfg(target_os = "macos")]
