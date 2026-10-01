@@ -24,9 +24,21 @@ and a bf16 embedding table that its pipeline cannot quantize. Cactus read
 bundles in its own 4-bit CQ4 format. Its converter has a profile for
 LFM2.5-8B-A1B and builds the other models with a generic graph.
 
-For Qwen3.5, bobcat, llama.cpp, and mistral.rs read Unsloth's
-`Qwen3.5-*-Q4_K_M.gguf` files, which `bobcat pull qwen3.5:SIZE`
-downloads. mlx-lm read mlx-community's 4-bit weights. ExecuTorch and
+For Qwen3.5, mlx-lm read mlx-community's 4-bit weights. bobcat,
+llama.cpp, and mistral.rs read one GGUF file per model with every matrix
+in Q4_0, which spends the same 4.5 bits per weight as MLX's 4-bit
+format, so every engine reads about the same bytes per token. Unsloth's
+Q4_0 files are 7 to 16 percent larger than these. llama.cpp's
+`llama-quantize` made each file from Unsloth's Q8_0 file:
+
+```sh
+llama-quantize --allow-requantize --pure --output-tensor-type q4_0 \
+  --token-embedding-type q4_0 Qwen3.5-9B-Q8_0.gguf Qwen3.5-9B-Q4_0.gguf Q4_0
+```
+
+The Q4_K_M files that `bobcat pull qwen3.5:SIZE` downloads hold 12 to
+26 percent more bytes per token than mlx-community's weights, and decode
+reads every byte once per token. ExecuTorch and
 candle have no Qwen3.5 model. Cactus skips Qwen3.5 as well. Its
 converter reads the full-precision release, and the four releases needed
 more disk than the machine had free.

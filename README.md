@@ -139,9 +139,6 @@ curl http://127.0.0.1:8080/v1/decisions -d '{
 }'
 ```
 
-`/v1/score` takes SGLang's prompt and label token ids for decisions you
-build yourself.
-
 **One decision without a server**
 
 ```sh
