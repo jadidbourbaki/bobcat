@@ -70,23 +70,54 @@ struct Linear {
 
 impl Linear {
     /// Return the products of the `x.len() / n_cols` rows of `x` with the matrix, plus the bias.
+    ///
+    /// The rows of `x` split across the CPU's cores. The memory projections multiply every token
+    /// of the request, which took four fifths of a 300-token decision on one core.
     fn apply(&self, x: &[f32]) -> Vec<f32> {
         let rows = x.len() / self.n_cols;
         let mut out = vec![0.0; rows * self.n_rows];
-        for (input, output) in x
+        let threads = std::thread::available_parallelism().map_or(1, usize::from);
+        let rows_per_thread = rows.div_ceil(threads).max(1);
+        std::thread::scope(|scope| {
+            for (inputs, outputs) in x
+                .chunks(rows_per_thread * self.n_cols)
+                .zip(out.chunks_mut(rows_per_thread * self.n_rows))
+            {
+                scope.spawn(move || self.apply_rows(inputs, outputs));
+            }
+        });
+        out
+    }
+
+    /// Write the products of the rows of `inputs` with the matrix, plus the bias, to `outputs`.
+    fn apply_rows(&self, inputs: &[f32], outputs: &mut [f32]) {
+        for (input, output) in inputs
             .chunks_exact(self.n_cols)
-            .zip(out.chunks_exact_mut(self.n_rows))
+            .zip(outputs.chunks_exact_mut(self.n_rows))
         {
             for (row, (value, weights)) in output
                 .iter_mut()
                 .zip(self.weight.chunks_exact(self.n_cols))
                 .enumerate()
             {
-                *value = scalar::dot(input, weights) + self.bias.as_ref().map_or(0.0, |b| b[row]);
+                *value = dot(input, weights) + self.bias.as_ref().map_or(0.0, |b| b[row]);
             }
         }
-        out
     }
+}
+
+/// Return the dot product of `a` and `b` in eight float sums, which the compiler vectorizes.
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let mut sums = [0.0_f32; 8];
+    let (a_chunks, a_rest) = a.as_chunks::<8>();
+    let (b_chunks, b_rest) = b.as_chunks::<8>();
+    for (a, b) in a_chunks.iter().zip(b_chunks) {
+        for lane in 0..8 {
+            sums[lane] += a[lane] * b[lane];
+        }
+    }
+    let rest: f32 = a_rest.iter().zip(b_rest).map(|(&a, &b)| a * b).sum();
+    sums.iter().sum::<f32>() + rest
 }
 
 /// A layer norm with a weight and a bias.
