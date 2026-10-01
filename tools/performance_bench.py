@@ -2,10 +2,10 @@
 
 Usage:
 
-    uv run python performance_bench.py --model 2.6b
+    uv run python performance_bench.py --model lfm2.5-2.6b
 
 Every engine that runs the model runs it on a 512-token prompt and then generates 128 tokens
-greedily. The CSV goes to `docs/performance/lfm2.5-MODEL.csv`.
+greedily. The CSV goes to `docs/performance/MODEL.csv`.
 bobcat, llama.cpp, and mlx-lm run through matched streaming harnesses. ExecuTorch and Cactus
 run through their harnesses in tools/. mistral.rs and candle run through their own benchmark
 tools. Each round runs every engine once, after the tool's own warmup, and the order rotates
@@ -71,8 +71,29 @@ class Weights:
     candle: bool
 
 
+def unsloth(size: str) -> Path:
+    """Return the Q4_K_M file of Unsloth's Qwen3.5 GGUF repository of `size` in the Hugging Face
+    cache, where `bobcat pull qwen3.5:SIZE` puts it. Before the pull, the path names no file."""
+    repo = Path.home() / f".cache/huggingface/hub/models--unsloth--Qwen3.5-{size}-GGUF"
+    files = sorted(repo.glob(f"snapshots/*/Qwen3.5-{size}-Q4_K_M.gguf"))
+    return files[-1] if files else repo / f"Qwen3.5-{size}-Q4_K_M.gguf"
+
+
+def qwen35(size: str) -> Weights:
+    """Return the weights of Qwen3.5 of `size`. ExecuTorch and candle have no Qwen3.5 model, and
+    Cactus converts only from the full-precision release."""
+    return Weights(
+        gguf=unsloth(size),
+        mlx=MODELS / f"Qwen3.5-{size}-MLX-4bit",
+        executorch=None,
+        cactus=None,
+        mistral_rs=True,
+        candle=False,
+    )
+
+
 WEIGHTS = {
-    "350m": Weights(
+    "lfm2.5-350m": Weights(
         gguf=MODELS / "LFM2.5-350M-QAD-Q4_0.gguf",
         mlx=MODELS / "LFM2.5-350M-MLX-4bit",
         executorch=EXECUTORCH / "lfm2_5_350m_mlx_4w.pte",
@@ -80,7 +101,7 @@ WEIGHTS = {
         mistral_rs=True,
         candle=True,
     ),
-    "1.2b": Weights(
+    "lfm2.5-1.2b": Weights(
         gguf=MODELS / "LFM2.5-1.2B-Instruct-QAD-Q4_0.gguf",
         mlx=MODELS / "LFM2.5-1.2B-Instruct-MLX-4bit",
         executorch=EXECUTORCH / "lfm2_5_1_2b_mlx_4w.pte",
@@ -88,7 +109,7 @@ WEIGHTS = {
         mistral_rs=True,
         candle=True,
     ),
-    "2.6b": Weights(
+    "lfm2.5-2.6b": Weights(
         gguf=MODELS / "LFM2.5-2.6B-QAD-Q4_0.gguf",
         mlx=MODELS / "LFM2.5-2.6B-MLX-4bit",
         executorch=EXECUTORCH / "lfm2_5_2_6b_mlx_4w.pte",
@@ -96,7 +117,7 @@ WEIGHTS = {
         mistral_rs=True,
         candle=True,
     ),
-    "8b": Weights(
+    "lfm2.5-8b": Weights(
         gguf=MODELS / "LFM2.5-8B-A1B-Q4_0.gguf",
         mlx=MODELS / "LFM2.5-8B-A1B-MLX-4bit",
         # ExecuTorch's LFM2 model has no mixture-of-experts layers. mistral.rs decodes the 8B at
@@ -106,6 +127,10 @@ WEIGHTS = {
         mistral_rs=False,
         candle=False,
     ),
+    "qwen3.5-0.8b": qwen35("0.8B"),
+    "qwen3.5-2b": qwen35("2B"),
+    "qwen3.5-4b": qwen35("4B"),
+    "qwen3.5-9b": qwen35("9B"),
 }
 
 
@@ -299,7 +324,10 @@ def main() -> None:
     parser.add_argument("--rounds", type=int, default=5)
     arguments = parser.parse_args()
     weights = WEIGHTS[arguments.model]
-    out = ROOT / f"docs/performance/lfm2.5-{arguments.model}.csv"
+    out = ROOT / f"docs/performance/{arguments.model}.csv"
+    for path in [weights.gguf, weights.mlx]:
+        if not path.exists():
+            raise FileNotFoundError(f"{arguments.model} needs {path}")
 
     output(["cargo", "build", "--release", "--locked", "-p", "bobcat-bench"])
     mlx_version = output(

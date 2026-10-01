@@ -92,7 +92,6 @@ fn run(options: &Options) -> Result<(), bobcat::Error> {
     use std::time::Instant;
 
     use bobcat::metal::Metal;
-    use bobcat::{Lfm2Metal, Model};
 
     if options.latency && options.generate < 2 {
         return Err(bobcat::Error::Argument(
@@ -113,8 +112,8 @@ fn run(options: &Options) -> Result<(), bobcat::Error> {
     // seed. The latency runs keep the repeated token that their llama.cpp counterpart uses, so
     // the two engines' token hashes compare.
     let mut rng = fastrand::Rng::with_seed(42);
-    let n_vocab = model.hyperparameters().n_vocab;
-    let bos = model.gguf().u32("tokenizer.ggml.bos_token_id").unwrap_or(1);
+    let n_vocab = model.n_vocab();
+    let bos = model.bos();
     let random_prompt: Vec<u32> = (0..options.prompt)
         .map(|i| if i == 0 { bos } else { rng.u32(..n_vocab) })
         .collect();
@@ -126,11 +125,11 @@ fn run(options: &Options) -> Result<(), bobcat::Error> {
     // The first run warms the shader cache and the page cache and does not count.
     if !options.latency_only {
         // Every run reuses one loaded model, the way an application serves requests.
-        let mut gpu = Lfm2Metal::new(&model, &mut metal, n_ctx, kv_half)?;
+        let mut gpu = Gpu::new(&model, &mut metal, n_ctx, kv_half)?;
         for rep in 0..=options.reps {
             gpu.reset()?;
             let start = Instant::now();
-            gpu.prefill(&random_prompt, None, None)?;
+            gpu.prefill(&random_prompt, None)?;
             let prefill = start.elapsed().as_secs_f64();
 
             // Decode runs pipelined, the way an application generates text.
@@ -176,15 +175,15 @@ fn run(options: &Options) -> Result<(), bobcat::Error> {
     if options.profile {
         // Prefill runs in one batched call, then decode steps one token at a time, with
         // profiling on for both.
-        let mut gpu = Lfm2Metal::new(&model, &mut metal, n_ctx, kv_half)?;
-        let mut logits = vec![0.0; model.hyperparameters().n_vocab as usize];
+        let mut gpu = Gpu::new(&model, &mut metal, n_ctx, kv_half)?;
+        let mut logits = vec![0.0; n_vocab as usize];
         gpu.metal().set_profiling(true);
-        gpu.prefill(&prompt, Some(&mut logits), None)?;
+        gpu.prefill(&prompt, Some(&mut logits))?;
         print_profile(gpu.metal(), "prefill", 1);
 
         gpu.metal().set_profiling(true);
         for _ in 0..options.generate {
-            gpu.step(argmax(&logits), Some(&mut logits), None)?;
+            gpu.step(argmax(&logits), Some(&mut logits))?;
         }
         gpu.metal().set_profiling(false);
         print_profile(gpu.metal(), "decode", options.generate);
@@ -197,11 +196,11 @@ fn run(options: &Options) -> Result<(), bobcat::Error> {
         let mut per_output = Vec::new();
         let mut end_to_end = Vec::new();
         let mut inter_chunk = Vec::new();
-        let mut gpu = Lfm2Metal::new(&model, &mut metal, n_ctx, kv_half)?;
+        let mut gpu = Gpu::new(&model, &mut metal, n_ctx, kv_half)?;
         for rep in 0..=options.reps {
             gpu.reset()?;
             let start = Instant::now();
-            gpu.prefill(&prompt, None, None)?;
+            gpu.prefill(&prompt, None)?;
             let mut emissions = Vec::new();
             if options.stream_chunk == 1 {
                 // Each token goes out as soon as the step that selects it finishes, with later
@@ -250,6 +249,156 @@ fn run(options: &Options) -> Result<(), bobcat::Error> {
         print_milliseconds("inter-chunk", &inter_chunk);
     }
     Ok(())
+}
+
+/// A model of an architecture bobcat runs on the Metal GPU.
+#[cfg(target_os = "macos")]
+enum Model {
+    Lfm2(bobcat::Model),
+    Qwen35(bobcat::qwen35::Model),
+}
+
+#[cfg(target_os = "macos")]
+impl Model {
+    /// Load the model in the GGUF file at `path`, whichever architecture the file names.
+    fn load(path: &std::path::Path) -> Result<Self, bobcat::Error> {
+        match bobcat::Model::load(path) {
+            Ok(model) => Ok(Self::Lfm2(model)),
+            Err(bobcat::Error::Architecture(_)) => {
+                Ok(Self::Qwen35(bobcat::qwen35::Model::load(path)?))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn n_vocab(&self) -> u32 {
+        match self {
+            Self::Lfm2(model) => model.hyperparameters().n_vocab,
+            Self::Qwen35(model) => model.hyperparameters().n_vocab,
+        }
+    }
+
+    /// Return the token that begins a sequence. Qwen3.5 names none, and llama-bench then begins
+    /// with token 1.
+    fn bos(&self) -> u32 {
+        let bos = match self {
+            Self::Lfm2(model) => model.gguf().u32("tokenizer.ggml.bos_token_id"),
+            Self::Qwen35(model) => model.gguf().u32("tokenizer.ggml.bos_token_id"),
+        };
+        bos.unwrap_or(1)
+    }
+}
+
+/// A model's sequence on the Metal GPU.
+#[cfg(target_os = "macos")]
+enum Gpu<'a> {
+    Lfm2(bobcat::Lfm2Metal<'a>),
+    Qwen35(bobcat::qwen35::Qwen35Metal<'a>),
+}
+
+#[cfg(target_os = "macos")]
+impl<'a> Gpu<'a> {
+    fn new(
+        model: &'a Model,
+        metal: &'a mut bobcat::metal::Metal,
+        n_ctx: u32,
+        kv_half: bool,
+    ) -> Result<Self, bobcat::Error> {
+        Ok(match model {
+            Model::Lfm2(model) => Self::Lfm2(bobcat::Lfm2Metal::new(model, metal, n_ctx, kv_half)?),
+            Model::Qwen35(model) => Self::Qwen35(bobcat::qwen35::Qwen35Metal::new(
+                model, metal, n_ctx, kv_half,
+            )?),
+        })
+    }
+
+    fn metal(&mut self) -> &mut bobcat::metal::Metal {
+        match self {
+            Self::Lfm2(gpu) => gpu.metal(),
+            Self::Qwen35(gpu) => gpu.metal(),
+        }
+    }
+
+    fn reset(&mut self) -> Result<(), bobcat::Error> {
+        match self {
+            Self::Lfm2(gpu) => gpu.reset(),
+            Self::Qwen35(gpu) => gpu.reset(),
+        }
+    }
+
+    fn prefill(&mut self, tokens: &[u32], logits: Option<&mut [f32]>) -> Result<(), bobcat::Error> {
+        match self {
+            Self::Lfm2(gpu) => gpu.prefill(tokens, logits, None),
+            Self::Qwen35(gpu) => gpu.prefill(tokens, logits, None, None),
+        }
+    }
+
+    fn step(&mut self, token: u32, logits: Option<&mut [f32]>) -> Result<(), bobcat::Error> {
+        match self {
+            Self::Lfm2(gpu) => gpu.step(token, logits, None),
+            Self::Qwen35(gpu) => gpu.step(token, logits, None),
+        }
+    }
+
+    /// Decode `out.len()` tokens greedily into `out`. Qwen3.5 decodes through its streaming loop,
+    /// which keeps the same steps in flight.
+    fn generate(&mut self, out: &mut [u32]) -> Result<(), bobcat::Error> {
+        match self {
+            Self::Lfm2(gpu) => gpu.generate(out),
+            Self::Qwen35(gpu) => {
+                let n_tokens = u32::try_from(out.len())
+                    .map_err(|_| bobcat::Error::Argument("too many tokens to generate"))?;
+                let mut emitted = 0;
+                gpu.generate_stream(n_tokens, |token| {
+                    out[emitted] = token;
+                    emitted += 1;
+                    true
+                })?;
+                Ok(())
+            }
+        }
+    }
+
+    fn generate_stream(
+        &mut self,
+        max_tokens: u32,
+        emit: impl FnMut(u32) -> bool,
+    ) -> Result<Vec<u32>, bobcat::Error> {
+        match self {
+            Self::Lfm2(gpu) => gpu.generate_stream(max_tokens, emit),
+            Self::Qwen35(gpu) => gpu.generate_stream(max_tokens, emit),
+        }
+    }
+
+    fn greedy_token(&mut self) -> Result<u32, bobcat::Error> {
+        match self {
+            Self::Lfm2(gpu) => gpu.greedy_token(),
+            Self::Qwen35(gpu) => gpu.greedy_token(),
+        }
+    }
+
+    fn generate_next(&mut self, out: &mut [u32]) -> Result<(), bobcat::Error> {
+        match self {
+            Self::Lfm2(gpu) => gpu.generate_next(out),
+            Self::Qwen35(_) => Err(bobcat::Error::Argument(
+                "streaming chunks of more than one token need an LFM2 model",
+            )),
+        }
+    }
+
+    fn last_encode_seconds(&self) -> f64 {
+        match self {
+            Self::Lfm2(gpu) => gpu.last_encode_seconds(),
+            Self::Qwen35(gpu) => gpu.last_encode_seconds(),
+        }
+    }
+
+    fn last_gpu_seconds(&self) -> f64 {
+        match self {
+            Self::Lfm2(gpu) => gpu.last_gpu_seconds(),
+            Self::Qwen35(gpu) => gpu.last_gpu_seconds(),
+        }
+    }
 }
 
 /// Print the mean and nearest-rank median and 95th percentile in milliseconds.
