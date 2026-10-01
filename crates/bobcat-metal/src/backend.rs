@@ -363,6 +363,8 @@ mod sealed {
 pub enum Format {
     /// Contiguous fp16 weights.
     F16,
+    /// Contiguous float weights.
+    F32,
     /// Blocks of 32 weights: an fp16 scale and 32 int8 quants.
     Q8_0,
     /// Blocks of 32 weights: an fp16 scale and 32 4-bit quants.
@@ -376,13 +378,15 @@ pub enum Format {
 }
 
 impl Format {
-    const ALL: [Self; 6] = [
+    /// Every format, in the order of [`Format::index`].
+    const ALL: [Self; 7] = [
         Self::F16,
         Self::Q8_0,
         Self::Q4_0,
         Self::Q4K,
         Self::Q5K,
         Self::Q6K,
+        Self::F32,
     ];
 
     fn index(self) -> usize {
@@ -393,6 +397,7 @@ impl Format {
             Self::Q4K => 3,
             Self::Q5K => 4,
             Self::Q6K => 5,
+            Self::F32 => 6,
         }
     }
 
@@ -410,7 +415,7 @@ impl Format {
             Self::Q4K => Some("matvec_conv_q4k"),
             Self::Q5K => Some("matvec_conv_q5k"),
             Self::Q6K => Some("matvec_conv_q6k"),
-            Self::F16 | Self::Q8_0 => None,
+            Self::F16 | Self::F32 | Self::Q8_0 => None,
         }
     }
 
@@ -439,7 +444,7 @@ impl Format {
                 "matvec_experts_down_q6k",
                 "matmul_experts_q6k",
             ]),
-            Self::F16 | Self::Q8_0 | Self::Q5K => None,
+            Self::F16 | Self::F32 | Self::Q8_0 | Self::Q5K => None,
         }
     }
 
@@ -451,7 +456,7 @@ impl Format {
             Self::Q4K => Some("expand_q4k"),
             Self::Q5K => Some("expand_q5k"),
             Self::Q6K => Some("expand_q6k"),
-            Self::F16 | Self::Q8_0 => None,
+            Self::F16 | Self::F32 | Self::Q8_0 => None,
         }
     }
 
@@ -459,6 +464,7 @@ impl Format {
     fn block(self) -> (usize, usize) {
         match self {
             Self::F16 => (32, 64),
+            Self::F32 => (32, 128),
             Self::Q8_0 => (32, 34),
             Self::Q4_0 => (32, 18),
             Self::Q4K => (256, 144),
@@ -478,6 +484,7 @@ impl Format {
     fn kernel_names(self) -> [&'static str; 4] {
         match self {
             Self::F16 => ["matvec_f16", "matvec_f16_swiglu", "matmul_f16", "embed_f16"],
+            Self::F32 => ["matvec_f32", "matvec_f32_swiglu", "matmul_f32", "embed_f32"],
             Self::Q8_0 => [
                 "matvec_q8_0",
                 "matvec_q8_0_swiglu",
@@ -2412,7 +2419,7 @@ impl Metal {
         // The Q8_0 kernel dequantizes one weight per thread, and the others 8.
         let per_thread = match format {
             Format::Q8_0 => 1,
-            Format::F16 | Format::Q4_0 | Format::Q4K | Format::Q5K | Format::Q6K => 8,
+            Format::F16 | Format::F32 | Format::Q4_0 | Format::Q4K | Format::Q5K | Format::Q6K => 8,
         };
         let args = [
             buffer(

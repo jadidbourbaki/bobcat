@@ -184,7 +184,9 @@ impl<'a> Qwen35Metal<'a> {
             beta: floats(rows * n_v_heads)?,
             alpha: floats(rows * n_v_heads)?,
             delta_out: floats(rows * value_dim)?,
-            ffn: floats(rows * to_usize(hp.n_ff))?,
+            // A decode step with gate and up matrices of two types keeps the gate products in
+            // the second row.
+            ffn: floats(rows.max(2) * to_usize(hp.n_ff))?,
             logits: floats(to_usize(hp.n_vocab))?,
             greedy_token: metal.new_buffer(TOKEN_BYTES)?,
             tokens: metal.new_buffer(to_usize(n_ctx) * TOKEN_BYTES)?,
@@ -722,15 +724,6 @@ fn check_supported(model: &Model) -> Result<(), Error> {
     {
         format(matrix)?;
     }
-    for layer in &model.layers {
-        if format(&layer.gate)? != format(&layer.up)? {
-            return Err(Error::MetalUnsupported(format!(
-                "gate and up matrices of one type, got {:?} and {:?}",
-                layer.gate.tensor.data_type(),
-                layer.up.tensor.data_type()
-            )));
-        }
-    }
     let group = hp.n_heads / hp.n_kv_heads;
     if !hp.head_dim.is_multiple_of(SIMD_WIDTH)
         || hp.head_dim > ATTENTION_MAX_HEAD_DIM
@@ -1093,19 +1086,30 @@ impl<'r> Recorder<'r> {
                 }
             }
 
-            self.metal.matvec_swiglu(
-                format(&layer.gate)?,
-                b.weights(&layer.gate.tensor),
-                b.weights(&layer.up.tensor),
-                layer.gate.n_rows,
-                layer.gate.n_cols,
-                h,
-                Norm {
-                    weight: b.weights(&layer.ffn_norm.tensor),
-                    eps: hp.norm_eps,
-                },
-                b.ffn.floats(0),
-            )?;
+            if format(&layer.gate)? == format(&layer.up)? {
+                self.metal.matvec_swiglu(
+                    format(&layer.gate)?,
+                    b.weights(&layer.gate.tensor),
+                    b.weights(&layer.up.tensor),
+                    layer.gate.n_rows,
+                    layer.gate.n_cols,
+                    h,
+                    Norm {
+                        weight: b.weights(&layer.ffn_norm.tensor),
+                        eps: hp.norm_eps,
+                    },
+                    b.ffn.floats(0),
+                )?;
+            } else {
+                // The fused launch reads both matrices with one kernel, so matrices of two types
+                // run as two products.
+                let gate = b.ffn.floats(to_usize(hp.n_ff));
+                let options = self.normalized(&layer.ffn_norm);
+                self.matvec(&layer.gate, h, gate, options)?;
+                self.matvec(&layer.up, h, b.ffn.floats(0), options)?;
+                self.metal.barrier();
+                self.metal.silu_mul(b.ffn.floats(0), gate, hp.n_ff)?;
+            }
             self.metal.barrier();
             self.matvec(&layer.down, b.ffn.floats(0), h, ADD_TO_RESIDUAL)?;
             self.metal.barrier();

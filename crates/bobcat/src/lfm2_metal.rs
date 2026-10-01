@@ -888,11 +888,9 @@ pub(crate) fn format(matrix: &Matrix) -> Result<Format, Error> {
         TensorType::Q4K => Ok(Format::Q4K),
         TensorType::Q5K => Ok(Format::Q5K),
         TensorType::Q6K => Ok(Format::Q6K),
-        other @ (TensorType::F32 | TensorType::F16 | TensorType::Bf16) => {
-            Err(Error::MetalUnsupported(format!(
-                "matrices in Q8_0, Q4_0, Q4_K, Q5_K, or Q6_K, got {other:?}"
-            )))
-        }
+        TensorType::F32 => Ok(Format::F32),
+        TensorType::F16 => Ok(Format::F16),
+        TensorType::Bf16 => Err(Error::MetalUnsupported("matrices in bfloat16".to_owned())),
     }
 }
 

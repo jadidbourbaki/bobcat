@@ -11,13 +11,12 @@ repository.workspace = true
 bobcat-gguf = { workspace = true }
 half = { workspace = true }
 memmap2 = { workspace = true }
+safetensors = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 bobcat-metal = { workspace = true }
-
-[dev-dependencies]
-serde_json = { workspace = true }
 
 [lints]
 workspace = true

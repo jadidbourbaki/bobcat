@@ -32,6 +32,10 @@ fn check_shape(
                 let value = ((block * 17 % 97) as f32 - 48.0) / 64.0;
                 bytes[..2].copy_from_slice(&f16::from_f32(value).to_bits().to_le_bytes());
             }
+            TensorType::F32 => {
+                let value = ((block * 17 % 97) as f32 - 48.0) / 64.0;
+                bytes.copy_from_slice(&value.to_le_bytes());
+            }
             TensorType::Q8_0 => {
                 for (i, quant) in bytes[2..].iter_mut().enumerate() {
                     *quant = u8::try_from((block * 17 + i * 13) % 127)?;
@@ -44,7 +48,7 @@ fn check_shape(
                     *quant = u8::try_from((block * 17 + i * 13) % 251)?;
                 }
             }
-            _ => unreachable!("the tile test uses F16, Q8_0, Q4_K, and Q5_K weights"),
+            _ => unreachable!("the tile test uses F16, F32, Q8_0, Q4_K, and Q5_K weights"),
         }
         weights.extend_from_slice(&bytes);
     }
@@ -229,6 +233,31 @@ fn f16_matrix_tiles_match_scalar() -> Result<(), Box<dyn Error>> {
                 &mut metal,
                 TensorType::F16,
                 Format::F16,
+                rows,
+                cols,
+                tokens,
+                store,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn f32_matrix_tiles_match_scalar() -> Result<(), Box<dyn Error>> {
+    let mut metal = match Metal::open() {
+        Ok(metal) => metal,
+        Err(error) => {
+            eprintln!("skip: {error}");
+            return Ok(());
+        }
+    };
+    for (rows, cols, tokens) in [(64, 64, 32), (70, 96, 33)] {
+        for store in [Store::Overwrite, Store::Accumulate, Store::Swiglu] {
+            check_shape(
+                &mut metal,
+                TensorType::F32,
+                Format::F32,
                 rows,
                 cols,
                 tokens,

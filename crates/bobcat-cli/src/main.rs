@@ -271,15 +271,41 @@ fn full_prompt(prompt: &str) -> Result<String, Error> {
     Ok(text)
 }
 
-/// Load the model and tokenizer that `options` name.
+/// The model, its tokenizer, and the decision head from its release, if it takes one.
 #[cfg(target_os = "macos")]
-fn load(options: &ModelOptions) -> Result<(backend::Model, tokenizers::Tokenizer), Error> {
-    let model = backend::Model::load(models::resolve(&options.model)?)?;
-    let tokenizer = match &options.tokenizer {
-        Some(path) => tokenizers::Tokenizer::from_file(path)?,
-        None => model.tokenizer()?,
+type Loaded = (
+    backend::Model,
+    tokenizers::Tokenizer,
+    Option<bobcat::clef::Head>,
+);
+
+/// Load the model, tokenizer, and decision head that `options` name.
+///
+/// A decision model whose head comes from its release also takes the release's tokenizer, which
+/// the head was trained with.
+#[cfg(target_os = "macos")]
+fn load(options: &ModelOptions) -> Result<Loaded, Error> {
+    let files = models::resolve(&options.model)?;
+    let model = backend::Model::load(&files.gguf)?;
+    let head = match (&files.head, &model) {
+        (None, _) => None,
+        (Some(head), backend::Model::Qwen35(backbone)) => {
+            Some(bobcat::clef::Head::from_safetensors(
+                backbone,
+                &std::fs::read(&head.config)?,
+                &std::fs::read(&head.weights)?,
+            )?)
+        }
+        (Some(_), backend::Model::Lfm2(_)) => {
+            return Err("a Clef decision head needs a Qwen3.5 backbone".into());
+        }
     };
-    Ok((model, tokenizer))
+    let tokenizer = match (&options.tokenizer, &files.head) {
+        (Some(path), _) => tokenizers::Tokenizer::from_file(path)?,
+        (None, Some(head)) => tokenizers::Tokenizer::from_file(&head.tokenizer)?,
+        (None, None) => model.tokenizer()?,
+    };
+    Ok((model, tokenizer, head))
 }
 
 /// Start the conversation with `model` on `metal` that `options` describe.
@@ -300,7 +326,7 @@ fn start<'a>(
         repeat_penalty: flags.repeat_penalty.unwrap_or(recommended.repeat_penalty),
     };
     let seed = flags.seed.unwrap_or_else(|| fastrand::u64(..));
-    let engine = engine::Engine::new(model, metal, tokenizer, options.context)?;
+    let engine = engine::Engine::new(model, metal, tokenizer, options.context, None)?;
     Ok(conversation::Conversation::new(
         engine,
         options.system.as_deref(),
@@ -345,7 +371,8 @@ fn respond(
     use engine::{Event, Part};
 
     let text = full_prompt(prompt)?;
-    let (model, tokenizer) = load(model_options)?;
+    // Conversations use no decision head.
+    let (model, tokenizer, _) = load(model_options)?;
     let mut metal = bobcat::metal::Metal::open()?;
     let mut conversation = start(options, &model, &mut metal, &tokenizer)?;
 
@@ -393,10 +420,10 @@ fn decide(model_options: &ModelOptions, request: &str) -> Result<(), Error> {
     };
     let request: serde_json::Value =
         serde_json::from_str(&text).map_err(|error| format!("the request is not JSON: {error}"))?;
-    let (model, tokenizer) = load(model_options)?;
+    let (model, tokenizer, head) = load(model_options)?;
     let mut metal = bobcat::metal::Metal::open()?;
     let context = u32::try_from(systemone::MAX_TOKENS)?;
-    let mut engine = engine::Engine::new(&model, &mut metal, &tokenizer, context)?;
+    let mut engine = engine::Engine::new(&model, &mut metal, &tokenizer, context, head)?;
     let response = match decisions::systemone(&mut engine, &request, &model_options.model) {
         Ok(response) => response,
         Err(decisions::Refusal::Invalid(message) | decisions::Refusal::Refused(message)) => {
@@ -493,7 +520,8 @@ fn chat(model_options: &ModelOptions, options: &ReplyOptions) -> Result<(), Erro
 
     use engine::{Event, Finish, Part};
 
-    let (model, tokenizer) = load(model_options)?;
+    // Conversations use no decision head.
+    let (model, tokenizer, _) = load(model_options)?;
     let mut metal = bobcat::metal::Metal::open()?;
     let mut conversation = start(options, &model, &mut metal, &tokenizer)?;
     let mut editor = rustyline::DefaultEditor::new()?;
@@ -562,12 +590,12 @@ fn serve(
     max_tokens: usize,
     context: u32,
 ) -> Result<(), Error> {
-    let (model, tokenizer) = load(options)?;
+    let (model, tokenizer, head) = load(options)?;
     let serve_options = serve::Options {
         name: options.model.clone(),
         context,
         max_tokens,
         address,
     };
-    serve::run(&serve_options, model, tokenizer)
+    serve::run(&serve_options, model, tokenizer, head)
 }

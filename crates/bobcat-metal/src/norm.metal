@@ -223,6 +223,8 @@ template [[host_name ("embed_q4_0")]] kernel decltype (embed_q<q4_0_format>)
 template [[host_name (
     "embed_f16")]] kernel decltype (embed_q<f16_format>) embed_q<f16_format>;
 template [[host_name (
+    "embed_f32")]] kernel decltype (embed_q<f32_format>) embed_q<f32_format>;
+template [[host_name (
     "embed_q4k")]] kernel decltype (embed_q<q4k_format>) embed_q<q4k_format>;
 template [[host_name (
     "embed_q5k")]] kernel decltype (embed_q<q5k_format>) embed_q<q5k_format>;

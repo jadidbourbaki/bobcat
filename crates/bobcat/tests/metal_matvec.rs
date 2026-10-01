@@ -149,6 +149,12 @@ fn launch_error(
                 bytes.extend_from_slice(&f16::from_f32(random.unit()).to_bits().to_le_bytes());
             }
             bytes
+        } else if format == Format::F32 {
+            let mut bytes = Vec::with_capacity(weight_bytes);
+            for _ in 0..weight_bytes / 4 {
+                bytes.extend_from_slice(&random.unit().to_le_bytes());
+            }
+            bytes
         } else {
             random.blocks(weight_bytes, block_bytes, scales)
         }
@@ -241,7 +247,7 @@ fn launch_error(
 }
 
 #[test]
-fn f16_matvec_matches_scalar() -> Result<(), Box<dyn Error>> {
+fn float_matvec_matches_scalar() -> Result<(), Box<dyn Error>> {
     let mut metal = match Metal::open() {
         Ok(metal) => metal,
         Err(error) => {
@@ -250,11 +256,19 @@ fn f16_matvec_matches_scalar() -> Result<(), Box<dyn Error>> {
         }
     };
     let mut random = Random(0x60e7_927b_081d_a5ef);
-    let format = (Format::F16, TensorType::F16, &[][..]);
-    for mode in [Mode::Plain, Mode::Norm, Mode::Accumulate, Mode::Swiglu] {
-        for (rows, cols) in [(7, 256), (1000, 1024)] {
-            let error = launch_error(&mut metal, &mut random, format, mode, rows, cols)?;
-            assert!(error < TOLERANCE, "F16 {mode:?} {rows}x{cols}: {error:e}");
+    for format in [
+        (Format::F16, TensorType::F16, &[][..]),
+        (Format::F32, TensorType::F32, &[][..]),
+    ] {
+        for mode in [Mode::Plain, Mode::Norm, Mode::Accumulate, Mode::Swiglu] {
+            for (rows, cols) in [(7, 256), (1000, 1024)] {
+                let error = launch_error(&mut metal, &mut random, format, mode, rows, cols)?;
+                assert!(
+                    error < TOLERANCE,
+                    "{:?} {mode:?} {rows}x{cols}: {error:e}",
+                    format.0
+                );
+            }
         }
     }
     Ok(())

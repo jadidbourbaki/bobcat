@@ -15,6 +15,7 @@
 use std::ops::Range;
 
 use bobcat_gguf::{Gguf, TensorType};
+use safetensors::{Dtype, SafeTensors};
 
 use crate::error::Error;
 use crate::lfm2::{require_tensor, require_u32, to_usize};
@@ -267,6 +268,17 @@ pub struct Head {
     residual_gate: f32,
 }
 
+/// The shape of a head, as the release's `joint_head_config.json` gives it.
+#[derive(Debug, Clone, Copy)]
+struct Config {
+    hidden_size: usize,
+    width: usize,
+    routing_layers: usize,
+    layers: usize,
+    heads: usize,
+    feedforward: usize,
+}
+
 impl Head {
     /// Load the head from the `clef.` tensors of `model`'s file, or return `None` when the file
     /// holds no head.
@@ -275,18 +287,58 @@ impl Head {
         if gguf.u32("clef.width").is_none() {
             return Ok(None);
         }
-        let config = |key: &str| require_u32(gguf, &format!("clef.{key}")).map(to_usize);
-        let hidden_size = config("hidden_size")?;
-        let width = config("width")?;
-        let heads = config("heads")?;
-        let feedforward = config("feedforward")?;
+        let key = |key: &str| require_u32(gguf, &format!("clef.{key}")).map(to_usize);
+        let config = Config {
+            hidden_size: key("hidden_size")?,
+            width: key("width")?,
+            routing_layers: key("routing_layers")?,
+            layers: key("layers")?,
+            heads: key("heads")?,
+            feedforward: key("feedforward")?,
+        };
+        Self::build(model, &config, &Loader::Gguf(gguf)).map(Some)
+    }
+
+    /// Load the head for `model` from a Clef release's `joint_head_config.json`, whose bytes are
+    /// `config`, and its `joint_head.safetensors`, whose bytes are `weights`.
+    pub fn from_safetensors(model: &Model, config: &[u8], weights: &[u8]) -> Result<Self, Error> {
+        let config: serde_json::Value =
+            serde_json::from_slice(config).map_err(|error| Error::Head(error.to_string()))?;
+        let key = |key: &str| -> Result<usize, Error> {
+            config[key]
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| Error::Head(format!("the configuration needs a count {key}")))
+        };
+        let config = Config {
+            hidden_size: key("hidden_size")?,
+            width: key("width")?,
+            routing_layers: key("routing_layers")?,
+            layers: key("layers")?,
+            heads: key("heads")?,
+            feedforward: key("feedforward")?,
+        };
+        let tensors =
+            SafeTensors::deserialize(weights).map_err(|error| Error::Head(error.to_string()))?;
+        Self::build(model, &config, &Loader::Safetensors(&tensors))
+    }
+
+    /// Return the head of `config`'s shape, with the tensors of `loader`.
+    fn build(model: &Model, config: &Config, loader: &Loader<'_>) -> Result<Self, Error> {
+        let Config {
+            hidden_size,
+            width,
+            routing_layers,
+            layers,
+            heads,
+            feedforward,
+        } = *config;
         if hidden_size != to_usize(model.hyperparameters().n_embd)
             || heads == 0
             || !width.is_multiple_of(heads)
         {
             return Err(Error::Hyperparameters);
         }
-        let loader = Loader { gguf };
         let linear = |name: &str, n_cols: usize, n_rows: usize, bias: bool| {
             loader.linear(name, n_cols, n_rows, bias)
         };
@@ -315,7 +367,7 @@ impl Head {
             })
         };
 
-        let evidence_layers = (0..config("routing_layers")?)
+        let evidence_layers = (0..routing_layers)
             .map(|i| -> Result<EvidenceLayer, Error> {
                 let name = |part: &str| format!("evidence_layers.{i}.{part}");
                 Ok(EvidenceLayer {
@@ -327,7 +379,7 @@ impl Head {
                 })
             })
             .collect::<Result<_, _>>()?;
-        let layers = (0..config("layers")?)
+        let layers = (0..layers)
             .map(|i| -> Result<DecoderLayer, Error> {
                 let name = |part: &str| format!("layers.{i}.{part}");
                 Ok(DecoderLayer {
@@ -341,7 +393,7 @@ impl Head {
             })
             .collect::<Result<_, _>>()?;
 
-        Ok(Some(Self {
+        Ok(Self {
             hidden_size,
             width,
             hidden_norm: norm("hidden_norm", hidden_size)?,
@@ -379,7 +431,7 @@ impl Head {
             prior_logit_scale: loader.scalar("prior_logit_scale")?,
             joint_logit_scale: loader.scalar("joint_logit_scale")?,
             residual_gate: loader.scalar("residual_gate")?,
-        }))
+        })
     }
 
     /// Return each question's logits, one per allowed option, for the request whose `tokens`
@@ -560,16 +612,54 @@ impl Head {
 }
 
 /// Reads the head's tensors out of the GGUF file.
-struct Loader<'g> {
-    gguf: &'g Gguf<Storage>,
+enum Loader<'s> {
+    /// A GGUF file that holds the head's tensors under `clef.` names.
+    Gguf(&'s Gguf<Storage>),
+    /// The release's `joint_head.safetensors`.
+    Safetensors(&'s SafeTensors<'s>),
 }
 
 impl Loader<'_> {
-    /// Return the float values of the tensor `clef.NAME`, whose GGUF shape must be `want`.
+    /// Return the float values of the head tensor `NAME`, whose GGUF shape must be `want`. A
+    /// safetensors file lists the same dimensions in reverse, and holds each scalar with no
+    /// dimensions at all.
     fn values(&self, name: &str, want: &[usize]) -> Result<Vec<f32>, Error> {
+        let gguf = match self {
+            Self::Gguf(gguf) => gguf,
+            Self::Safetensors(tensors) => {
+                let view = tensors
+                    .tensor(name)
+                    .map_err(|_| Error::MissingTensor(name.to_owned()))?;
+                let mut shape: Vec<usize> = view.shape().iter().rev().copied().collect();
+                if shape.is_empty() {
+                    shape.push(1);
+                }
+                if shape != want {
+                    return Err(Error::Head(format!(
+                        "{name} has shape {shape:?}, and the head needs {want:?}"
+                    )));
+                }
+                let data_type = match view.dtype() {
+                    Dtype::F32 => TensorType::F32,
+                    Dtype::F16 => TensorType::F16,
+                    Dtype::BF16 => TensorType::Bf16,
+                    other => {
+                        return Err(Error::Head(format!("{name} holds {other:?} values")));
+                    }
+                };
+                let mut values = vec![0.0; want.iter().product()];
+                if view.data().len() != values.len() * data_type.block().1 {
+                    return Err(Error::Head(format!(
+                        "{name} holds the wrong number of bytes"
+                    )));
+                }
+                scalar::dequantize(data_type, view.data(), &mut values);
+                return Ok(values);
+            }
+        };
         let name = format!("clef.{name}");
         let want: Vec<u64> = want.iter().map(|&n| n as u64).collect();
-        let tensor = require_tensor(self.gguf, &name, &want)?;
+        let tensor = require_tensor(gguf, &name, &want)?;
         let data_type = tensor.data_type();
         if !matches!(
             data_type,
@@ -577,8 +667,7 @@ impl Loader<'_> {
         ) {
             return Err(Error::TensorType { name, data_type });
         }
-        let bytes = self
-            .gguf
+        let bytes = gguf
             .tensor_data(tensor)
             .ok_or_else(|| Error::MissingTensor(name.clone()))?;
         let count = want.iter().product::<u64>();

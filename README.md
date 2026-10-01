@@ -239,20 +239,8 @@ chat template always opens a reasoning block before the answer.
 **[Clef-Flash](https://huggingface.co/Cloudflare/clef-flash)**
 
 ```sh
-hf download Cloudflare/clef-flash --local-dir clef-flash
-python llama.cpp/convert_hf_to_gguf.py clef-flash --no-mtp --outtype q8_0 \
-  --outfile clef-flash-backbone.gguf
-cd tools && uv run python clef_gguf.py --backbone ../clef-flash-backbone.gguf \
-  --release ../clef-flash --out ../clef-flash-Q8_0.gguf
+bobcat pull clef:flash
 ```
-
-```sh
-bobcat serve -m clef-flash-Q8_0.gguf
-```
-
-Clef-Flash answers `/v1/systemone` and `bobcat decide` with its own
-decision head. A warm server answers a 300-token decision in 0.88
-seconds on an M4 Pro.
 
 bobcat is still in alpha. We are rapidly adding support for more models
 and model families. Please stay tuned!

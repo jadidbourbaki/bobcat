@@ -84,6 +84,9 @@ pub enum Error {
     /// An argument has the wrong size or value.
     #[error("invalid argument: {0}")]
     Argument(&'static str),
+    /// A decision head's safetensors file or its configuration is malformed.
+    #[error("the decision head is malformed: {0}")]
+    Head(String),
     /// The Metal path cannot run the model.
     #[error("the Metal path needs {0}")]
     MetalUnsupported(String),

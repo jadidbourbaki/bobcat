@@ -24,7 +24,8 @@ const DEFAULT_TAG: &str = "Q8_0";
 
 /// The short names of the models bobcat supports, with the Hugging Face repository each one names.
 /// Supporting a new model adds a line here.
-const ALIASES: [(&str, &str, &str); 8] = [
+const ALIASES: [(&str, &str, &str); 9] = [
+    ("clef:flash", "bartowski", "Cloudflare_clef-flash-GGUF"),
     ("lfm2.5:350m", "LiquidAI", "LFM2.5-350M-GGUF"),
     ("lfm2.5:1.2b", "LiquidAI", "LFM2.5-1.2B-Instruct-GGUF"),
     ("lfm2.5:2.6b", "LiquidAI", "LFM2.5-2.6B-GGUF"),
@@ -169,25 +170,109 @@ fn tag_of(file: &str, files: &[&str]) -> String {
         .unwrap_or_else(|| stem.to_owned())
 }
 
-/// Return the GGUF file for `model`, which is a path to a file or a model name. A name not yet in
+/// The GGUF repositories of decision models whose decision head lives in the model's own release,
+/// with that release's repository. The GGUF file holds the backbone, and the release holds the
+/// head and the tokenizer the head was trained with.
+const DECISION_HEADS: [(&str, &str, &str); 1] = [(
+    "bartowski/Cloudflare_clef-flash-GGUF",
+    "Cloudflare",
+    "clef-flash",
+)];
+
+/// The head files a decision model's release holds.
+const HEAD_FILES: [&str; 3] = [
+    "joint_head.safetensors",
+    "joint_head_config.json",
+    "tokenizer.json",
+];
+
+/// The files of a model.
+pub(crate) struct Files {
+    pub(crate) gguf: PathBuf,
+    /// The decision head from the model's release, for a model that has one there.
+    pub(crate) head: Option<HeadFiles>,
+}
+
+/// The files of a decision head from a Clef release.
+pub(crate) struct HeadFiles {
+    pub(crate) weights: PathBuf,
+    pub(crate) config: PathBuf,
+    pub(crate) tokenizer: PathBuf,
+}
+
+/// Return the files of `model`, which is a path to a GGUF file or a model name. A name not yet in
 /// the cache downloads first.
-pub(crate) fn resolve(model: &str) -> Result<PathBuf, Error> {
+pub(crate) fn resolve(model: &str) -> Result<Files, Error> {
     let path = Path::new(model);
     if path.exists() {
-        return Ok(path.to_owned());
+        return Ok(Files {
+            gguf: path.to_owned(),
+            head: None,
+        });
     }
     if model.to_ascii_lowercase().ends_with(".gguf") {
         return Err(format!("no file {model}").into());
     }
     let name = Name::parse(model)?;
-    match cached(&name)? {
-        Some(file) => Ok(file.file_path),
-        None => pull(&name),
+    let gguf = match cached(&name)? {
+        Some(file) => file.file_path,
+        None => pull_gguf(&name)?,
+    };
+    Ok(Files {
+        gguf,
+        head: head_files(&name)?,
+    })
+}
+
+/// Return the decision head files of the model `name`, downloading any the cache lacks, or
+/// `None` when the model takes no head from another repository.
+fn head_files(name: &Name) -> Result<Option<HeadFiles>, Error> {
+    let repo_id = name.repo_id();
+    let Some(&(_, owner, repo)) = DECISION_HEADS
+        .iter()
+        .find(|(gguf, _, _)| repo_id.eq_ignore_ascii_case(gguf))
+    else {
+        return Ok(None);
+    };
+    let release = format!("{owner}/{repo}");
+    let cached: Vec<CachedFileInfo> = cached_repos()?
+        .find(|cached| cached.repo_id == release)
+        .map(cached_files)
+        .unwrap_or_default();
+    let mut paths = Vec::new();
+    for file in HEAD_FILES {
+        let path = match cached.iter().find(|cached| cached.file_name == file) {
+            Some(cached) => cached.file_path.clone(),
+            None => HFClientSync::new()?
+                .model(owner, repo)
+                .download_file()
+                .filename(file)
+                .progress(Progress::new(ProgressLine::new(format!(
+                    "{release}/{file}"
+                ))))
+                .send()?,
+        };
+        paths.push(path);
     }
+    let [weights, config, tokenizer] =
+        <[PathBuf; 3]>::try_from(paths).map_err(|_| "the release lists a head file twice")?;
+    Ok(Some(HeadFiles {
+        weights,
+        config,
+        tokenizer,
+    }))
+}
+
+/// Download the GGUF file `name` picks into the cache, with any decision head the model takes
+/// from its release, and return the GGUF file's path.
+pub(crate) fn pull(name: &Name) -> Result<PathBuf, Error> {
+    let path = pull_gguf(name)?;
+    head_files(name)?;
+    Ok(path)
 }
 
 /// Download the GGUF file `name` picks into the cache and return its path.
-pub(crate) fn pull(name: &Name) -> Result<PathBuf, Error> {
+fn pull_gguf(name: &Name) -> Result<PathBuf, Error> {
     let client = HFClientSync::new()?;
     let repo = client.model(&name.owner, &name.repo);
     let entries = repo.list_tree().send()?;

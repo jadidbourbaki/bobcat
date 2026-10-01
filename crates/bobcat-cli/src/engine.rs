@@ -179,11 +179,15 @@ const QWEN_CALLS: CallFormat = CallFormat {
 
 impl<'a> Engine<'a> {
     /// Load `model` onto `metal` for conversations of up to `context` tokens.
+    ///
+    /// Decisions use `head` when it is given, and otherwise the Clef head inside the model file,
+    /// if the file holds one.
     pub(crate) fn new(
         model: &'a Model,
         metal: &'a mut Metal,
         tokenizer: &'a Tokenizer,
         context: u32,
+        head: Option<Head>,
     ) -> Result<Self, Error> {
         let source = model
             .metadata_string("tokenizer.chat_template")
@@ -240,9 +244,10 @@ impl<'a> Engine<'a> {
                 turn_open: tokenizer.token_to_id("<|im_start|>"),
             },
             calls,
-            head: match model {
-                Model::Lfm2(_) => None,
-                Model::Qwen35(model) => Head::load(model)?,
+            head: match (head, model) {
+                (Some(head), _) => Some(head),
+                (None, Model::Lfm2(_)) => None,
+                (None, Model::Qwen35(model)) => Head::load(model)?,
             },
         })
     }

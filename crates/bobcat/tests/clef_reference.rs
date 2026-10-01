@@ -51,6 +51,30 @@ fn head_matches_reference() -> TestResult {
     Ok(())
 }
 
+/// Check that the head read from the release's safetensors file gives the logits of the head
+/// that `tools/clef_gguf.py` copied into the model file.
+#[test]
+fn safetensors_head_matches_gguf_head() -> TestResult {
+    let Some((model, reference)) = load()? else {
+        return Ok(());
+    };
+    let release = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/hf/clef-flash");
+    let Ok(weights) = fs::read(release.join("joint_head.safetensors")) else {
+        eprintln!("skip: needs the release in {}", release.display());
+        return Ok(());
+    };
+    let config = fs::read(release.join("joint_head_config.json"))?;
+    let from_release = Head::from_safetensors(&model, &config, &weights)?;
+    let from_gguf = Head::load(&model)?.ok_or("the model file holds no Clef head")?;
+    let hidden = read_f32s(&reference.dir, "hidden.f32")?;
+    let logits =
+        |head: &Head| head.logits(&model, &hidden, &reference.tokens, &reference.questions);
+    if logits(&from_release)? != logits(&from_gguf)? {
+        return Err("the two heads give different logits".into());
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn decision_matches_reference() -> TestResult {

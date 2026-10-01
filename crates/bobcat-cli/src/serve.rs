@@ -23,6 +23,8 @@ use serde_json::{Map, Value, json};
 use tokio::sync::{mpsc as channel, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
+use bobcat::clef::Head;
+
 use crate::Error;
 use crate::decisions::{self, Refusal};
 use crate::engine::{Engine, Event, Finish, Message, Part, Request, Role};
@@ -30,6 +32,7 @@ use crate::sampler::Sampler;
 use crate::tools::ToolCall;
 
 /// How to serve a model.
+#[derive(Debug, Clone)]
 pub(crate) struct Options {
     /// The model's name in the API, as `-m` gave it.
     pub(crate) name: String,
@@ -41,11 +44,13 @@ pub(crate) struct Options {
     pub(crate) address: SocketAddr,
 }
 
-/// Serve `model` with `tokenizer` until the process ends.
+/// Serve `model` with `tokenizer`, and with the decision head `head` when it is given, until the
+/// process ends.
 pub(crate) fn run(
     options: &Options,
     model: crate::backend::Model,
     tokenizer: tokenizers::Tokenizer,
+    head: Option<Head>,
 ) -> Result<(), Error> {
     // Binding before the model loads reports a busy port at once.
     let listener = std::net::TcpListener::bind(options.address)
@@ -53,13 +58,9 @@ pub(crate) fn run(
     listener.set_nonblocking(true)?;
     let (jobs, queue) = mpsc::channel();
     let (ready, started) = mpsc::channel();
-    let context = options.context;
-    let max_tokens = options.max_tokens;
-    let name = options.name.clone();
+    let worker_options = options.clone();
     std::thread::spawn(move || {
-        worker(
-            &model, &name, &tokenizer, context, max_tokens, &queue, &ready,
-        );
+        worker(&model, &tokenizer, head, &worker_options, &queue, &ready);
     });
     started
         .recv()
@@ -153,17 +154,18 @@ enum Route {
     Score,
 }
 
-/// Load `model` onto the GPU, report on `ready`, and answer the jobs on `queue` one at a time.
-/// SystemOne answers name the model `name`.
+/// Load `model` onto the GPU as `options` describe, report on `ready`, and answer the jobs on
+/// `queue` one at a time.
 fn worker(
     model: &crate::backend::Model,
-    name: &str,
     tokenizer: &tokenizers::Tokenizer,
-    context: u32,
-    max_tokens: usize,
+    head: Option<Head>,
+    options: &Options,
     queue: &mpsc::Receiver<Job>,
     ready: &mpsc::Sender<Result<(), Error>>,
 ) {
+    let name = options.name.as_str();
+    let max_tokens = options.max_tokens;
     let mut metal = match bobcat::metal::Metal::open() {
         Ok(metal) => metal,
         Err(error) => {
@@ -171,7 +173,7 @@ fn worker(
             return;
         }
     };
-    let mut engine = match Engine::new(model, &mut metal, tokenizer, context) {
+    let mut engine = match Engine::new(model, &mut metal, tokenizer, options.context, head) {
         Ok(engine) => engine,
         Err(error) => {
             let _ = ready.send(Err(error));

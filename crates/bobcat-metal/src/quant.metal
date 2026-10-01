@@ -38,6 +38,30 @@ struct f16_format
   }
 };
 
+/* Plain float weights, stored as contiguous rows.  Some GGUF files keep
+   small matrices such as Qwen3.5's DeltaNet gate projections in
+   floats.  */
+struct f32_format
+{
+  static constant constexpr uint block_weights = 32;
+  static constant constexpr uint block_bytes = 128;
+
+  static weights8
+  load8 (device const uchar *row, uint e)
+  {
+    device const float4 *values = (device const float4 *)(row + 4 * e);
+    return { values[0], values[1] };
+  }
+
+  static void
+  load16 (device const uchar *row, uint e, thread half4 *out)
+  {
+    device const float4 *values = (device const float4 *)(row + 4 * e);
+    for (uint i = 0; i < 4; i++)
+      out[i] = half4 (values[i]);
+  }
+};
+
 /* The Q4_0 format: blocks of 32 weights, each an fp16 scale and 16
    bytes whose low nibbles hold weights 0 to 15 and whose high nibbles
    hold weights 16 to 31, each offset by 8.  */
