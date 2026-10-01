@@ -33,10 +33,12 @@ rms_norm (device const float *x [[buffer (0)]],
 
 /* Normalize each of the heads of HEAD_DIM floats of each token at SRC by
    its root mean square, scale it by the HEAD_DIM floats at WEIGHT,
-   rotate it for the token's position, and store it at DST as T.  Token
-   I sits at position POS + I, SRC_STRIDE floats into SRC and DST_STRIDE
-   elements into DST.  Element I of a head pairs with element I +
-   HEAD_DIM / 2.  One threadgroup of HEAD_DIM threads handles one head of
+   rotate its first N_ROT elements for the token's position, and store it
+   at DST as T.  Token I sits at position POS + I, SRC_STRIDE floats into
+   SRC and DST_STRIDE elements into DST.  Head H of a token starts H
+   SRC_HEAD_STRIDE floats into the token at SRC and H HEAD_DIM elements
+   into it at DST.  Element I of the rotated elements pairs with element
+   I + N_ROT / 2.  One threadgroup of HEAD_DIM threads handles one head of
    one token.  SRC and DST may be the same floats.  */
 template <typename T>
 kernel void
@@ -49,6 +51,8 @@ norm_rope (device const float *src [[buffer (0)]],
            constant float &eps [[buffer (6)]],
            constant uint &src_stride [[buffer (7)]],
            constant uint &dst_stride [[buffer (8)]],
+           constant uint &n_rot [[buffer (9)]],
+           constant uint &src_head_stride [[buffer (10)]],
            uint2 position [[threadgroup_position_in_grid]],
            uint2 thread_position [[thread_position_in_threadgroup]],
            uint simdgroup_index [[simdgroup_index_in_threadgroup]],
@@ -61,27 +65,29 @@ norm_rope (device const float *src [[buffer (0)]],
   uint token = position.y;
   uint i = thread_position.x;
 
-  float value = src[token * src_stride + head * head_dim + i];
+  float value = src[token * src_stride + head * src_head_stride + i];
   float sum_squares = threadgroup_sum (value * value, partials,
                                        simdgroup_index, simdgroups, lane);
   float scale = precise::rsqrt (sum_squares / float (head_dim) + eps);
   normed[i] = weight[i] * (value * scale);
   threadgroup_barrier (mem_flags::mem_threadgroup);
 
-  uint half_dim = head_dim / 2;
+  uint half_rot = n_rot / 2;
   device T *out = dst + token * dst_stride + head * head_dim;
-  if (i < half_dim)
+  if (i < half_rot)
     {
       float inv_freq
-          = 1.0f / precise::pow (theta, float (2 * i) / float (head_dim));
+          = 1.0f / precise::pow (theta, float (2 * i) / float (n_rot));
       float angle = float (pos + token) * inv_freq;
       float c = precise::cos (angle);
       float s = precise::sin (angle);
       float x0 = normed[i];
-      float x1 = normed[i + half_dim];
+      float x1 = normed[i + half_rot];
       out[i] = T (x0 * c - x1 * s);
-      out[i + half_dim] = T (x1 * c + x0 * s);
+      out[i + half_rot] = T (x1 * c + x0 * s);
     }
+  else if (i >= n_rot)
+    out[i] = T (normed[i]);
 }
 
 /* The element type appears in the signature, so each instantiation

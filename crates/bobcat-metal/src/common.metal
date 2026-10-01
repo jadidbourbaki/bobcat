@@ -44,7 +44,11 @@ enum
      checks the model against the other two limits.  */
   ATTENTION_CHUNK = 64,
   ATTENTION_MAX_GROUP = 4,
-  ATTENTION_MAX_HEAD_DIM = 128,
+  ATTENTION_MAX_HEAD_DIM = 256,
+  /* The Gated DeltaNet kernels' limits.  The host checks the model
+     against both.  */
+  GDN_MAX_KERNEL = 8,
+  GDN_MAX_K_DIM = 128,
   /* A threadgroup of attention_flash covers FLASH_QUERIES queries of one
      head with four simdgroups of 8 queries each, over FLASH_KEYS keys at
      a time, for heads of FLASH_HEAD_DIM.  */

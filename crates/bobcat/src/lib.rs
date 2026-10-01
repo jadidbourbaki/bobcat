@@ -2,13 +2,16 @@
 //!
 //! [`Model`] loads an LFM2 model from a GGUF file. [`State`] runs the model on the CPU with the
 //! scalar reference ops in [`scalar`], which define the correct output of every op. On macOS,
-//! [`Lfm2Metal`] runs the same model on the GPU.
+//! [`Lfm2Metal`] runs the same model on the GPU. [`qwen35`] holds the same pieces for Qwen3.5
+//! models.
 
 mod error;
 mod lfm2;
 #[cfg(target_os = "macos")]
 mod lfm2_metal;
 pub mod qwen35;
+#[cfg(target_os = "macos")]
+mod qwen35_metal;
 pub mod scalar;
 mod storage;
 

@@ -41,6 +41,7 @@ const SOURCE: &str = concat!(
     include_str!("quant.metal"),
     include_str!("matvec.metal"),
     include_str!("moe.metal"),
+    include_str!("gdn.metal"),
     include_str!("norm.metal"),
     include_str!("attention.metal"),
     include_str!("conv.metal"),
@@ -85,6 +86,13 @@ pub const MOE_MAX_EXPERTS: u32 = 128;
 /// The most experts the router may pick for a token. Must match `MOE_MAX_USED` in
 /// `common.metal`.
 pub const MOE_MAX_USED: u32 = 8;
+/// The longest causal convolution of a Gated DeltaNet layer. Must match `GDN_MAX_KERNEL` in
+/// `common.metal`.
+pub const GDN_MAX_KERNEL: u32 = 8;
+/// The largest key head of a Gated DeltaNet layer. Must match `GDN_MAX_K_DIM` in
+/// `common.metal`.
+pub const GDN_MAX_K_DIM: u32 = 128;
+
 /// Must match `MOE_ROUTE_SIMDGROUPS`, `MOE_ROUTE_TOKENS`, and `MOE_GROUP_SIMDGROUPS` in
 /// `common.metal`.
 const MOE_ROUTE_SIMDGROUPS: usize = 32;
@@ -211,6 +219,20 @@ pub enum Error {
     /// The format has no mixture-of-experts kernels.
     #[error("{0:?} matrices cannot hold experts")]
     NoExperts(Format),
+    /// A Gated DeltaNet layer exceeds the kernels' limits.
+    #[error(
+        "the DeltaNet kernels need a convolution of 2 to {GDN_MAX_KERNEL} taps, key heads of up \
+         to {GDN_MAX_K_DIM} floats, and value heads of a multiple of 32 floats, got \
+         {conv_kernel}, {k_dim}, and {v_dim}"
+    )]
+    DeltaNetLimits {
+        /// The taps of the convolution, or zero when the convolution is not at issue.
+        conv_kernel: u32,
+        /// The size of each key head, or zero when the heads are not at issue.
+        k_dim: u32,
+        /// The size of each value head, or zero when the heads are not at issue.
+        v_dim: u32,
+    },
     /// The router picks more experts than the kernels allow.
     #[error(
         "the router picks {n_used} of {n_experts} experts, and the kernels allow at most \
@@ -502,6 +524,12 @@ enum Kernel {
         format: Format,
         swiglu: bool,
     },
+    GdnConv,
+    GdnQkNorm,
+    GdnGates,
+    GdnRecurrence,
+    SiluMul,
+    AttentionGate,
 }
 
 impl Kernel {
@@ -530,6 +558,12 @@ impl Kernel {
             Self::Embed(format) => format.kernel_names()[3],
             Self::Argmax => "argmax",
             Self::MoeRoute { .. } => "moe_route",
+            Self::GdnConv => "gdn_conv",
+            Self::GdnQkNorm => "gdn_qk_norm",
+            Self::GdnGates => "gdn_gates",
+            Self::GdnRecurrence => "gdn_recurrence",
+            Self::SiluMul => "silu_mul",
+            Self::AttentionGate => "attention_gate",
             Self::MoeGroup => "moe_group",
             Self::MoeCombine => "moe_combine",
             Self::MatmulExperts { format, .. } => format
@@ -676,6 +710,12 @@ struct Pipelines {
     moe_route: [Pipeline; 2],
     moe_group: Pipeline,
     moe_combine: Pipeline,
+    gdn_conv: Pipeline,
+    gdn_qk_norm: Pipeline,
+    gdn_gates: Pipeline,
+    gdn_recurrence: Pipeline,
+    silu_mul: Pipeline,
+    attention_gate: Pipeline,
 }
 
 impl Pipelines {
@@ -716,6 +756,12 @@ impl Pipelines {
             moe_route: [route(false)?, route(true)?],
             moe_group: plain("moe_group")?,
             moe_combine: plain("moe_combine")?,
+            gdn_conv: plain("gdn_conv")?,
+            gdn_qk_norm: plain("gdn_qk_norm")?,
+            gdn_gates: plain("gdn_gates")?,
+            gdn_recurrence: plain("gdn_recurrence")?,
+            silu_mul: plain("silu_mul")?,
+            attention_gate: plain("attention_gate")?,
         })
     }
 
@@ -764,6 +810,12 @@ impl Pipelines {
             Kernel::Embed(format) => &self.formats[format.index()].embed,
             Kernel::Argmax => &self.argmax,
             Kernel::MoeRoute { norm } => &self.moe_route[usize::from(norm)],
+            Kernel::GdnConv => &self.gdn_conv,
+            Kernel::GdnQkNorm => &self.gdn_qk_norm,
+            Kernel::GdnGates => &self.gdn_gates,
+            Kernel::GdnRecurrence => &self.gdn_recurrence,
+            Kernel::SiluMul => &self.silu_mul,
+            Kernel::AttentionGate => &self.attention_gate,
             Kernel::MoeGroup => &self.moe_group,
             Kernel::MoeCombine => &self.moe_combine,
             Kernel::ExpertsSwiglu(format) => &self.experts(format)[0],
@@ -1587,6 +1639,238 @@ impl Metal {
         })
     }
 
+    /// Record the causal convolution of `n_tokens` tokens of `channels` floats at `x` with
+    /// `kernel_size` taps per channel at `taps`, the oldest first, and store SiLU of each result
+    /// at `y`.
+    ///
+    /// `history` holds the latest `kernel_size - 1` raw inputs of each channel, the oldest
+    /// first, and moves forward one token at a time.
+    pub fn gdn_conv(
+        &mut self,
+        x: View<'_>,
+        taps: View<'_>,
+        history: View<'_>,
+        y: View<'_>,
+        channels: u32,
+        kernel_size: u32,
+        n_tokens: u32,
+    ) -> Result<(), Error> {
+        if !(2..=GDN_MAX_KERNEL).contains(&kernel_size) {
+            return Err(Error::DeltaNetLimits {
+                conv_kernel: kernel_size,
+                k_dim: 0,
+                v_dim: 0,
+            });
+        }
+        let token_bytes = product(&[to_usize(n_tokens), to_usize(channels), FLOAT_BYTES]);
+        let args = [
+            buffer(x, token_bytes),
+            buffer(
+                taps,
+                product(&[to_usize(channels), to_usize(kernel_size), FLOAT_BYTES]),
+            ),
+            buffer(
+                history,
+                product(&[to_usize(channels), to_usize(kernel_size - 1), FLOAT_BYTES]),
+            ),
+            buffer(y, token_bytes),
+            Arg::U32(channels),
+            Arg::U32(kernel_size),
+            Arg::U32(n_tokens),
+        ];
+        self.launch(&Launch {
+            kernel: Kernel::GdnConv,
+            args: &args,
+            dispatch: elementwise(channels),
+            n_rows: 0,
+            n_cols: 0,
+            weight_bytes: 0,
+        })
+    }
+
+    /// Record the L2 normalization of each query and key head of the `n_tokens` DeltaNet tokens
+    /// of `shape` at `y`, and the scaling of the queries by `q_scale`.
+    pub fn gdn_qk_norm(
+        &mut self,
+        y: View<'_>,
+        shape: DeltaShape,
+        n_tokens: u32,
+        q_scale: f32,
+    ) -> Result<(), Error> {
+        let args = [
+            buffer(
+                y,
+                product(&[to_usize(n_tokens), to_usize(shape.conv_dim()), FLOAT_BYTES]),
+            ),
+            Arg::U32(shape.n_k_heads),
+            Arg::U32(shape.k_dim),
+            Arg::U32(shape.conv_dim()),
+            Arg::F32(q_scale),
+        ];
+        self.launch(&Launch {
+            kernel: Kernel::GdnQkNorm,
+            args: &args,
+            dispatch: Dispatch::Threadgroups(
+                [to_usize(shape.n_k_heads), to_usize(n_tokens), 2],
+                [SIMD_WIDTH, 1, 1],
+            ),
+            n_rows: 0,
+            n_cols: 0,
+            weight_bytes: 0,
+        })
+    }
+
+    /// Record the gates of `n_tokens` DeltaNet tokens with `n_v_heads` value heads.
+    ///
+    /// `beta` receives the sigmoid of each update strength projection, and `alpha` receives each
+    /// decay factor `exp(a * softplus(alpha + dt_bias))`, with the `n_v_heads` values of `a` and
+    /// `dt_bias` per head.
+    pub fn gdn_gates(
+        &mut self,
+        beta: View<'_>,
+        alpha: View<'_>,
+        a: View<'_>,
+        dt_bias: View<'_>,
+        n_v_heads: u32,
+        n_tokens: u32,
+    ) -> Result<(), Error> {
+        let n = n_tokens.saturating_mul(n_v_heads);
+        let gate_bytes = product(&[to_usize(n), FLOAT_BYTES]);
+        let head_bytes = product(&[to_usize(n_v_heads), FLOAT_BYTES]);
+        let args = [
+            buffer(beta, gate_bytes),
+            buffer(alpha, gate_bytes),
+            buffer(a, head_bytes),
+            buffer(dt_bias, head_bytes),
+            Arg::U32(n_v_heads),
+            Arg::U32(n),
+        ];
+        self.launch(&Launch {
+            kernel: Kernel::GdnGates,
+            args: &args,
+            dispatch: elementwise(n),
+            n_rows: 0,
+            n_cols: 0,
+            weight_bytes: 0,
+        })
+    }
+
+    /// Record the gated delta rule of `n_tokens` DeltaNet tokens of `shape`.
+    ///
+    /// `y` holds the tokens' normalized queries and keys and their values, and `beta` and `decay`
+    /// hold each token's gates per value head. `state` holds `n_v_heads` matrices of `k_dim`
+    /// rows of `v_dim` floats, which the tokens update in order. Each token's `n_v_heads * v_dim`
+    /// outputs go to `out`.
+    pub fn gdn_recurrence(
+        &mut self,
+        y: View<'_>,
+        beta: View<'_>,
+        decay: View<'_>,
+        state: View<'_>,
+        out: View<'_>,
+        shape: DeltaShape,
+        n_tokens: u32,
+    ) -> Result<(), Error> {
+        if shape.k_dim == 0
+            || shape.k_dim > GDN_MAX_K_DIM
+            || shape.v_dim == 0
+            || !shape.v_dim.is_multiple_of(32)
+            || shape.n_k_heads == 0
+        {
+            return Err(Error::DeltaNetLimits {
+                conv_kernel: 0,
+                k_dim: shape.k_dim,
+                v_dim: shape.v_dim,
+            });
+        }
+        let tokens = to_usize(n_tokens);
+        let heads = to_usize(shape.n_v_heads);
+        let gate_bytes = product(&[tokens, heads, FLOAT_BYTES]);
+        let args = [
+            buffer(
+                y,
+                product(&[tokens, to_usize(shape.conv_dim()), FLOAT_BYTES]),
+            ),
+            buffer(beta, gate_bytes),
+            buffer(decay, gate_bytes),
+            buffer(
+                state,
+                product(&[
+                    heads,
+                    to_usize(shape.k_dim),
+                    to_usize(shape.v_dim),
+                    FLOAT_BYTES,
+                ]),
+            ),
+            buffer(
+                out,
+                product(&[tokens, heads, to_usize(shape.v_dim), FLOAT_BYTES]),
+            ),
+            Arg::U32(shape.n_k_heads),
+            Arg::U32(shape.n_v_heads),
+            Arg::U32(shape.k_dim),
+            Arg::U32(shape.v_dim),
+            Arg::U32(n_tokens),
+        ];
+        self.launch(&Launch {
+            kernel: Kernel::GdnRecurrence,
+            args: &args,
+            dispatch: Dispatch::Threadgroups(
+                [to_usize(shape.v_dim / 32), heads, 1],
+                [SIMD_WIDTH, 1, 1],
+            ),
+            n_rows: 0,
+            n_cols: 0,
+            weight_bytes: 0,
+        })
+    }
+
+    /// Record the multiplication of each of the `n` floats at `x` by SiLU of the matching float
+    /// at `gate`.
+    pub fn silu_mul(&mut self, x: View<'_>, gate: View<'_>, n: u32) -> Result<(), Error> {
+        let bytes = product(&[to_usize(n), FLOAT_BYTES]);
+        let args = [buffer(x, bytes), buffer(gate, bytes), Arg::U32(n)];
+        self.launch(&Launch {
+            kernel: Kernel::SiluMul,
+            args: &args,
+            dispatch: elementwise(n),
+            n_rows: 0,
+            n_cols: 0,
+            weight_bytes: 0,
+        })
+    }
+
+    /// Record the multiplication of the attention outputs at `out`, `n_tokens` tokens of `q_dim`
+    /// floats, by the sigmoid of their gates.
+    ///
+    /// The gates sit in the query projection `qg`, whose token holds each head's `head_dim`
+    /// queries followed by its `head_dim` gates.
+    pub fn attention_gate(
+        &mut self,
+        out: View<'_>,
+        qg: View<'_>,
+        head_dim: u32,
+        q_dim: u32,
+        n_tokens: u32,
+    ) -> Result<(), Error> {
+        let n = n_tokens.saturating_mul(q_dim);
+        let args = [
+            buffer(out, product(&[to_usize(n), FLOAT_BYTES])),
+            buffer(qg, product(&[to_usize(n), 2, FLOAT_BYTES])),
+            Arg::U32(head_dim),
+            Arg::U32(q_dim),
+            Arg::U32(n),
+        ];
+        self.launch(&Launch {
+            kernel: Kernel::AttentionGate,
+            args: &args,
+            dispatch: elementwise(n),
+            n_rows: 0,
+            n_cols: 0,
+            weight_bytes: 0,
+        })
+    }
+
     /// Record an RMS normalization of each of the `n_rows` rows of `n` floats at `x`, scaled by
     /// the `n` floats at `weight`, into the matching rows of `out`.
     pub fn rms_norm(
@@ -1620,8 +1904,11 @@ impl Metal {
     /// `head_dim` floats of each of `n_tokens` tokens at `src`.
     ///
     /// Token `i` sits at position `pos + i`, `src_stride` floats into `src` and `dst_stride`
-    /// elements into `dst`. The result goes to `dst` as half-precision numbers when `dst_half`
-    /// is true and as floats otherwise. `src` and `dst` may be the same floats.
+    /// elements into `dst`. Head `h` starts `h * src_head_stride` floats into a token at `src`
+    /// and `h * head_dim` elements into it at `dst`. The rotation turns the first `n_rot`
+    /// elements of each head, and element `i` of them pairs with element `i + n_rot / 2`. The
+    /// result goes to `dst` as half-precision numbers when `dst_half` is true and as floats
+    /// otherwise. `src` and `dst` may be the same floats.
     pub fn norm_rope(
         &mut self,
         src: View<'_>,
@@ -1630,6 +1917,8 @@ impl Metal {
         weight: View<'_>,
         n_heads: u32,
         head_dim: u32,
+        n_rot: u32,
+        src_head_stride: u32,
         pos: u32,
         n_tokens: u32,
         src_stride: u32,
@@ -1637,15 +1926,21 @@ impl Metal {
         theta: f32,
         eps: f32,
     ) -> Result<(), Error> {
-        let head_elements = product(&[to_usize(n_heads), to_usize(head_dim)]);
-        let extent = |stride: u32| {
+        let extent = |stride: u32, head_stride: u32| {
             product(&[to_usize(n_tokens.saturating_sub(1)), to_usize(stride)])
-                .saturating_add(head_elements)
+                .saturating_add(product(&[
+                    to_usize(n_heads.saturating_sub(1)),
+                    to_usize(head_stride),
+                ]))
+                .saturating_add(to_usize(head_dim))
         };
         let dst_element = if dst_half { HALF_BYTES } else { FLOAT_BYTES };
         let args = [
-            buffer(src, product(&[extent(src_stride), FLOAT_BYTES])),
-            buffer(dst, product(&[extent(dst_stride), dst_element])),
+            buffer(
+                src,
+                product(&[extent(src_stride, src_head_stride), FLOAT_BYTES]),
+            ),
+            buffer(dst, product(&[extent(dst_stride, head_dim), dst_element])),
             buffer(weight, product(&[to_usize(head_dim), FLOAT_BYTES])),
             Arg::U32(head_dim),
             Arg::U32(pos),
@@ -1653,6 +1948,8 @@ impl Metal {
             Arg::F32(eps),
             Arg::U32(src_stride),
             Arg::U32(dst_stride),
+            Arg::U32(n_rot),
+            Arg::U32(src_head_stride),
         ];
         self.launch(&Launch {
             kernel: Kernel::NormRope { half: dst_half },
@@ -2212,6 +2509,27 @@ impl Metal {
             n_cols: 0,
             weight_bytes: 0,
         })
+    }
+}
+
+/// The head layout of a Gated DeltaNet layer: `n_k_heads` query and key heads of `k_dim` floats
+/// and `n_v_heads` value heads of `v_dim` floats. Value head `j` reads key head `j % n_k_heads`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeltaShape {
+    /// The number of query and key heads.
+    pub n_k_heads: u32,
+    /// The number of value heads.
+    pub n_v_heads: u32,
+    /// The size of each query and key head.
+    pub k_dim: u32,
+    /// The size of each value head.
+    pub v_dim: u32,
+}
+
+impl DeltaShape {
+    /// Return the floats of one token: the queries, the keys, and the values.
+    pub fn conv_dim(self) -> u32 {
+        2 * self.n_k_heads * self.k_dim + self.n_v_heads * self.v_dim
     }
 }
 

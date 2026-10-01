@@ -21,6 +21,9 @@ use crate::lfm2::{
 use crate::scalar;
 use crate::storage::Storage;
 
+#[cfg(target_os = "macos")]
+pub use crate::qwen35_metal::{Checkpoint, Qwen35Metal};
+
 /// transformers' Qwen3.5 code fixes the epsilon of the L2 norm of DeltaNet queries and keys.
 const L2_NORM_EPS: f32 = 1e-6;
 
@@ -137,6 +140,26 @@ pub(crate) struct Layer {
     pub(crate) gate: Matrix,
     pub(crate) up: Matrix,
     pub(crate) down: Matrix,
+}
+
+impl Layer {
+    /// Return the layer's matrices.
+    pub(crate) fn matrices(&self) -> Vec<&Matrix> {
+        let mut matrices = match &self.mixer {
+            Mixer::Attention(attention) => {
+                vec![&attention.q, &attention.k, &attention.v, &attention.output]
+            }
+            Mixer::DeltaNet(delta) => vec![
+                &delta.qkv,
+                &delta.gate,
+                &delta.beta,
+                &delta.alpha,
+                &delta.output,
+            ],
+        };
+        matrices.extend([&self.gate, &self.up, &self.down]);
+        matrices
+    }
 }
 
 /// A Qwen3.5 model loaded from a GGUF file.
