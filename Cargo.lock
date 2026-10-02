@@ -277,7 +277,7 @@ dependencies = [
 
 [[package]]
 name = "bobcat"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bobcat-gguf",
  "bobcat-metal",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "bobcat-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bobcat",
  "clap",
@@ -300,7 +300,7 @@ dependencies = [
 
 [[package]]
 name = "bobcat-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "bobcat",
@@ -321,14 +321,14 @@ dependencies = [
 
 [[package]]
 name = "bobcat-gguf"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "bobcat-metal"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "block2",
  "libc",
