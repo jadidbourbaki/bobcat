@@ -14,7 +14,7 @@ dependencies = [
     "polars==1.44.2",
     "pydantic==2.13.5",
     "tokenizers==0.23.2",
-    "torch==2.14.0",
+    "torch==2.14.1",
     "transformers==5.17.0",
 ]
 
